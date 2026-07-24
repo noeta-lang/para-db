@@ -1,0 +1,89 @@
+name: CI
+
+# The para/db package's CI, two jobs:
+#   - rust     : fmt / clippy (deny warnings) / test in each Rust crate (the driver + migration
+#                engine and the native entry crate), each its own workspace root.
+#   - examples : the Noeta-level gate — install a pinned released `noeta`, then check + test the
+#                hermetic (SQLite/in-memory) example demos (composing the toolchain builds the
+#                native crate, so the Rust toolchain is installed here too). The Postgres demos
+#                need a live server and are skipped.
+#
+# NOTE: these workflows go green once the noeta toolchain repo is published under
+# github.com/noeta-lang/noeta and this repo's pre-publish `file:///` git deps are flipped to it
+# (tracked in the pre-alpha run-list). Until then they fail at the git-dep fetch / noeta-install
+# steps by design.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The Rust toolchain is PINNED (dtolnay/rust-toolchain@1.97.0, in lockstep with the toolchain
+# repo's own CI) rather than floating on `@stable` — clippy's lint set grows each release and the
+# rust job denies warnings. NOETA_VERSION is the toolchain release the examples are proven against.
+# Bumping either is deliberate: raise it here and in `release.yml` together.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  NOETA_VERSION: v0.1.0
+
+jobs:
+  rust:
+    name: Rust crates (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Workspace-less on purpose (each crate is its own workspace root, so the composed toolchain
+      # can adopt it as a path dependency) — run per crate directory.
+      - name: cargo fmt --check
+        run: |
+          for crate in crates/*/ native/; do
+            (cd "${crate}" && cargo fmt --check)
+          done
+      - name: cargo clippy (deny warnings)
+        run: |
+          for crate in crates/*/ native/; do
+            (cd "${crate}" && cargo clippy --all-targets -- -D warnings)
+          done
+      - name: cargo test
+        run: |
+          for crate in crates/*/ native/; do
+            (cd "${crate}" && cargo test)
+          done
+      # The opt-in Postgres driver ring must keep compiling even though the default build never
+      # links the PG client.
+      - name: cargo check --features ring-postgres (opt-in driver ring)
+        working-directory: crates/noeta-para-db
+        run: cargo check --features ring-postgres
+
+  examples:
+    name: Examples (noeta check + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Composing a native package's toolchain cargo-builds the extension crate, so the Rust
+      # toolchain is required even for the Noeta-side tests.
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install noeta ${{ env.NOETA_VERSION }}
+        run: |
+          DIST="noeta-${NOETA_VERSION}-x86_64-unknown-linux-gnu"
+          curl -fsSL "https://github.com/noeta-lang/noeta/releases/download/${NOETA_VERSION}/${DIST}.tar.gz" | tar -xz
+          echo "${PWD}/${DIST}" >> "$GITHUB_PATH"
+      # The postgres/live/watch demos need a reachable PostgreSQL server; gate the hermetic ones.
+      - name: noeta check + test the hermetic demos
+        working-directory: examples/para-db-demo
+        run: |
+          for f in demo.noe query_demo.noe repo_demo.noe sql_demo.noe migrate_demo.noe seed_demo.noe reactive_demo.noe live_repo_sqlite_demo.noe; do
+            echo "== ${f}"
+            noeta check "${f}"
+            noeta test "${f}"
+          done

@@ -1,0 +1,53 @@
+name: Release
+
+# Tag-triggered package publish. On a `v*` tag: gate the Rust crates' tests with the pinned
+# compiler, install the pinned released `noeta`, then `noeta publish` this repo + tag to the
+# hosted registry. Provenance is keyless Sigstore via the ambient GitHub OIDC identity — hence
+# `id-token: write`.
+#
+# NOTE: goes live once the noeta toolchain repo is published under github.com/noeta-lang/noeta,
+# the pre-publish `file:///` git deps are flipped to it, and the registry scope `para` is claimed
+# by the noeta-lang org (tracked in the pre-alpha run-list).
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # keyless Sigstore signing via the ambient GitHub OIDC identity
+
+# Kept in lockstep with `ci.yml` — a release must be gated by the same compiler and published
+# with the same toolchain release the gates proved the tree against.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  NOETA_VERSION: v0.1.0
+
+jobs:
+  publish:
+    name: Publish para/db to the registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (crate gate)
+        run: |
+          for crate in crates/*/ native/; do
+            (cd "${crate}" && cargo test)
+          done
+      - name: Install noeta ${{ env.NOETA_VERSION }}
+        run: |
+          DIST="noeta-${NOETA_VERSION}-x86_64-unknown-linux-gnu"
+          curl -fsSL "https://github.com/noeta-lang/noeta/releases/download/${NOETA_VERSION}/${DIST}.tar.gz" | tar -xz
+          echo "${PWD}/${DIST}" >> "$GITHUB_PATH"
+      - name: noeta publish
+        env:
+          NOETA_REGISTRY_URL: https://registry.noeta.dev
+          NOETA_REGISTRY_TOKEN: ${{ secrets.NOETA_REGISTRY_TOKEN }}
+        run: noeta publish --git https://github.com/noeta-lang/para-db --tag ${{ github.ref_name }}
