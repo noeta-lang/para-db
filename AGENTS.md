@@ -14,9 +14,9 @@ Guidance for coding agents working in this repo — the standalone repo of the *
 
 ## Build & test
 
-- `cargo test` inside `crates/noeta-para-db` works standalone — the toolchain crates are git dependencies (currently the pre-publish `file:///home/niklas/Code/lang` form; flips to `https://github.com/noeta-lang/noeta` at publish). `native/` builds the same way. Postgres-path code compiles under `--features ring-postgres`.
+- `cargo test` inside `crates/noeta-para-db` works standalone — the toolchain crates are git dependencies on `https://github.com/noeta-lang/noeta` (rev-pinned; flips to tag pins once a toolchain release tag exists). `native/` builds the same way. Postgres-path code compiles under `--features ring-postgres`.
 - Running the examples needs the `noeta` binary and **composes a toolchain** (the native crate is compiled in). Set:
-  - `NOETA_TOOLCHAIN_REPO=file:///home/niklas/Code/lang` — MUST equal the URL the crates' Cargo.toml declares, or the composed build links two copies of the extension ABI and every impl fails with a two-`Extension`-traits E0308;
+  - nothing, in the common case: the compose `[patch]` key defaults to the binary's baked repository URL (`https://github.com/noeta-lang/noeta`), which now equals the URL the crates' Cargo.toml declares. When overriding to a fork or local clone, `NOETA_TOOLCHAIN_REPO` MUST equal the declared URL, or the composed build links two copies of the extension ABI and every impl fails with a two-`Extension`-traits E0308;
   - optionally `NOETA_TOOLCHAIN_SRC=<path to a noeta checkout>` to skip the git fetch.
 - Then `noeta check` / `noeta test` each demo in `examples/para-db-demo/`. The `postgres_demo` / `live_repo_demo` / `watch_demo` entries need a reachable PostgreSQL; the rest are SQLite/in-memory and hermetic.
 
