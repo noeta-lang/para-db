@@ -22,10 +22,14 @@ Guidance for coding agents working in this repo — the standalone repo of the *
 
 ## Conventions
 
-- Rust code is `cargo fmt` and `cargo clippy --all-targets -- -D warnings` clean (toolchain pinned at 1.97.0 in CI).
 - `noeta.lock` files under `examples/` **are committed** — leave resolved locks in place.
-- Markdown never hard-wraps lines; American English throughout.
-- Conventional commits. Never move a published `v*` tag — a release is a new tag.
+- Rust: default `rustfmt` style (no `rustfmt.toml`), `cargo clippy --all-targets -- -D warnings` clean, zero compiler warnings; the CI toolchain is pinned at 1.97.0 — lint against it locally (a floating `@stable` surfaces lints CI doesn't have yet, and vice versa).
+- Rust naming: `snake_case` files/functions, `PascalCase` types, `SCREAMING_SNAKE_CASE` constants; prefer enums and constants over magic strings.
+- Markdown never hard-wraps lines.
+- **American English** throughout — code, comments, and docs (`behavior`, not `behaviour`).
+- **Conventional commits** for all commit titles. Commit each green slice as it completes, but **never `git push` without explicit authorization**. Never move a published `v*` tag — a release is a new tag.
+- Implement in full — no stubs or TODOs; new functionality lands with tests.
+- Keep `README.md` and this file up to date when layout or behavior changes.
 
 ## CI
 
