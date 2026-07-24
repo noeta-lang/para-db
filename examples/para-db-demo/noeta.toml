@@ -12,9 +12,11 @@ para = { path = "../.." }
 migrations = "migrations"
 seeds = "seeds"
 
-# Running a package's native Rust code requires the root app to authorize it (Phase 4 trust gate).
+# Running a package's native Rust code requires the root app to authorize it (Phase 4 trust gate);
+# its CLI commands (`noeta migrate`) additionally require command trust.
 [trust]
 native = ["para/db"]
+commands = ["para/db"]
 
 [native]
 # A `--native` binary picks its driver at runtime; request the Postgres driver ring so the AOT build
