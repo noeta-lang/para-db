@@ -17,6 +17,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable as the release gate (release.yml runs the full CI before publishing).
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}

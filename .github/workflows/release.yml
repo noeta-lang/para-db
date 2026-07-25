@@ -29,8 +29,15 @@ env:
   NOETA_VERSION: ${{ vars.NOETA_VERSION || 'v0.1.0' }}
 
 jobs:
+  # The repo's full CI, reused as the release gate: a tag can only publish a tree that
+  # passes everything CI checks (one gate definition, no drift).
+  gate:
+    name: CI gates
+    uses: ./.github/workflows/ci.yml
+
   publish:
     name: Publish para/db to the registry
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
