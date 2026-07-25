@@ -49,8 +49,7 @@ jobs:
         run: |
           PINS=$(grep -rhoE 'github.com/noeta-lang/noeta", tag = "[^"]+"' crates/*/Cargo.toml native/Cargo.toml 2>/dev/null | grep -oE 'tag = "[^"]+"' | cut -d'"' -f2 | sort -u || true)
           if [ -n "$PINS" ]; then
-            COUNT=$(printf '%s
-' "$PINS" | wc -l)
+            COUNT=$(echo "$PINS" | wc -l)
             [ "$COUNT" = "1" ] || { echo "multiple toolchain tags pinned:"; echo "$PINS"; exit 1; }
             [ "$PINS" = "$NOETA_VERSION" ] || { echo "Cargo.toml pins toolchain $PINS but CI installs $NOETA_VERSION — bump the org variable NOETA_VERSION and the manifests together"; exit 1; }
             echo "toolchain tag pin matches NOETA_VERSION ($PINS)"
