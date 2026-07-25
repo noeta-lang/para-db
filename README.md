@@ -8,7 +8,7 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
   - `sqlite::memory:` / `:memory:` — in-memory SQLite
   - `sqlite:PATH` (or a bare path) — a SQLite file
   - `postgres://user:pass@host:5432/db` (`postgresql://` too) — PostgreSQL
-- **`Connection`** — `execute(sql, params) -> int` / `query(sql, params) -> List<Map<string, dyn>>` with positional `?` bind parameters (rewritten per driver; never string-spliced, so no injection risk), plus `migrate(dir)`, `seed(dir)`, `close()`.
+- **`Connection`** — `execute(sql, params) -> int` / `query(sql, params) -> List<Map<string, dyn>>` with positional `?` bind parameters (rewritten per driver; never string-spliced, so no injection risk), plus `notify(channel)` (fire a change notification: Postgres `NOTIFY`, an in-process bus publish on SQLite), `migrate(dir)`, `seed(dir)`, `close()`.
 - **`para.db.query`** (pure Noeta) — a fluent query builder: `table("users").filter("age", ">", 18).order("name", "asc").limit(20)`.
 - **`para.db.repo`** (pure Noeta) — repository + unit-of-work: stage writes during a request, flush them as one transactional batch.
 - **`para.db.sql`** (pure Noeta) — the typed `@sql { … }` block tier: `${…}` holes are always bound parameters, never spliced.
@@ -43,6 +43,60 @@ conn.execute("INSERT INTO users (id, name) VALUES (?, ?)", [1, "Ada"])
 min_id = 0
 rows = query(conn, @sql { SELECT * FROM users WHERE id > ${min_id} })
 echo rows.len()
+```
+
+A `${…}` hole in an `@sql { … }` block is **always a bound parameter**: the block evaluates to a `Sql` value — the statement `text` with `?` placeholders plus its `params` in hole order — so a statement built from untrusted input carries no injection risk by construction. `query(conn, stmt)` runs it as a query; its sibling `execute(conn, stmt)` runs a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected. A bound parameter is a scalar — `int`, `float`, `bool`, `string`, or `none` (SQL `NULL`) — and a row comes back as a `Map<string, dyn>` keyed by column name, with `NULL` as `none`. Transactions are ordinary statements: `conn.execute("BEGIN", [])` / `"COMMIT"` / `"ROLLBACK"`.
+
+**Swapping drivers is the dsn.** Everything above the driver — this raw surface, the query builder, the repository, `@sql`, migrations — runs unchanged over SQLite or PostgreSQL: `postgres_demo.noe` is `demo.noe` with only the connection string changed. The neutral `?` placeholders are rewritten to Postgres's `$1, $2, …` by the driver.
+
+## Query builder — compose statements fluently
+
+`para.db.query` composes a `Query` — statement text with `?` placeholders plus its ordered bound parameters. `table(name)` starts a builder; `filter(col, op, value)` (ANDed with the others), `order(col, dir)` (`"asc"`/`"desc"`), and `limit(n)` chain; a terminal `select(cols)`, `insert(columns, values)`, `update(columns, values)`, or `delete()` builds the `Query`. `run(conn, q)` executes a query, returning its rows; `exec(conn, q)` executes a write, returning rows affected.
+
+```noeta
+use para.db
+use para.db.query.{table, run, exec}
+
+conn = db.connect("sqlite::memory:")
+conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
+
+ins = table("users").insert(["name", "age"], ["Ada", 36])
+exec(conn, ins)
+
+q = table("users").filter("age", ">", 30).order("age", "asc").limit(10).select("name, age")
+rows = run(conn, q)        // List<Map<string, dyn>>
+```
+
+In an `update(columns, values)`, the SET bindings come first and the builder's filter bindings follow; `delete()` binds this builder's filters. Filter values become bound parameters, so a query built from untrusted input carries no injection risk.
+
+## Repository & unit of work — typed models, batched writes
+
+`para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and the repository is constructed with the model's runtime type **name** (generics are erased, so it is passed as a string), its table, and its primary-key column. Reads go straight to the connection — `find(conn, id)` (a `?dyn`; `none` when absent), `all(conn)`, and `where(conn, col, op, value)`, each mapped to the model; narrow a result with `.as<User>()`. Writes are the **unit of work**: `add(entity)` / `save(entity)` / `remove(id)` *stage* an insert / a by-primary-key update / a delete, and `flush(conn)` commits everything staged as one batch inside a single transaction (`BEGIN` … `COMMIT`), returning the statement count — a failure before `COMMIT` leaves the batch to the transaction to undo. `discard()` drops the staged changes without touching the database.
+
+```noeta
+use para.db
+use para.db.repo.Repository
+
+@derive(Serialize<Json>, Deserialize<Json>)
+struct User {
+    id: int
+    name: string
+    age: int
+}
+
+conn = db.connect("sqlite::memory:")
+conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
+users = Repository.new("User", "users", "id")
+
+users.add(User { id: 1, name: "Ada", age: 36 })
+users.add(User { id: 2, name: "Bob", age: 41 })
+n = users.flush(conn)                       // one transaction, 2 statements
+
+users.save(User { id: 2, name: "Bob", age: 42 })    // stage an UPDATE by primary key
+users.remove(1)                                     // stage a DELETE
+users.flush(conn)
+
+adults = users.where(conn, "age", ">", 18)
 ```
 
 ## Migrations — evolve the schema over time
@@ -104,7 +158,7 @@ seeds = "seeds"              # optional; the directory (default "seeds"), overri
 
 An aether server (or any program) can migrate itself at startup off the same engine, and optionally seed after — seeding is never implicit, an app opts in explicitly and controls the order (migrate, then seed):
 
-```noe
+```noeta
 conn = db.connect(env.get("DATABASE_URL") ?? "sqlite:app.db")
 applied = conn.migrate("migrations")   // returns the count applied; a no-op when up to date
 seeded  = conn.seed("seeds")           // runs every seed file every time; returns how many ran
@@ -124,7 +178,7 @@ The Postgres driver uses a pure-Rust rustls connector (the `ring` crypto provide
 | `verify-ca` | ✅ | ✅ | Mandatory TLS, certificate verified against the bundled roots. |
 | `verify-full` | ✅ | ✅ (incl. hostname) | Mandatory TLS, full certificate verification. The strongest mode. |
 
-```noe
+```noeta
 conn = db.connect("postgres://user:pass@host:5432/db?sslmode=require")
 ```
 
@@ -136,7 +190,7 @@ An unrecognized `sslmode` value is a clear error before any connection is attemp
 
 `para.db` integrates with `std.reactive`, so a query can be a **reactive value**: when the data changes, the query re-runs and every dependent — an `effect`, a `computed`, a LiveView `view.expose(...)` — updates. Reactivity is **opt-in**: the plain `Repository` stays non-reactive and zero-overhead; you choose it by using `LiveRepository`.
 
-```noe
+```noeta
 use para.db
 use para.db.reactive.LiveRepository
 use std.reactive.effect
@@ -154,7 +208,7 @@ users.flush()                                  // commit + notify
 users.pump()                                   // deliver notifications → the effect re-runs
 ```
 
-`LiveRepository` wraps a plain `Repository` with three additions: `all()` returns a reactive query, `flush()` notifies after committing, and `pump()` (called from your loop, e.g. the serve loop) delivers pending change notifications and wakes the reactive graph. Under the hood it composes `db.watch(conn, channel)` — a reactive source node over a change-notification channel — with a plain repository.
+`LiveRepository` wraps a plain `Repository` with three additions: `all()` returns a reactive query, `flush()` notifies after committing, and `pump()` (called from your loop, e.g. the serve loop) delivers pending change notifications and wakes the reactive graph. Under the hood it composes `db.watch(conn, channel)` — a reactive source node over a change-notification channel — with a plain repository. The source is also usable directly: a `computed` that reads `watch.get()` and re-queries the table re-runs whenever a fired notification is pumped in with `watch.pump()` (see `watch_demo.noe`).
 
 **How far a change propagates depends on the driver:**
 
@@ -193,7 +247,7 @@ For **other editors** (or a custom setup), `@sql { … }` bodies highlight as SQ
 
 ## Requirements
 
-Consumers compile this package's native driver crate locally: `cargo` and a Rust toolchain (1.95+) must be on `PATH`. The Noeta toolchain composes and builds it automatically on first use. SQLite is bundled (compiled from source — no system libsqlite3 needed); the Postgres driver rides the opt-in `ring-postgres` feature.
+Consumers compile this package's native driver crate locally: `cargo` and a Rust toolchain (1.95+) must be on `PATH`. The Noeta toolchain composes and builds it automatically on first use. SQLite is bundled (compiled from source — no system libsqlite3 needed); the Postgres driver rides the opt-in `ring-postgres` feature — the composed toolchain auto-enables it (no flags needed), and a `--native` (AOT) build requests it in the manifest with `[native] rings = ["ring-postgres"]`.
 
 ## Development
 
