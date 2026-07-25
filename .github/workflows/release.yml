@@ -26,7 +26,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  NOETA_VERSION: v0.1.0
+  NOETA_VERSION: ${{ vars.NOETA_VERSION || 'v0.1.0' }}
 
 jobs:
   publish:
@@ -41,6 +41,22 @@ jobs:
           for crate in crates/*/ native/; do
             (cd "${crate}" && cargo test)
           done
+      - name: Toolchain version consistency
+        # The installed binary's version must match the toolchain tag the crates pin — a mismatch
+        # links two copies of the extension ABI in composed builds (a two-`Extension`-traits E0308).
+        # While the deps are rev-pinned (pre-release) there is no tag to compare; the guard engages
+        # automatically once the manifests flip to `tag = "vX"`.
+        run: |
+          PINS=$(grep -rhoE 'github.com/noeta-lang/noeta", tag = "[^"]+"' crates/*/Cargo.toml native/Cargo.toml 2>/dev/null | grep -oE 'tag = "[^"]+"' | cut -d'"' -f2 | sort -u || true)
+          if [ -n "$PINS" ]; then
+            COUNT=$(printf '%s
+' "$PINS" | wc -l)
+            [ "$COUNT" = "1" ] || { echo "multiple toolchain tags pinned:"; echo "$PINS"; exit 1; }
+            [ "$PINS" = "$NOETA_VERSION" ] || { echo "Cargo.toml pins toolchain $PINS but CI installs $NOETA_VERSION — bump the org variable NOETA_VERSION and the manifests together"; exit 1; }
+            echo "toolchain tag pin matches NOETA_VERSION ($PINS)"
+          else
+            echo "toolchain deps are rev-pinned; the tag guard engages after the tag flip"
+          fi
       - name: Install noeta ${{ env.NOETA_VERSION }}
         run: |
           DIST="noeta-${NOETA_VERSION}-x86_64-unknown-linux-gnu"
