@@ -3,9 +3,9 @@ version = 2
 
 [[package]]
 name = "para/db"
-version = "0.1.1"
+version = "0.1.2"
 source = "path"
 path = "../.."
 native = "native"
 edition = "2026"
-hash = "76b89c1e7e78c9582397b0ebb2116d02afb53935c9bf55a9e29db8e401de56a1"
+hash = "ae02e143f8855ab264fef07df2d140d248f21248b0117581122ec052ad53cfd3"
