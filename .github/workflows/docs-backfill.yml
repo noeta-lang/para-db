@@ -1,0 +1,41 @@
+name: Docs backfill
+
+# Manually dispatched: regenerate the API-docs artifact for an ALREADY-PUBLISHED release tag and
+# re-upload it via `noeta publish --docs-only` — no version bump, the index entry is untouched.
+# Exists because docs generation is toolchain-side: a docs-gen fix (or a richer generator) can be
+# applied to versions already on the shelf.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag (e.g. v0.1.2) whose docs artifact to regenerate"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NOETA_VERSION: ${{ vars.NOETA_VERSION || 'v0.2.3' }}
+
+jobs:
+  docs:
+    name: Regenerate + re-upload docs for ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install noeta ${{ env.NOETA_VERSION }}
+        run: |
+          DIST="noeta-${NOETA_VERSION}-x86_64-unknown-linux-gnu"
+          curl -fsSL "https://github.com/noeta-lang/noeta/releases/download/${NOETA_VERSION}/${DIST}.tar.gz" | tar -xz
+          echo "${PWD}/${DIST}" >> "$GITHUB_PATH"
+      - name: noeta publish --docs-only
+        env:
+          NOETA_REGISTRY_URL: https://registry.noeta.dev
+          NOETA_REGISTRY_TOKEN: ${{ secrets.NOETA_REGISTRY_TOKEN }}
+        run: noeta publish --docs-only
