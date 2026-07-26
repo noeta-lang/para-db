@@ -1,8 +1,9 @@
 [package]
 name = "para/db"
-version = "0.1.2"
+version = "0.1.3"
 # The minimum noeta this package works with; enforced at resolve time from noeta 0.2.1 on.
 toolchain = ">=0.2"
+license = "MIT OR Apache-2.0"
 description = "Database access with swappable drivers — SQLite and Postgres, bound parameters, migrations, and reactive queries."
 keywords = ["database", "sqlite", "postgres", "sql", "migrations"]
 # This package ships a native Rust extension crate (the `para.db` surface — the swappable-driver
