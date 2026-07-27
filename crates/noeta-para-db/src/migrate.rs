@@ -22,10 +22,29 @@
 //! Both kinds live in the **same** directory and interleave in one filename order, so a project
 //! writes portable migrations wherever the DSL's vocabulary reaches and drops to raw SQL for the
 //! steps it does not (`migrate new` still scaffolds `.sql` unless asked for `--schema`).
-//! **A migration's checksum is taken over its file source, never over the lowered DDL** — the source
-//! is what the author owns and is identical on every backend, so a DSL migration's identity is stable
-//! across SQLite and Postgres and across para/db versions (a lowering improvement must never read as
-//! edited history).
+//!
+//! # What a migration's checksum is taken over
+//!
+//! **Never the lowered DDL.** The DDL is a function of para/db's own code generator and of the
+//! connected backend, so hashing it would give one migration two identities (SQLite's
+//! `INTEGER PRIMARY KEY AUTOINCREMENT` against Postgres's `BIGSERIAL PRIMARY KEY`) and would turn any
+//! later improvement to the lowering into "history was edited" for every project that already ran it.
+//!
+//! What is hashed is the migration's **meaning**, spelled the one canonical way:
+//!   * `.sql` — the **file source**. Raw SQL *is* the DDL; there is no IR to canonicalize, and the
+//!     engine deliberately does not parse SQL, so the bytes the author wrote are the identity.
+//!   * `.schema` — the **canonical re-rendering of the parsed IR**
+//!     ([`crate::schema::canonicalize`]): source → [`crate::schema::parse`] → `Vec<Statement>` →
+//!     [`crate::schema::render`] → sha256. Whitespace, indentation, line breaks and comments are gone
+//!     by the time the hash is taken, so reformatting a `.schema` file — a formatter hook, a fixed
+//!     typo in a comment — does **not** read as tampered history, while every field the IR records
+//!     does change it. No [`crate::schema::Dialect`] appears anywhere on that path, so the checksum is
+//!     the same on every backend, and it is taken *before* lowering, so [`crate::schema::lower`] can
+//!     be improved freely.
+//!
+//! A `.schema` body that does not parse has no IR, so it falls back to its source — it can never be
+//! applied (the parse failure stops the run before its transaction opens), so it can never be
+//! recorded under that checksum either.
 //!
 //! **A tracking table** [`TRACKING_TABLE`] records each applied migration's filename, a **sha256
 //! checksum** of its contents, and the time it was applied. Two integrity gates run before anything is
@@ -90,8 +109,8 @@ impl MigrationKind {
 }
 
 /// A discovered migration file: its filename (the ordering key **and** the body-language selector),
-/// its verbatim source body, and the sha256 hex checksum of that body (the history-integrity
-/// fingerprint).
+/// its verbatim source body, and the sha256 hex checksum of what that body *means* (the
+/// history-integrity fingerprint).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Migration {
     /// The file name including extension, e.g. `20260719_143000_init.sql`. The lexicographic order
@@ -100,8 +119,10 @@ pub struct Migration {
     /// The verbatim file contents: native SQL for a [`MigrationKind::Sql`] migration, schema-DSL
     /// source for a [`MigrationKind::Schema`] one.
     pub body: String,
-    /// Lowercase sha256 hex of `body` — the **source**, never the lowered DDL, so the identity of a
-    /// DSL migration does not depend on which backend it was applied against.
+    /// Lowercase sha256 hex of the migration's **identity text** (see [`identity_text`]): the body
+    /// itself for raw SQL, the canonical rendering of the parsed IR for the schema DSL. Never the
+    /// lowered DDL, so it does not depend on the backend it was applied against nor on the version of
+    /// para/db that applied it.
     pub checksum: String,
     /// How [`Migration::lowered`] turns `body` into DDL.
     pub kind: MigrationKind,
@@ -113,8 +134,8 @@ impl Migration {
     pub fn new(name: impl Into<String>, body: impl Into<String>) -> Migration {
         let name = name.into();
         let body = body.into();
-        let checksum = sha256_hex(body.as_bytes());
         let kind = MigrationKind::of(&name);
+        let checksum = sha256_hex(identity_text(kind, &body).as_bytes());
         Migration {
             name,
             body,
@@ -255,6 +276,27 @@ impl std::fmt::Display for MigrateError {
 }
 
 impl std::error::Error for MigrateError {}
+
+/// The text a migration's checksum is taken over — its **identity**, not its formatting.
+///
+/// For raw SQL that is the body verbatim: SQL *is* the DDL, so the bytes the author wrote are the
+/// only honest fingerprint. For the schema DSL it is the canonical rendering of the parsed IR
+/// ([`crate::schema::canonicalize`]), which is invariant under reformatting, independent of the
+/// connected dialect, and taken before any lowering — see this module's header for why each of those
+/// matters.
+///
+/// A `.schema` body that does not parse has no IR to canonicalize, so it falls back to its source.
+/// That migration cannot be applied at all ([`Migration::lowered`] fails before its transaction
+/// opens), so the fallback checksum is never recorded; it exists only so discovery
+/// ([`load_dir`]) and [`plan`] stay total in the face of a malformed file.
+fn identity_text(kind: MigrationKind, body: &str) -> String {
+    match kind {
+        MigrationKind::Sql => body.to_string(),
+        MigrationKind::Schema => {
+            crate::schema::canonicalize(body).unwrap_or_else(|_| body.to_string())
+        }
+    }
+}
 
 /// Lowercase sha256 hex of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -601,8 +643,9 @@ pub const SCAFFOLD_TEMPLATE: &str = "-- Migration: write forward-only SQL below.
 /// shows the fluent shape and names the escape hatch, since the DSL deliberately covers only what
 /// lowers identically onto both backends.
 pub const SCHEMA_SCAFFOLD_TEMPLATE: &str = "// Migration (portable schema DSL): lowered to the connected driver's own DDL — SQLite gets\n\
-     // `INTEGER PRIMARY KEY AUTOINCREMENT`, Postgres `BIGSERIAL PRIMARY KEY`, and so on. This file's\n\
-     // contents are checksummed once applied, so edit it only before it runs.\n\
+     // `INTEGER PRIMARY KEY AUTOINCREMENT`, Postgres `BIGSERIAL PRIMARY KEY`, and so on. Once applied,\n\
+     // what is checksummed is the SCHEMA THIS FILE DESCRIBES, not its text: reformatting it or editing\n\
+     // a comment is safe, changing what it does is edited history. Make later changes in a new one.\n\
      //\n\
      // create_table(\"todos\")\n\
      //     .id()\n\
@@ -771,14 +814,144 @@ mod tests {
     }
 
     #[test]
-    fn a_dsl_migrations_checksum_is_over_its_source_not_its_ddl() {
-        // The identity of a `.schema` migration is the file the author wrote, so it is the same
-        // whether it was applied against SQLite or Postgres — and a change to the lowering can never
-        // read as edited history.
+    fn a_raw_sql_migration_is_still_hashed_over_its_source() {
+        // Raw SQL *is* the DDL: there is no IR to canonicalize, so the bytes the author wrote are
+        // the identity — unchanged by this design, formatting and all.
+        let src = "CREATE   TABLE a (id INT);  -- a comment\n";
+        assert_eq!(
+            migration("0001_a.sql", src).checksum,
+            sha256_hex(src.as_bytes())
+        );
+    }
+
+    #[test]
+    fn a_dsl_migrations_checksum_is_over_the_canonical_ir_not_the_source_or_the_ddl() {
+        // The identity of a `.schema` migration is the schema it describes, rendered canonically —
+        // so it is the same whether it was applied against SQLite or Postgres, a change to the
+        // lowering can never read as edited history, and the file's text is not the fingerprint.
         let src = "create_table(\"t\").id()";
         let m = migration("0001_t.schema", src);
-        assert_eq!(m.checksum, sha256_hex(src.as_bytes()));
+        assert_eq!(
+            m.checksum,
+            sha256_hex(crate::schema::canonicalize(src).unwrap().as_bytes())
+        );
+        assert_ne!(m.checksum, sha256_hex(src.as_bytes()));
+        // The body is still kept verbatim — only the checksum goes through the IR.
         assert_eq!(m.body, src);
+    }
+
+    #[test]
+    fn reformatting_a_dsl_migration_does_not_change_its_checksum() {
+        // The whole point: a formatter hook, a re-indent, a rewritten comment, an added blank line,
+        // and either comment syntax all leave the migration's identity alone.
+        let terse = "create_table(\"t\").id().text(\"title\").not_null()";
+        let sprawling = "\n\
+             // The table this migration creates.\n\
+             create_table(\"t\")\n\
+             \t.id()\n\
+             \n\
+             \t.text(\"title\")   -- the headline\n\
+             \t\t.not_null()\n\
+             \n";
+        assert_eq!(
+            migration("0001_t.schema", terse).checksum,
+            migration("0001_t.schema", sprawling).checksum
+        );
+        // …and the two files really are different bytes, so the equality above says something.
+        assert_ne!(terse, sprawling);
+    }
+
+    #[test]
+    fn changing_what_a_dsl_migration_does_always_changes_its_checksum() {
+        // Every kind of meaning change — a renamed column, a changed type, a changed default, an
+        // added or dropped constraint, a reordered statement, an extra statement — is a distinct
+        // identity. (Pairwise distinct, so none of them collides with any other either.)
+        let variants = [
+            "create_table(\"t\").id().text(\"title\").not_null().bool(\"done\").default(false)",
+            // renamed column
+            "create_table(\"t\").id().text(\"name\").not_null().bool(\"done\").default(false)",
+            // changed type
+            "create_table(\"t\").id().int(\"title\").not_null().bool(\"done\").default(false)",
+            // changed default
+            "create_table(\"t\").id().text(\"title\").not_null().bool(\"done\").default(true)",
+            // dropped constraint
+            "create_table(\"t\").id().text(\"title\").bool(\"done\").default(false)",
+            // added constraint
+            "create_table(\"t\").id().text(\"title\").not_null().unique().bool(\"done\").default(false)",
+            // reordered columns
+            "create_table(\"t\").id().bool(\"done\").default(false).text(\"title\").not_null()",
+            // an extra statement
+            "create_table(\"t\").id().text(\"title\").not_null().bool(\"done\").default(false)\n\
+             create_index(\"t\").column(\"done\")",
+            // reordered statements
+            "create_index(\"t\").column(\"done\")\n\
+             create_table(\"t\").id().text(\"title\").not_null().bool(\"done\").default(false)",
+        ];
+        let checksums: Vec<String> = variants
+            .iter()
+            .map(|src| migration("0001_t.schema", src).checksum)
+            .collect();
+        for (i, a) in checksums.iter().enumerate() {
+            for (j, b) in checksums.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "variants {i} and {j} share a checksum");
+            }
+        }
+    }
+
+    #[test]
+    fn a_dsl_migrations_checksum_is_pinned_to_the_canonical_text() {
+        // A regression pin over a representative statement set: the checksum is the sha256 of THIS
+        // text, and of nothing that a `lower` change could touch. If a future canonical rendering
+        // changes, this fails — which is the point, since it would silently re-identify every
+        // already-applied `.schema` migration in every project.
+        let src = "
+            create_table(\"notes\")
+                .id()
+                .text(\"title\").not_null()
+                .bigint(\"author_id\").references(\"users\", \"id\").on_delete(\"CASCADE\")
+                .bool(\"pinned\").default(false)
+                .timestamps()
+                .unique(\"title\", \"author_id\")
+                .if_not_exists()
+
+            create_index(\"notes\").column(\"pinned\").unique().name(\"by_pinned\")
+            alter_table(\"notes\").add_text(\"body\").rename_column(\"title\", \"headline\")
+            drop_index(\"by_pinned\").if_exists()
+            drop_table(\"scratch\")
+        ";
+        let canonical = crate::schema::canonicalize(src).unwrap();
+        assert_eq!(
+            canonical,
+            "create_table(\"notes\")\
+             .id(\"id\").not_null()\
+             .text(\"title\").not_null()\
+             .bigint(\"author_id\").references(\"users\", \"id\").on_delete(\"cascade\")\
+             .bool(\"pinned\").default(false)\
+             .timestamp(\"created_at\").not_null().default_now()\
+             .timestamp(\"updated_at\").not_null().default_now()\
+             .unique(\"title\", \"author_id\")\
+             .if_not_exists()\n\
+             create_index(\"notes\").name(\"by_pinned\").columns(\"pinned\").unique()\n\
+             alter_table(\"notes\").add_text(\"body\").rename_column(\"title\", \"headline\")\n\
+             drop_index(\"by_pinned\").if_exists()\n\
+             drop_table(\"scratch\")\n"
+        );
+        assert_eq!(
+            migration("0001_notes.schema", src).checksum,
+            "5739ddfd8bc0649ee5c74cde071bb20da2388747426aaf2326e119dbae405ce0"
+        );
+    }
+
+    #[test]
+    fn a_malformed_dsl_body_falls_back_to_its_source() {
+        // No IR, no canonical form. The fallback keeps discovery total; the file can never be
+        // applied, so the checksum is never recorded (see `identity_text`).
+        let src = "create_table(\"t\").frobnicate()";
+        assert!(crate::schema::parse(src).is_err());
+        assert_eq!(
+            migration("0001_t.schema", src).checksum,
+            sha256_hex(src.as_bytes())
+        );
     }
 
     #[test]
@@ -1154,7 +1327,7 @@ mod sqlite_e2e {
     }
 
     #[test]
-    fn a_dsl_migration_is_tracked_by_filename_and_source_checksum() {
+    fn a_dsl_migration_is_tracked_by_filename_and_canonical_checksum() {
         let mut driver = mem();
         let migrations = mixed_migrations();
         apply(&mut driver, &migrations).unwrap();
@@ -1164,10 +1337,15 @@ mod sqlite_e2e {
         assert_eq!(recorded[0].checksum, migrations[0].checksum);
         assert_eq!(
             recorded[0].checksum,
-            sha256_hex(migrations[0].body.as_bytes())
+            sha256_hex(
+                crate::schema::canonicalize(&migrations[0].body)
+                    .unwrap()
+                    .as_bytes()
+            )
         );
 
-        // Editing a `.schema` file after it applied is edited history, exactly as for `.sql`.
+        // Editing a `.schema` file's *meaning* after it applied is edited history, exactly as for
+        // `.sql`.
         let edited = vec![
             Migration::new(
                 "0001_todos.schema",
@@ -1179,6 +1357,38 @@ mod sqlite_e2e {
             apply(&mut driver, &edited).unwrap_err(),
             MigrateError::ChecksumDrift { .. }
         ));
+    }
+
+    #[test]
+    fn reformatting_an_applied_dsl_migration_is_not_edited_history() {
+        let mut driver = mem();
+        let migrations = mixed_migrations();
+        apply(&mut driver, &migrations).unwrap();
+
+        // The same schema, run through a formatter: re-indented, re-wrapped, freshly commented, the
+        // modifiers moved onto their own lines. Different bytes, same migration.
+        let reformatted = vec![
+            Migration::new(
+                "0001_todos.schema",
+                "// Reformatted after it was applied — a comment rewritten, everything re-indented.\n\
+                 create_table( \"todos\" )\n\
+                 \t.id()\n\
+                 \t.text(\"title\")\n\
+                 \t\t.not_null()\n\
+                 \t.bool(\"done\")\n\
+                 \t\t.default(false)\n\
+                 \t.timestamps()\n\
+                 \n\
+                 -- and a SQL-style comment, for good measure\n\
+                 create_index(\"todos\")\n\
+                 \t.column(\"done\")\n",
+            ),
+            migrations[1].clone(),
+        ];
+        assert_ne!(reformatted[0].body, migrations[0].body);
+        // No drift, and nothing to re-apply.
+        assert!(apply(&mut driver, &reformatted).unwrap().is_empty());
+        assert!(status(&mut driver, &reformatted).unwrap()[0].applied);
     }
 
     #[test]
@@ -1371,8 +1581,9 @@ mod postgres_e2e {
             .unwrap();
         assert_eq!(indexes.len(), 1);
 
-        // Idempotent re-run, and the checksum recorded is the DSL *source* — byte-identical to the
-        // one SQLite would record for the same file.
+        // Idempotent re-run, and the checksum recorded is the canonical rendering of the DSL's IR —
+        // byte-identical to the one SQLite would record for the same file, since no dialect is on
+        // that path.
         assert!(apply(&mut driver, &migrations).unwrap().is_empty());
         let recorded = read_applied(&mut driver).unwrap();
         assert_eq!(recorded[0].checksum, migrations[0].checksum);

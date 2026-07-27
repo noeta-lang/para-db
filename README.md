@@ -193,9 +193,16 @@ migrations/
   20260727000003_add_archived.schema     # portable: alter_table("notes").add_bool("archived")…
 ```
 
-**A tracking table `_noeta_migrations`** records, for each applied migration, its `filename`, a **sha256 `checksum`** of the file contents, and `applied_at`. The checksum is taken over the **file source**, never over the lowered DDL: the source is what the author wrote and is byte-identical on every backend, so a `.schema` migration has one identity across SQLite and PostgreSQL, and a future improvement to the lowering can never read as edited history. Two integrity checks run before anything is applied, both hard errors that name the file:
+**A tracking table `_noeta_migrations`** records, for each applied migration, its `filename`, a **sha256 `checksum`**, and `applied_at`. The checksum is taken over what the migration *means*, never over the lowered DDL:
 
-- **Checksum drift** — an already-applied migration's file was edited. History is immutable; revert the edit or make the change in a new migration.
+- A **`.sql`** migration is hashed over its **file source**. Raw SQL *is* the DDL — the engine does not parse it, so the bytes the author wrote are the identity.
+- A **`.schema`** migration is hashed over the **canonical rendering of its parsed statements**: source → parse → the neutral IR → canonical re-render → sha256. Formatting is gone by the time the hash is taken, so re-indenting a file, wrapping a chain differently, or fixing a typo in a comment does **not** read as tampered history — while a renamed column, a changed default, an added constraint, or a reordered statement always does.
+
+Hashing the generated DDL instead would be worse on both counts: it is backend-dependent (`INTEGER PRIMARY KEY AUTOINCREMENT` here, `BIGSERIAL PRIMARY KEY` there), so one migration would have two identities — and it would turn any future improvement to the lowering into "history was edited" for every project that had already run it. The checksum is taken **before** lowering and never sees a dialect, so one `.schema` file has one identity across SQLite and PostgreSQL and the code generator stays free to improve.
+
+Two integrity checks run before anything is applied, both hard errors that name the file:
+
+- **Checksum drift** — an already-applied migration's file was edited. History is immutable; revert the edit or make the change in a new migration. (For a `.schema` file, only a change to what it *does* counts — reformat it freely.)
 - **Deleted applied migration** — a file recorded as applied is gone. Restore it, or `--reset` in development.
 
 A `.schema` body is parsed and lowered **before** its transaction opens, so a DSL syntax error stops the run with the file and line named and nothing touched.

@@ -1,6 +1,8 @@
 // A portable schema migration: this ONE file creates the table on SQLite and on PostgreSQL.
 // The engine lowers it through the connected driver just before applying it, and checksums the
-// source you see here — not the generated DDL — so its identity is the same on either backend.
+// SCHEMA it describes — not the generated DDL, and not this text — so its identity is the same on
+// either backend and survives reformatting. Re-indent this file or rewrite this comment and the
+// migration is still the same migration; rename a column and it is not.
 
 create_table("notes")
     .id()

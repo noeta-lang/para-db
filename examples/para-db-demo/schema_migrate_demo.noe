@@ -17,7 +17,8 @@ applied = conn.migrate("examples/para-db-demo/schema_migrations")
 echo "applied ${applied} migration(s)"
 
 // 2. Re-running is a no-op: a DSL migration is checksummed and tracked like any other. The checksum
-//    is over the file's SOURCE, so it is identical on SQLite and PostgreSQL.
+//    is over the canonical form of the schema each file DESCRIBES — not its text, not the DDL — so
+//    it is identical on SQLite and PostgreSQL, and reformatting a file is not edited history.
 again = conn.migrate("examples/para-db-demo/schema_migrations")
 echo "re-run applied ${again} migration(s)"
 
