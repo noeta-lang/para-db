@@ -5,7 +5,7 @@
 //! lives at the driver seam ([`crate::driver::SqlDriver::lower_schema`]) exactly like the `?`→`$N`
 //! rewrite does, so nothing above the seam ever branches on the backend.
 //!
-//! # The three pieces
+//! # The four pieces
 //!
 //! 1. **A source syntax** — a small fluent notation, deliberately shaped like the Noeta builder that
 //!    renders it, so a migration file reads as code:
@@ -27,6 +27,11 @@
 //! 3. **A per-dialect lowering** — [`lower`], parameterized by [`Dialect`]. The driver picks the
 //!    dialect; the rendering itself is one implementation, so the two backends can never grow
 //!    independent DDL writers.
+//!
+//! 4. **A canonical rendering** — [`render`], the inverse of [`parse`]: the IR spelled back out in
+//!    one fixed shape, with no [`Dialect`] anywhere in sight. It is what a `.schema` migration is
+//!    *checksummed* over, so a migration's identity is its meaning rather than its formatting (see
+//!    [`crate::migrate`]).
 //!
 //! # What is deliberately NOT here
 //!
@@ -75,6 +80,21 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
+    /// The DSL spelling of this type — the call that declares a column of it (`text("title")`), and,
+    /// prefixed with `add_`, the call that adds one to an existing table. The inverse of
+    /// [`column_type`], and the type's whole contribution to the canonical rendering.
+    fn dsl_name(self) -> &'static str {
+        match self {
+            ColumnType::Id => "id",
+            ColumnType::Text => "text",
+            ColumnType::Int => "int",
+            ColumnType::BigInt => "bigint",
+            ColumnType::Float => "float",
+            ColumnType::Bool => "bool",
+            ColumnType::Timestamp => "timestamp",
+        }
+    }
+
     /// The DDL type name for `dialect`. [`ColumnType::Id`] is not a type name but a whole column
     /// definition, so it is rendered by [`render_column`] instead and never reaches here.
     fn sql(self, dialect: Dialect) -> &'static str {
@@ -104,6 +124,21 @@ pub enum DefaultValue {
 }
 
 impl DefaultValue {
+    /// The canonical DSL call that reproduces this default — `.default(…)` for a literal,
+    /// `.default_now()` for [`DefaultValue::Now`], which has no literal spelling. A float always
+    /// carries a decimal point (`{:?}` is f64's shortest round-tripping form and never elides it), so
+    /// it re-lexes as a float and never as a whole number.
+    fn canonical(&self) -> String {
+        match self {
+            DefaultValue::Bool(true) => ".default(true)".to_string(),
+            DefaultValue::Bool(false) => ".default(false)".to_string(),
+            DefaultValue::Int(n) => format!(".default({n})"),
+            DefaultValue::Float(f) => format!(".default({f:?})"),
+            DefaultValue::Text(s) => format!(".default({})", quoted(s)),
+            DefaultValue::Now => ".default_now()".to_string(),
+        }
+    }
+
     /// The DDL literal. Text is single-quoted with `''` escaping (identical on both backends).
     fn sql(&self) -> String {
         match self {
@@ -136,6 +171,18 @@ pub enum RefAction {
 }
 
 impl RefAction {
+    /// The canonical DSL spelling — the one [`RefAction::parse`] round-trips exactly (it also accepts
+    /// other cases and separators, which the canonical form normalizes away).
+    fn dsl_name(self) -> &'static str {
+        match self {
+            RefAction::Cascade => "cascade",
+            RefAction::Restrict => "restrict",
+            RefAction::SetNull => "set_null",
+            RefAction::SetDefault => "set_default",
+            RefAction::NoAction => "no_action",
+        }
+    }
+
     fn sql(self) -> &'static str {
         match self {
             RefAction::Cascade => "CASCADE",
@@ -410,16 +457,24 @@ fn lex(src: &str) -> Parsed<Vec<Spanned>> {
                     i += 1;
                 }
                 let text: String = chars[start..i].iter().collect();
-                let literal =
-                    if seen_dot {
-                        Literal::Float(text.parse::<f64>().map_err(|_| {
-                            SchemaError::new(line, format!("`{text}` is not a number"))
-                        })?)
-                    } else {
-                        Literal::Int(text.parse::<i64>().map_err(|_| {
-                            SchemaError::new(line, format!("`{text}` is not a whole number"))
-                        })?)
-                    };
+                let literal = if seen_dot {
+                    let value = text
+                        .parse::<f64>()
+                        .map_err(|_| SchemaError::new(line, format!("`{text}` is not a number")))?;
+                    // A literal too large for f64 parses as an infinity, which has no DDL
+                    // spelling and no DSL spelling — refuse it here rather than render `inf`.
+                    if !value.is_finite() {
+                        return Err(SchemaError::new(
+                            line,
+                            format!("`{text}` is out of range for a number"),
+                        ));
+                    }
+                    Literal::Float(value)
+                } else {
+                    Literal::Int(text.parse::<i64>().map_err(|_| {
+                        SchemaError::new(line, format!("`{text}` is not a whole number"))
+                    })?)
+                };
                 out.push(Spanned {
                     token: Token::Literal(literal),
                     line,
@@ -1152,6 +1207,204 @@ fn validate_alter(root: &Call, alter: &AlterTable) -> Parsed<()> {
     Ok(())
 }
 
+// --- Canonical rendering --------------------------------------------------------------------------
+
+/// Render statements back into **canonical** schema-DSL source — the inverse of [`parse`], in one
+/// fixed shape: one statement per line, every link inline, no comments, no indentation, arguments
+/// spelled the one way the grammar accepts them.
+///
+/// This is the **identity of a schema migration**. The migration engine hashes *this* rather than the
+/// file the author wrote, which is what makes a `.schema` migration's checksum survive reformatting:
+/// whitespace, line breaks, comments, `.timestamps()` vs the two columns it stands for, and the
+/// forgiving spellings of a referential action all disappear on the way through the IR, while every
+/// field of every statement survives.
+///
+/// It is deliberately **not** the lowered DDL: nothing here consults a [`Dialect`], so one migration
+/// has one identity on every backend, and a later improvement to [`lower`] can never read as edited
+/// history.
+///
+/// The output re-parses to an equal IR (`parse(render(parse(src))) == parse(src)`), which is the
+/// property that makes the rendering injective — two migrations that differ in *anything* the IR
+/// records cannot collide on one canonical text. Every statement below is rendered by destructuring
+/// its struct or exhaustively matching its enum with **no** catch-all, so a new IR field or variant
+/// stops compiling here rather than silently vanishing from the checksum.
+pub fn render(statements: &[Statement]) -> String {
+    let mut out = String::new();
+    for statement in statements {
+        render_statement(statement, &mut out);
+        out.push('\n');
+    }
+    out
+}
+
+fn render_statement(statement: &Statement, out: &mut String) {
+    match statement {
+        Statement::CreateTable(table) => {
+            let CreateTable {
+                name,
+                if_not_exists,
+                columns,
+                primary_key,
+                uniques,
+            } = table;
+            out.push_str(&format!("create_table({})", quoted(name)));
+            for column in columns {
+                render_column_chain(column, "", out);
+            }
+            // Table-level keys follow every column, so the argument-less column modifiers above can
+            // never be mistaken for them (the parser tells the two apart by arity).
+            if !primary_key.is_empty() {
+                out.push_str(&format!(".primary_key({})", quoted_list(primary_key)));
+            }
+            for unique in uniques {
+                out.push_str(&format!(".unique({})", quoted_list(unique)));
+            }
+            if *if_not_exists {
+                out.push_str(".if_not_exists()");
+            }
+        }
+        Statement::DropTable { name, if_exists } => {
+            out.push_str(&format!("drop_table({})", quoted(name)));
+            if *if_exists {
+                out.push_str(".if_exists()");
+            }
+        }
+        Statement::CreateIndex(index) => {
+            let CreateIndex {
+                table,
+                name,
+                columns,
+                unique,
+                if_not_exists,
+            } = index;
+            out.push_str(&format!("create_index({})", quoted(table)));
+            // An explicit name is rendered only when there is one: an index that leaves the name to
+            // be derived is a different statement from one that spells the derived name out, and the
+            // canonical form must keep them apart.
+            if let Some(name) = name {
+                out.push_str(&format!(".name({})", quoted(name)));
+            }
+            out.push_str(&format!(".columns({})", quoted_list(columns)));
+            if *unique {
+                out.push_str(".unique()");
+            }
+            if *if_not_exists {
+                out.push_str(".if_not_exists()");
+            }
+        }
+        Statement::DropIndex { name, if_exists } => {
+            out.push_str(&format!("drop_index({})", quoted(name)));
+            if *if_exists {
+                out.push_str(".if_exists()");
+            }
+        }
+        Statement::AlterTable(alter) => {
+            let AlterTable { name, actions } = alter;
+            out.push_str(&format!("alter_table({})", quoted(name)));
+            for action in actions {
+                render_alter_action(action, out);
+            }
+        }
+    }
+}
+
+fn render_alter_action(action: &AlterAction, out: &mut String) {
+    match action {
+        AlterAction::AddColumn(column) => render_column_chain(column, "add_", out),
+        AlterAction::DropColumn(name) => {
+            out.push_str(&format!(".drop_column({})", quoted(name)));
+        }
+        AlterAction::RenameColumn { from, to } => {
+            out.push_str(&format!(".rename_column({}, {})", quoted(from), quoted(to)));
+        }
+        AlterAction::RenameTable(name) => {
+            out.push_str(&format!(".rename_to({})", quoted(name)));
+        }
+    }
+}
+
+/// One column's declaring call plus every constraint it carries, in a fixed order. `prefix` is `""`
+/// inside a `create_table` and `"add_"` inside an `alter_table`, which is the only difference between
+/// the two spellings of a column.
+fn render_column_chain(column: &Column, prefix: &str, out: &mut String) {
+    // Destructured with no `..`: a new column field fails to compile until it is rendered here, and
+    // therefore until it is part of the migration's identity.
+    let Column {
+        name,
+        ty,
+        not_null,
+        unique,
+        primary_key,
+        default,
+        references,
+    } = column;
+    out.push_str(&format!(".{prefix}{}({})", ty.dsl_name(), quoted(name)));
+    if *primary_key {
+        out.push_str(".primary_key()");
+    }
+    if *not_null {
+        out.push_str(".not_null()");
+    }
+    if *unique {
+        out.push_str(".unique()");
+    }
+    if let Some(default) = default {
+        out.push_str(&default.canonical());
+    }
+    if let Some(key) = references {
+        let ForeignKey {
+            table,
+            column,
+            on_delete,
+            on_update,
+        } = key;
+        out.push_str(&format!(
+            ".references({}, {})",
+            quoted(table),
+            quoted(column)
+        ));
+        if let Some(action) = on_delete {
+            out.push_str(&format!(".on_delete({})", quoted(action.dsl_name())));
+        }
+        if let Some(action) = on_update {
+            out.push_str(&format!(".on_update({})", quoted(action.dsl_name())));
+        }
+    }
+}
+
+/// A DSL string literal: double-quoted, with the four escapes [`lex_string`] reads. Identifiers are
+/// already validated by [`ident`], but defaults are arbitrary text, so this is what keeps the
+/// canonical rendering re-parseable.
+fn quoted(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A list of names as DSL arguments (`"a", "b"`).
+fn quoted_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| quoted(name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse and canonically re-render in one step — the checksum pipeline of a `.schema` migration.
+pub fn canonicalize(src: &str) -> Result<String, SchemaError> {
+    Ok(render(&parse(src)?))
+}
+
 // --- Lowering -----------------------------------------------------------------------------------
 
 /// Lower backend-neutral statements into `dialect`'s DDL — a `;`-terminated script ready for
@@ -1621,5 +1874,200 @@ mod tests {
     fn an_empty_source_lowers_to_nothing() {
         assert_eq!(parse("").unwrap(), Vec::new());
         assert_eq!(sqlite("// nothing but a comment\n"), "");
+    }
+
+    #[test]
+    fn a_number_too_large_for_a_float_is_refused_rather_than_rendered_as_infinity() {
+        let huge = format!(
+            "create_table(\"t\").float(\"x\").default({}.0)",
+            "9".repeat(400)
+        );
+        assert!(err(&huge).contains("out of range"), "{}", err(&huge));
+    }
+
+    // --- The canonical rendering ------------------------------------------------------------------
+
+    /// Every corner of the vocabulary, so the round-trip and coverage tests below actually exercise
+    /// every `Statement` variant, every `AlterAction`, every `ColumnType`, every `DefaultValue`, and
+    /// a foreign key with both referential actions.
+    const CORPUS: &[&str] = &[
+        TODOS,
+        r#"create_table("t").id("uid").text("a").not_null().unique().int("b").primary_key()"#,
+        r#"create_table("t").bigint("a").float("b").bool("c").timestamp("d").primary_key("a", "b").unique("c").unique("d").if_not_exists()"#,
+        r#"create_table("t").text("a").default("it's \"fine\"\n\there").int("b").default(-3).float("c").default(1.0).float("d").default(-0.5).bool("e").default(true).timestamp("f").default_now()"#,
+        r#"create_table("t").bigint("a").references("u", "id").on_delete("SET-NULL").on_update("no action")"#,
+        r#"create_index("t").column("a")"#,
+        r#"create_index("t").columns("a", "b").name("by_ab").unique().if_not_exists()"#,
+        r#"drop_table("t")"#,
+        r#"drop_table("t").if_exists()"#,
+        r#"drop_index("i")"#,
+        r#"drop_index("i").if_exists()"#,
+        r#"alter_table("t").add_text("a").add_int("b").default(0).add_bigint("c").references("u", "id").add_float("d").add_bool("e").not_null().default(false).add_timestamp("f").drop_column("g").rename_column("h", "i")"#,
+        r#"alter_table("t").rename_to("u")"#,
+    ];
+
+    #[test]
+    fn the_canonical_rendering_re_parses_to_the_same_ir_and_is_idempotent() {
+        // The property that makes the rendering injective: nothing the IR records is lost on the way
+        // out, so two migrations that differ at all cannot share one canonical text.
+        for src in CORPUS {
+            let ir = parse(src).unwrap();
+            let canonical = render(&ir);
+            let round_tripped = parse(&canonical)
+                .unwrap_or_else(|e| panic!("canonical text does not re-parse: {e}\n{canonical}"));
+            assert_eq!(round_tripped, ir, "round-trip changed the IR\n{canonical}");
+            assert_eq!(render(&round_tripped), canonical, "not idempotent");
+        }
+    }
+
+    #[test]
+    fn the_canonical_rendering_is_the_same_for_any_formatting_of_one_schema() {
+        // Whitespace, line breaks, indentation, both comment syntaxes, `.timestamps()` versus the
+        // two columns it stands for, and a forgiving referential-action spelling all normalize away.
+        let sprawling = "
+            // The todos table.
+            create_table(  \"todos\"  )
+
+                .id()
+                .text(\"title\")
+                    .not_null()     -- the headline
+                .bool(\"done\").default(false)
+                .timestamp(\"created_at\").not_null().default_now()
+                .timestamp(\"updated_at\").not_null().default_now()
+        ";
+        assert_eq!(
+            canonicalize(TODOS).unwrap(),
+            canonicalize(sprawling).unwrap()
+        );
+
+        let loud = r#"create_table("t").bigint("a").references("u", "id").on_delete("Set Null")"#;
+        let quiet = r#"create_table("t").bigint("a").references("u","id").on_delete("set_null")"#;
+        assert_eq!(canonicalize(loud).unwrap(), canonicalize(quiet).unwrap());
+    }
+
+    #[test]
+    fn the_canonical_rendering_names_no_dialect() {
+        // Backend-independence, structurally: `render` takes no `Dialect` and reaches nothing that
+        // does, so there is exactly one canonical text per schema. The `lower`ings of the same IR
+        // differ — which is precisely why the checksum is taken here and not there.
+        let ir = parse(TODOS).unwrap();
+        assert_ne!(lower(&ir, Dialect::Sqlite), lower(&ir, Dialect::Postgres));
+        assert_eq!(render(&ir), render(&parse(TODOS).unwrap()));
+    }
+
+    #[test]
+    fn the_canonical_rendering_is_one_line_per_statement() {
+        let canonical = canonicalize(
+            r#"
+            create_table("a").int("x")
+            create_index("a").column("x")
+            drop_table("b").if_exists()
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical,
+            "create_table(\"a\").int(\"x\")\n\
+             create_index(\"a\").columns(\"x\")\n\
+             drop_table(\"b\").if_exists()\n"
+        );
+        assert_eq!(canonicalize("// only a comment\n").unwrap(), "");
+    }
+
+    #[test]
+    fn every_ir_field_reaches_the_canonical_text() {
+        // Field-by-field: flip exactly one thing in the source and the canonical text must move. The
+        // compiler enforces *presence* (`render` destructures every struct with no `..` and matches
+        // every enum with no catch-all); this enforces that what it renders is actually distinct.
+        let variants = [
+            // CreateTable: name, if_not_exists, columns, primary_key, uniques
+            r#"create_table("t").int("a").int("b")"#,
+            r#"create_table("u").int("a").int("b")"#,
+            r#"create_table("t").int("a").int("b").if_not_exists()"#,
+            r#"create_table("t").int("a").int("c")"#,
+            r#"create_table("t").int("a").int("b").primary_key("a")"#,
+            r#"create_table("t").int("a").int("b").primary_key("a", "b")"#,
+            r#"create_table("t").int("a").int("b").unique("a")"#,
+            r#"create_table("t").int("a").int("b").unique("a").unique("b")"#,
+            // Column: name, ty, not_null, unique, primary_key, default, references
+            r#"create_table("t").int("a")"#,
+            r#"create_table("t").int("z")"#,
+            r#"create_table("t").bigint("a")"#,
+            r#"create_table("t").int("a").not_null()"#,
+            r#"create_table("t").int("a").unique()"#,
+            r#"create_table("t").int("a").primary_key()"#,
+            r#"create_table("t").int("a").default(1)"#,
+            r#"create_table("t").int("a").default(2)"#,
+            r#"create_table("t").int("a").default(2.0)"#,
+            r#"create_table("t").int("a").default("2")"#,
+            r#"create_table("t").int("a").default(true)"#,
+            r#"create_table("t").int("a").default_now()"#,
+            // ForeignKey: table, column, on_delete, on_update
+            r#"create_table("t").bigint("a").references("u", "id")"#,
+            r#"create_table("t").bigint("a").references("v", "id")"#,
+            r#"create_table("t").bigint("a").references("u", "uid")"#,
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("cascade")"#,
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("restrict")"#,
+            r#"create_table("t").bigint("a").references("u", "id").on_update("cascade")"#,
+            // CreateIndex: table, name, columns, unique, if_not_exists
+            r#"create_index("t").column("a")"#,
+            r#"create_index("u").column("a")"#,
+            r#"create_index("t").column("a").name("idx_t_a")"#,
+            r#"create_index("t").column("b")"#,
+            r#"create_index("t").columns("a", "b")"#,
+            r#"create_index("t").columns("b", "a")"#,
+            r#"create_index("t").column("a").unique()"#,
+            r#"create_index("t").column("a").if_not_exists()"#,
+            // DropTable / DropIndex: name, if_exists
+            r#"drop_table("t")"#,
+            r#"drop_table("u")"#,
+            r#"drop_table("t").if_exists()"#,
+            r#"drop_index("t")"#,
+            r#"drop_index("t").if_exists()"#,
+            // AlterTable: name, actions (all four)
+            r#"alter_table("t").add_text("a")"#,
+            r#"alter_table("u").add_text("a")"#,
+            r#"alter_table("t").add_int("a")"#,
+            r#"alter_table("t").drop_column("a")"#,
+            r#"alter_table("t").rename_column("a", "b")"#,
+            r#"alter_table("t").rename_column("b", "a")"#,
+            r#"alter_table("t").rename_to("a")"#,
+            r#"alter_table("t").add_text("a").drop_column("b")"#,
+            r#"alter_table("t").drop_column("b").add_text("a")"#,
+        ];
+        let mut seen: Vec<(usize, String)> = Vec::new();
+        for (i, src) in variants.iter().enumerate() {
+            let canonical = canonicalize(src).unwrap();
+            if let Some((j, _)) = seen.iter().find(|(_, text)| *text == canonical) {
+                panic!("variants {j} and {i} collide on `{canonical}`");
+            }
+            seen.push((i, canonical));
+        }
+    }
+
+    #[test]
+    fn a_text_default_survives_the_round_trip_with_its_escapes() {
+        let src =
+            "create_table(\"t\").text(\"a\").default(\"a \\\"quote\\\", a \\\\ and a\\nline\")";
+        let canonical = canonicalize(src).unwrap();
+        assert_eq!(
+            canonical,
+            "create_table(\"t\").text(\"a\").default(\"a \\\"quote\\\", a \\\\ and a\\nline\")\n"
+        );
+        assert_eq!(parse(&canonical).unwrap(), parse(src).unwrap());
+    }
+
+    #[test]
+    fn a_whole_float_default_stays_a_float() {
+        // `1.0` must not canonicalize to `1`, which would re-lex as an int and quietly change the
+        // migration's meaning (and collide with the int-defaulted one).
+        let float = canonicalize(r#"create_table("t").float("a").default(1.0)"#).unwrap();
+        let int = canonicalize(r#"create_table("t").float("a").default(1)"#).unwrap();
+        assert!(float.contains(".default(1.0)"), "{float}");
+        assert_ne!(float, int);
+        assert_eq!(
+            parse(&float).unwrap()[0],
+            parse(r#"create_table("t").float("a").default(1.0)"#).unwrap()[0]
+        );
     }
 }
