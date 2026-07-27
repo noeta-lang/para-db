@@ -87,6 +87,7 @@ pub const DB_FNS: &[ExtFn] = &[ExtFn {
     name: "connect",
     params: &[SigType::String],
     ret: RetTy::Concrete(CONNECTION_SIG),
+    ..ExtFn::DEFAULTS
 }];
 
 /// The `db` module dispatch — parses the dsn scheme (the driver-selection point) and returns a
@@ -173,7 +174,8 @@ pub const CONNECTION_METHODS: &[ExtFn] = &[
         name: "execute",
         params: &[SigType::String, SigType::List(&SigType::Dyn)],
         ret: RetTy::Concrete(SigType::Int),
-    },
+    ..ExtFn::DEFAULTS
+},
     ExtFn {
         name: "query",
         params: &[SigType::String, SigType::List(&SigType::Dyn)],
@@ -181,27 +183,32 @@ pub const CONNECTION_METHODS: &[ExtFn] = &[
             &SigType::String,
             &SigType::Dyn,
         ))),
-    },
+    ..ExtFn::DEFAULTS
+},
     ExtFn {
         name: "notify",
         params: &[SigType::String],
         ret: RetTy::Concrete(SigType::Unit),
-    },
+    ..ExtFn::DEFAULTS
+},
     ExtFn {
         name: "migrate",
         params: &[SigType::String],
         ret: RetTy::Concrete(SigType::Int),
-    },
+    ..ExtFn::DEFAULTS
+},
     ExtFn {
         name: "seed",
         params: &[SigType::String],
         ret: RetTy::Concrete(SigType::Int),
-    },
+    ..ExtFn::DEFAULTS
+},
     ExtFn {
         name: "close",
         params: &[],
         ret: RetTy::Concrete(SigType::Unit),
-    },
+    ..ExtFn::DEFAULTS
+},
 ];
 
 /// The `Connection` method dispatch entry (paired with [`CONNECTION_METHODS`] at registration).

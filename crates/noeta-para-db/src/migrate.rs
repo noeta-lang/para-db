@@ -294,10 +294,16 @@ fn ensure_tracking_table(driver: &mut dyn SqlDriver) -> Result<(), MigrateError>
 
 /// Read every applied-migration record from the tracking table, ordered by filename.
 fn read_applied(driver: &mut dyn SqlDriver) -> Result<Vec<AppliedRecord>, MigrateError> {
+    // `applied_at` is cast in SQL rather than read as a timestamp: the row surface is textual
+    // (`SqlValue` has no temporal variant) and the Postgres driver receives a `timestamp` in
+    // binary, so reading the column raw fails outright — which broke every migrate *after* the
+    // first, the moment the tracking table had a row to read back. `CAST(… AS TEXT)` is portable
+    // across both drivers and makes the column text on the wire, which is all this needs.
     let rows = driver
         .query(
             &format!(
-                "SELECT filename, checksum, applied_at FROM {TRACKING_TABLE} ORDER BY filename"
+                "SELECT filename, checksum, CAST(applied_at AS TEXT) AS applied_at \
+                 FROM {TRACKING_TABLE} ORDER BY filename"
             ),
             &[],
         )
@@ -312,8 +318,8 @@ fn read_applied(driver: &mut dyn SqlDriver) -> Result<Vec<AppliedRecord>, Migrat
         .collect())
 }
 
-/// Read a text column from a row, tolerating whatever scalar the driver returns (Postgres surfaces
-/// `applied_at` as a timestamp value rendered to text; SQLite returns it as text already).
+/// Read a text column from a row, tolerating whatever scalar the driver returns (`applied_at` is
+/// cast to text by the query above on both drivers; the other columns are text already).
 fn column_text(row: &crate::driver::Row, name: &str) -> String {
     row.iter()
         .find(|(col, _)| col == name)
