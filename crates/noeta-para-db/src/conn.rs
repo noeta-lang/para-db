@@ -174,8 +174,8 @@ pub const CONNECTION_METHODS: &[ExtFn] = &[
         name: "execute",
         params: &[SigType::String, SigType::List(&SigType::Dyn)],
         ret: RetTy::Concrete(SigType::Int),
-    ..ExtFn::DEFAULTS
-},
+        ..ExtFn::DEFAULTS
+    },
     ExtFn {
         name: "query",
         params: &[SigType::String, SigType::List(&SigType::Dyn)],
@@ -183,32 +183,38 @@ pub const CONNECTION_METHODS: &[ExtFn] = &[
             &SigType::String,
             &SigType::Dyn,
         ))),
-    ..ExtFn::DEFAULTS
-},
+        ..ExtFn::DEFAULTS
+    },
     ExtFn {
         name: "notify",
         params: &[SigType::String],
         ret: RetTy::Concrete(SigType::Unit),
-    ..ExtFn::DEFAULTS
-},
+        ..ExtFn::DEFAULTS
+    },
     ExtFn {
         name: "migrate",
         params: &[SigType::String],
         ret: RetTy::Concrete(SigType::Int),
-    ..ExtFn::DEFAULTS
-},
+        ..ExtFn::DEFAULTS
+    },
     ExtFn {
         name: "seed",
         params: &[SigType::String],
         ret: RetTy::Concrete(SigType::Int),
-    ..ExtFn::DEFAULTS
-},
+        ..ExtFn::DEFAULTS
+    },
+    ExtFn {
+        name: "apply_schema",
+        params: &[SigType::String],
+        ret: RetTy::Concrete(SigType::Int),
+        ..ExtFn::DEFAULTS
+    },
     ExtFn {
         name: "close",
         params: &[],
         ret: RetTy::Concrete(SigType::Unit),
-    ..ExtFn::DEFAULTS
-},
+        ..ExtFn::DEFAULTS
+    },
 ];
 
 /// The `Connection` method dispatch entry (paired with [`CONNECTION_METHODS`] at registration).
@@ -291,6 +297,23 @@ fn connection_method_dispatch(
             // never implicit — the app opts in and controls the order (migrate, then seed).
             let ran = crate::migrate::seed(&mut **driver, &seeds).map_err(migrate_error)?;
             Ok(NativeOut::Scalar(Scalar::Int(ran.len() as i64)))
+        }
+        "apply_schema" => {
+            want_arity(method, args, 1)?;
+            let source = want_str(method, args, 0)?.to_string();
+            // Parse the portable DSL once (backend-independent), then let the connected driver lower
+            // it — the same two steps the migration engine takes for a `.schema` file, so a schema
+            // built in Noeta and a schema written in a migration go through one code path.
+            let statements = crate::schema::parse(&source)
+                .map_err(|e| io_error(format!("para.db: invalid schema DSL — {e}")))?;
+            let conn = conn_of(recv)?;
+            let mut driver = conn
+                .0
+                .lock()
+                .map_err(|_| io_error("connection lock poisoned"))?;
+            let ddl = driver.lower_schema(&statements).map_err(io_error)?;
+            driver.execute_batch(&ddl).map_err(io_error)?;
+            Ok(NativeOut::Scalar(Scalar::Int(statements.len() as i64)))
         }
         "close" => {
             want_arity(method, args, 0)?;

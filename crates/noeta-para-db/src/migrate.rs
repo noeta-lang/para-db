@@ -5,14 +5,26 @@
 //!
 //! # Design
 //!
-//! **Migrations are plain `.sql` files** in a project directory (default `migrations/`), ordered by a
-//! **sortable filename prefix**. The engine sorts lexicographically over the whole filename, so any
+//! **Migrations are files** in a project directory (default `migrations/`), ordered by a **sortable
+//! filename prefix**. The engine sorts lexicographically over the whole filename, so any
 //! zero-padded/monotonic scheme works; `migrate new` scaffolds a UTC-timestamp prefix
 //! (`YYYYMMDDHHMMSS_name.sql`) because timestamps never collide across the many concurrent branches
-//! this project is developed on, while still sorting chronologically. Migration bodies are run
-//! **verbatim** in the target dialect's native SQL (via [`SqlDriver::execute_batch`], no `?`→`$N`
-//! rewrite), so there is no portability translation — write portable SQL, or maintain per-dialect
-//! directories later (a documented, deferred option).
+//! this project is developed on, while still sorting chronologically.
+//!
+//! **Two body languages, one ordering.** A migration's extension picks how its body becomes DDL
+//! ([`MigrationKind`]):
+//!   * `.sql` — run **verbatim** in the target dialect's native SQL (via [`SqlDriver::execute_batch`],
+//!     no `?`→`$N` rewrite). The escape hatch: anything dialect-specific is written here.
+//!   * `.schema` — the **portable schema DSL** ([`crate::schema`]), lowered to the connected driver's
+//!     DDL at the driver seam ([`SqlDriver::lower_schema`]) just before it is applied. One file
+//!     migrates both SQLite and Postgres.
+//!
+//! Both kinds live in the **same** directory and interleave in one filename order, so a project
+//! writes portable migrations by default and drops to raw SQL for the one step that needs it.
+//! **A migration's checksum is taken over its file source, never over the lowered DDL** — the source
+//! is what the author owns and is identical on every backend, so a DSL migration's identity is stable
+//! across SQLite and Postgres and across para/db versions (a lowering improvement must never read as
+//! edited history).
 //!
 //! **A tracking table** [`TRACKING_TABLE`] records each applied migration's filename, a **sha256
 //! checksum** of its contents, and the time it was applied. Two integrity gates run before anything is
@@ -45,32 +57,91 @@ use crate::driver::{SqlDriver, SqlValue};
 /// tracking schema.
 pub const TRACKING_TABLE: &str = "_noeta_migrations";
 
-/// The extension a migration file must carry.
-const SQL_EXTENSION: &str = "sql";
+/// The extension of a raw-SQL migration — the body is run verbatim.
+pub const SQL_EXTENSION: &str = "sql";
 
-/// A discovered migration file: its filename (the ordering key), its verbatim SQL body, and the
-/// sha256 hex checksum of that body (the history-integrity fingerprint).
+/// The extension of a portable schema-DSL migration — the body is lowered per driver.
+pub const SCHEMA_EXTENSION: &str = "schema";
+
+/// How a migration's body becomes DDL. Decided by the file's **extension**, so the body language is
+/// visible in the directory listing and needs no in-file marker (which a checksum would then have to
+/// treat as history).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationKind {
+    /// A `.sql` body: native SQL for the connected backend, run verbatim.
+    Sql,
+    /// A `.schema` body: the portable schema DSL, lowered by the driver at apply time.
+    Schema,
+}
+
+impl MigrationKind {
+    /// The kind a filename declares — [`MigrationKind::Schema`] for `.schema`, otherwise raw SQL.
+    fn of(name: &str) -> MigrationKind {
+        let is_schema = std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(SCHEMA_EXTENSION));
+        if is_schema {
+            MigrationKind::Schema
+        } else {
+            MigrationKind::Sql
+        }
+    }
+}
+
+/// A discovered migration file: its filename (the ordering key **and** the body-language selector),
+/// its verbatim source body, and the sha256 hex checksum of that body (the history-integrity
+/// fingerprint).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Migration {
     /// The file name including extension, e.g. `20260719_143000_init.sql`. The lexicographic order
     /// key.
     pub name: String,
-    /// The verbatim file contents, applied as a single native-SQL batch.
-    pub sql: String,
-    /// Lowercase sha256 hex of `sql`.
+    /// The verbatim file contents: native SQL for a [`MigrationKind::Sql`] migration, schema-DSL
+    /// source for a [`MigrationKind::Schema`] one.
+    pub body: String,
+    /// Lowercase sha256 hex of `body` — the **source**, never the lowered DDL, so the identity of a
+    /// DSL migration does not depend on which backend it was applied against.
     pub checksum: String,
+    /// How [`Migration::lowered`] turns `body` into DDL.
+    pub kind: MigrationKind,
 }
 
 impl Migration {
-    /// Build a migration from a filename and its contents, computing the checksum.
-    pub fn new(name: impl Into<String>, sql: impl Into<String>) -> Migration {
+    /// Build a migration from a filename and its contents, computing the checksum and reading the
+    /// body language off the extension.
+    pub fn new(name: impl Into<String>, body: impl Into<String>) -> Migration {
         let name = name.into();
-        let sql = sql.into();
-        let checksum = sha256_hex(sql.as_bytes());
+        let body = body.into();
+        let checksum = sha256_hex(body.as_bytes());
+        let kind = MigrationKind::of(&name);
         Migration {
             name,
-            sql,
+            body,
             checksum,
+            kind,
+        }
+    }
+
+    /// The DDL to execute against `driver`: the body itself for a raw-SQL migration, or the body
+    /// parsed as schema DSL and lowered through [`SqlDriver::lower_schema`] for a `.schema` one. Run
+    /// **before** the migration's transaction opens, so a DSL syntax error never leaves a dangling
+    /// `BEGIN`.
+    fn lowered(&self, driver: &dyn SqlDriver) -> Result<String, MigrateError> {
+        match self.kind {
+            MigrationKind::Sql => Ok(self.body.clone()),
+            MigrationKind::Schema => {
+                let statements =
+                    crate::schema::parse(&self.body).map_err(|e| MigrateError::Schema {
+                        filename: self.name.clone(),
+                        message: e.to_string(),
+                    })?;
+                driver
+                    .lower_schema(&statements)
+                    .map_err(|message| MigrateError::Schema {
+                        filename: self.name.clone(),
+                        message,
+                    })
+            }
         }
     }
 }
@@ -114,6 +185,10 @@ pub enum MigrateError {
     DeletedApplied { filename: String },
     /// A migration failed while applying; the transaction was rolled back.
     Apply { filename: String, message: String },
+    /// A `.schema` migration's body is not valid portable schema DSL (or the connected driver has no
+    /// dialect mapping for it). Reported **before** the migration's transaction opens, so nothing was
+    /// touched.
+    Schema { filename: String, message: String },
     /// A seed file failed while running; its transaction was rolled back. Distinct from
     /// [`MigrateError::Apply`] so output names it as a seed, not a migration (seeds are untracked
     /// dev data — the prior seeds stay committed, the same stop-on-first-failure shape).
@@ -153,6 +228,10 @@ impl std::fmt::Display for MigrateError {
                     "migration `{filename}` failed and was rolled back: {message}"
                 )
             }
+            MigrateError::Schema { filename, message } => write!(
+                f,
+                "migration `{filename}` is not valid portable schema DSL: {message}"
+            ),
             MigrateError::Seed { filename, message } => {
                 write!(f, "seed `{filename}` failed and was rolled back: {message}")
             }
@@ -187,14 +266,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Discover every `*.sql` file directly under `dir`, sorted by filename, each with its checksum.
-/// The shared loader for **both** migrations and seeds — [`seed`] reuses it for the `seeds/` dir
-/// (a seed simply ignores the computed checksum, since seeds are not tracked history).
+/// Discover every `*.sql` and `*.schema` file directly under `dir`, sorted by filename, each with its
+/// checksum and its body language ([`MigrationKind`]). The shared loader for **both** migrations and
+/// seeds — [`seed`] reuses it for the `seeds/` dir (a seed simply ignores the computed checksum, since
+/// seeds are not tracked history).
+///
+/// The two extensions share **one** ordering: the sort is over the whole filename, so a raw-SQL and a
+/// DSL migration interleave by their timestamp prefixes exactly as two `.sql` files would, and the
+/// tracking table needs no notion of body language (the filename it already records carries it).
 ///
 /// A missing directory is an error (the caller asked to migrate but there is nowhere to read from);
 /// an *empty* existing directory yields an empty list (migrate is then a clean no-op). Sub-directories
-/// and non-`.sql` files are ignored — leaving room for a future per-dialect `dir/postgres/` overlay
-/// without disturbing v1.
+/// and files with any other extension are ignored — leaving room for a future per-dialect
+/// `dir/postgres/` overlay without disturbing what exists.
 pub fn load_dir(dir: &Path) -> Result<Vec<Migration>, MigrateError> {
     if !dir.exists() {
         return Err(MigrateError::Io(format!(
@@ -214,18 +298,19 @@ pub fn load_dir(dir: &Path) -> Result<Vec<Migration>, MigrateError> {
         let entry =
             entry.map_err(|e| MigrateError::Io(format!("reading `{}`: {e}", dir.display())))?;
         let path = entry.path();
-        let is_sql = path.is_file()
-            && path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case(SQL_EXTENSION));
-        if !is_sql {
+        let is_migration = path.is_file()
+            && path.extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case(SQL_EXTENSION)
+                    || ext.eq_ignore_ascii_case(SCHEMA_EXTENSION)
+            });
+        if !is_migration {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let sql = std::fs::read_to_string(&path).map_err(|e| {
+        let body = std::fs::read_to_string(&path).map_err(|e| {
             MigrateError::Io(format!("cannot read migration `{}`: {e}", path.display()))
         })?;
-        migrations.push(Migration::new(name, sql));
+        migrations.push(Migration::new(name, body));
     }
     migrations.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(migrations)
@@ -333,13 +418,15 @@ fn column_text(row: &crate::driver::Row, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Apply one migration inside its own transaction: `BEGIN`, run the verbatim body, record the row,
-/// `COMMIT`. Any failure rolls back (best-effort) and reports the file.
+/// Apply one migration inside its own transaction: lower the body to this driver's DDL, then `BEGIN`,
+/// run it, record the row, `COMMIT`. Any failure rolls back (best-effort) and reports the file.
+/// Lowering happens *outside* the transaction so a malformed `.schema` body never opens one.
 fn apply_one(driver: &mut dyn SqlDriver, migration: &Migration) -> Result<(), MigrateError> {
+    let ddl = migration.lowered(driver)?;
     driver.execute_batch("BEGIN").map_err(MigrateError::Db)?;
 
     let body = (|| -> Result<(), String> {
-        driver.execute_batch(&migration.sql)?;
+        driver.execute_batch(&ddl)?;
         driver.execute(
             &format!("INSERT INTO {TRACKING_TABLE} (filename, checksum) VALUES (?, ?)"),
             &[
@@ -438,8 +525,12 @@ pub fn seed(driver: &mut dyn SqlDriver, seeds: &[Migration]) -> Result<Vec<Strin
 /// Run one seed file inside its own transaction: `BEGIN`, the verbatim body, `COMMIT` — no tracking
 /// insert (seeds are not history). Any failure rolls back (best-effort) and reports the file.
 fn seed_one(driver: &mut dyn SqlDriver, file: &Migration) -> Result<(), MigrateError> {
+    // Seeds share the loader, so they share the body languages too: a `.sql` seed runs verbatim and a
+    // `.schema` one lowers through the driver first (rarely what a seed wants — seeds are data — but
+    // there is no reason for the two directories to understand different files).
+    let body = file.lowered(driver)?;
     driver.execute_batch("BEGIN").map_err(MigrateError::Db)?;
-    match driver.execute_batch(&file.sql) {
+    match driver.execute_batch(&body) {
         Ok(()) => driver.execute_batch("COMMIT").map_err(MigrateError::Db),
         Err(message) => {
             let _ = driver.execute_batch("ROLLBACK");
@@ -471,10 +562,15 @@ pub fn seed_only(
     seed(driver, seeds)
 }
 
-/// Build the filename for a new migration: `{prefix}_{slug}.sql`, where `slug` is `name` lowercased
-/// with every run of non-alphanumeric characters collapsed to a single `_`. Pure (the caller supplies
-/// the timestamp `prefix`), so it is testable without a clock.
-pub fn scaffold_filename(prefix: &str, name: &str) -> Result<String, MigrateError> {
+/// Build the filename for a new migration: `{prefix}_{slug}.{extension}`, where `slug` is `name`
+/// lowercased with every run of non-alphanumeric characters collapsed to a single `_`, and
+/// `extension` is [`SQL_EXTENSION`] or [`SCHEMA_EXTENSION`] (the body language). Pure (the caller
+/// supplies the timestamp `prefix`), so it is testable without a clock.
+pub fn scaffold_filename(
+    prefix: &str,
+    name: &str,
+    extension: &str,
+) -> Result<String, MigrateError> {
     let mut slug = String::with_capacity(name.len());
     let mut prev_underscore = false;
     for ch in name.chars() {
@@ -490,12 +586,34 @@ pub fn scaffold_filename(prefix: &str, name: &str) -> Result<String, MigrateErro
     if slug.is_empty() {
         return Err(MigrateError::InvalidName(name.to_string()));
     }
-    Ok(format!("{prefix}_{slug}.{SQL_EXTENSION}"))
+    Ok(format!("{prefix}_{slug}.{extension}"))
 }
 
-/// The starter body written into a freshly scaffolded migration file.
+/// The starter body written into a freshly scaffolded raw-SQL migration file.
 pub const SCAFFOLD_TEMPLATE: &str = "-- Migration: write forward-only SQL below. This file's contents are checksummed once applied,\n\
-     -- so edit it only before it runs; make later changes in a new migration.\n";
+     -- so edit it only before it runs; make later changes in a new migration.\n\
+     --\n\
+     -- This body runs VERBATIM in the connected database's own SQL dialect. For a migration that\n\
+     -- works on every backend, scaffold the portable schema DSL instead: `migrate new <name> --schema`.\n";
+
+/// The starter body written into a freshly scaffolded **portable schema-DSL** migration file — it
+/// shows the fluent shape and names the escape hatch, since the DSL deliberately covers only what
+/// lowers identically onto both backends.
+pub const SCHEMA_SCAFFOLD_TEMPLATE: &str = "// Migration (portable schema DSL): lowered to the connected driver's own DDL — SQLite gets\n\
+     // `INTEGER PRIMARY KEY AUTOINCREMENT`, Postgres `BIGSERIAL PRIMARY KEY`, and so on. This file's\n\
+     // contents are checksummed once applied, so edit it only before it runs.\n\
+     //\n\
+     // create_table(\"todos\")\n\
+     //     .id()\n\
+     //     .text(\"title\").not_null()\n\
+     //     .bool(\"done\").default(false)\n\
+     //     .timestamps()\n\
+     //\n\
+     // create_index(\"todos\").column(\"done\")\n\
+     //\n\
+     // Statements: create_table, alter_table, drop_table, create_index, drop_index.\n\
+     // Anything dialect-specific (views, triggers, json/uuid/decimal columns, partial indexes)\n\
+     // belongs in a raw `.sql` migration beside this one — the two interleave in filename order.\n";
 
 /// The starter body written into a freshly scaffolded seed file — re-runnable dev data, so it
 /// documents the idempotent-insert idiom inline.
@@ -612,21 +730,63 @@ mod tests {
     #[test]
     fn scaffold_filename_slugifies_and_prefixes() {
         assert_eq!(
-            scaffold_filename("20260719143000", "Add Users Table").unwrap(),
+            scaffold_filename("20260719143000", "Add Users Table", SQL_EXTENSION).unwrap(),
             "20260719143000_add_users_table.sql"
         );
         assert_eq!(
-            scaffold_filename("0004", "create--posts!!").unwrap(),
+            scaffold_filename("0004", "create--posts!!", SQL_EXTENSION).unwrap(),
             "0004_create_posts.sql"
+        );
+        // The body language is the extension, and nothing else about the name changes.
+        assert_eq!(
+            scaffold_filename("20260719143000", "Add Users Table", SCHEMA_EXTENSION).unwrap(),
+            "20260719143000_add_users_table.schema"
         );
     }
 
     #[test]
     fn scaffold_filename_rejects_an_empty_slug() {
         assert!(matches!(
-            scaffold_filename("0001", "!!!").unwrap_err(),
+            scaffold_filename("0001", "!!!", SQL_EXTENSION).unwrap_err(),
             MigrateError::InvalidName(_)
         ));
+    }
+
+    #[test]
+    fn the_extension_selects_the_body_language() {
+        assert_eq!(
+            migration("0001_a.sql", "SELECT 1;").kind,
+            MigrationKind::Sql
+        );
+        assert_eq!(
+            migration("0001_a.schema", "create_table(\"t\").int(\"x\")").kind,
+            MigrationKind::Schema
+        );
+        // Case-insensitive, like the loader's own extension match.
+        assert_eq!(
+            migration("0001_a.SCHEMA", "create_table(\"t\").int(\"x\")").kind,
+            MigrationKind::Schema
+        );
+    }
+
+    #[test]
+    fn a_dsl_migrations_checksum_is_over_its_source_not_its_ddl() {
+        // The identity of a `.schema` migration is the file the author wrote, so it is the same
+        // whether it was applied against SQLite or Postgres — and a change to the lowering can never
+        // read as edited history.
+        let src = "create_table(\"t\").id()";
+        let m = migration("0001_t.schema", src);
+        assert_eq!(m.checksum, sha256_hex(src.as_bytes()));
+        assert_eq!(m.body, src);
+    }
+
+    #[test]
+    fn schema_scaffold_template_shows_the_shape_and_names_the_escape_hatch() {
+        assert!(SCHEMA_SCAFFOLD_TEMPLATE.contains("create_table(\"todos\")"));
+        assert!(SCHEMA_SCAFFOLD_TEMPLATE.contains(".timestamps()"));
+        assert!(SCHEMA_SCAFFOLD_TEMPLATE.contains("raw `.sql` migration"));
+        // The SQL scaffold points the other way, so either starting point mentions the other.
+        assert!(SCAFFOLD_TEMPLATE.contains("--schema"));
     }
 
     #[test]
@@ -656,7 +816,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["0001_a.sql", "0002_b.sql"]
         );
-        assert_eq!(migrations[0].sql, "SELECT 1;");
+        assert_eq!(migrations[0].body, "SELECT 1;");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_dir_interleaves_both_body_languages_in_one_filename_order() {
+        let dir = std::env::temp_dir().join(format!("noeta-migrate-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0003_c.sql"), "SELECT 3;").unwrap();
+        std::fs::write(dir.join("0001_a.schema"), "create_table(\"a\").int(\"x\")").unwrap();
+        std::fs::write(dir.join("0002_b.sql"), "SELECT 2;").unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+
+        let migrations = load_dir(&dir).unwrap();
+        assert_eq!(
+            migrations
+                .iter()
+                .map(|m| (m.name.as_str(), m.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("0001_a.schema", MigrationKind::Schema),
+                ("0002_b.sql", MigrationKind::Sql),
+                ("0003_c.sql", MigrationKind::Sql),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -905,6 +1090,144 @@ mod sqlite_e2e {
         assert_eq!(count(&mut driver, "users"), 0);
     }
 
+    /// The regression corpus for the DSL slice: a portable `.schema` migration and a raw `.sql` one
+    /// in the same list, applied through the same engine in filename order.
+    fn mixed_migrations() -> Vec<Migration> {
+        vec![
+            Migration::new(
+                "0001_todos.schema",
+                "create_table(\"todos\")\n\
+                 .id()\n\
+                 .text(\"title\").not_null()\n\
+                 .bool(\"done\").default(false)\n\
+                 .timestamps()\n\
+                 \n\
+                 create_index(\"todos\").column(\"done\")\n",
+            ),
+            // Raw SQL keeps working unchanged, beside the DSL, in one directory.
+            Migration::new(
+                "0002_first_todo.sql",
+                "INSERT INTO todos (title) VALUES ('write a migration');",
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_schema_dsl_migration_applies_beside_a_raw_sql_one() {
+        let mut driver = mem();
+        let migrations = mixed_migrations();
+
+        let applied = apply(&mut driver, &migrations).unwrap();
+        assert_eq!(applied, vec!["0001_todos.schema", "0002_first_todo.sql"]);
+        assert!(table_exists(&mut driver, "todos"));
+
+        // The lowered SQLite DDL really is what the DSL described: an autoincrement identity, a
+        // NOT NULL text column, a defaulted boolean, and the two timestamps.
+        let rows = driver
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='todos'",
+                &[],
+            )
+            .unwrap();
+        let ddl = column_text(&rows[0], "sql");
+        assert!(
+            ddl.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "{ddl}"
+        );
+        assert!(ddl.contains("title TEXT NOT NULL"), "{ddl}");
+        assert!(ddl.contains("done BOOLEAN DEFAULT FALSE"), "{ddl}");
+        assert!(ddl.contains("created_at TIMESTAMP NOT NULL"), "{ddl}");
+
+        // The index landed under its derived name, and the raw-SQL insert ran against the DSL schema.
+        let indexes = driver
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_todos_done'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(count(&mut driver, "todos"), 1);
+
+        // Re-running is a no-op — the DSL migration is tracked exactly like a SQL one.
+        assert!(apply(&mut driver, &migrations).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_dsl_migration_is_tracked_by_filename_and_source_checksum() {
+        let mut driver = mem();
+        let migrations = mixed_migrations();
+        apply(&mut driver, &migrations).unwrap();
+
+        let recorded = read_applied(&mut driver).unwrap();
+        assert_eq!(recorded[0].filename, "0001_todos.schema");
+        assert_eq!(recorded[0].checksum, migrations[0].checksum);
+        assert_eq!(
+            recorded[0].checksum,
+            sha256_hex(migrations[0].body.as_bytes())
+        );
+
+        // Editing a `.schema` file after it applied is edited history, exactly as for `.sql`.
+        let edited = vec![
+            Migration::new(
+                "0001_todos.schema",
+                "create_table(\"todos\").id().text(\"t\")",
+            ),
+            migrations[1].clone(),
+        ];
+        assert!(matches!(
+            apply(&mut driver, &edited).unwrap_err(),
+            MigrateError::ChecksumDrift { .. }
+        ));
+    }
+
+    #[test]
+    fn an_alter_table_dsl_migration_evolves_an_existing_table() {
+        let mut driver = mem();
+        let mut migrations = mixed_migrations();
+        apply(&mut driver, &migrations).unwrap();
+
+        migrations.push(Migration::new(
+            "0003_notes.schema",
+            "alter_table(\"todos\")\n\
+             .add_text(\"note\")\n\
+             .add_bool(\"archived\").not_null().default(false)\n",
+        ));
+        assert_eq!(
+            apply(&mut driver, &migrations).unwrap(),
+            vec!["0003_notes.schema"]
+        );
+        // Both new columns exist and the pre-existing row got the declared default.
+        let rows = driver
+            .query("SELECT note, archived FROM todos", &[])
+            .unwrap();
+        assert_eq!(rows[0][0].1, SqlValue::Null);
+        assert_eq!(rows[0][1].1, SqlValue::Int(0)); // SQLite reads a boolean back as 0/1
+    }
+
+    #[test]
+    fn a_malformed_dsl_migration_fails_before_it_opens_a_transaction() {
+        let mut driver = mem();
+        let migrations = vec![
+            Migration::new("0001_ok.sql", "CREATE TABLE ok (id INTEGER);"),
+            Migration::new("0002_bad.schema", "create_table(\"bad\").frobnicate()"),
+        ];
+        let err = apply(&mut driver, &migrations).unwrap_err();
+        match &err {
+            MigrateError::Schema { filename, message } => {
+                assert_eq!(filename, "0002_bad.schema");
+                assert!(message.contains("frobnicate"), "{message}");
+            }
+            other => panic!("expected a schema error, got {other:?}"),
+        }
+        assert!(err.to_string().contains("not valid portable schema DSL"));
+        // The prior migration is committed and no transaction was left open — a following statement
+        // succeeds, which it could not inside an abandoned `BEGIN`.
+        assert!(table_exists(&mut driver, "ok"));
+        driver
+            .execute_batch("CREATE TABLE after (id INTEGER)")
+            .unwrap();
+    }
+
     #[test]
     fn seed_only_runs_seeds_once_the_schema_is_current() {
         let mut driver = mem();
@@ -992,6 +1315,66 @@ mod postgres_e2e {
         // Reset wipes and re-applies.
         let reapplied = reset(&mut driver, &migrations).unwrap();
         assert_eq!(reapplied.len(), 2);
+
+        driver.reset().expect("final cleanup");
+    }
+
+    /// The **same** `.schema` migration the SQLite e2e applies, run against a live Postgres: the one
+    /// file produces a `BIGSERIAL` identity here and an `AUTOINCREMENT` rowid there, and the raw-SQL
+    /// migration beside it inserts into the result either way. This is the portability claim, proven
+    /// end to end. (The lowered Postgres DDL string itself is asserted hermetically in
+    /// [`crate::schema`]'s tests, so this test's absence never leaves the Postgres path uncovered.)
+    #[test]
+    fn a_portable_schema_migration_applies_to_postgres_too() {
+        let Ok(dsn) = std::env::var("NOETA_PG_TEST_DSN") else {
+            return; // no server configured — skip
+        };
+        let mut driver = PostgresDriver::connect(&dsn).expect("connect to NOETA_PG_TEST_DSN");
+        driver.reset().expect("reset");
+
+        let migrations = vec![
+            Migration::new(
+                "0001_todos.schema",
+                "create_table(\"todos\")\n\
+                 .id()\n\
+                 .text(\"title\").not_null()\n\
+                 .bool(\"done\").default(false)\n\
+                 .timestamps()\n\
+                 \n\
+                 create_index(\"todos\").column(\"done\")\n",
+            ),
+            Migration::new(
+                "0002_first_todo.sql",
+                "INSERT INTO todos (title) VALUES ('write a migration');",
+            ),
+        ];
+
+        let applied = apply(&mut driver, &migrations).unwrap();
+        assert_eq!(applied, vec!["0001_todos.schema", "0002_first_todo.sql"]);
+
+        // `id` was auto-assigned by the sequence BIGSERIAL created, and `done` took its default.
+        let rows = driver
+            .query("SELECT id, title, done FROM todos ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].1, SqlValue::Int(1));
+        assert_eq!(rows[0][2].1, SqlValue::Bool(false));
+
+        // The index exists under the same derived name it gets on SQLite.
+        let indexes = driver
+            .query(
+                "SELECT indexname FROM pg_indexes WHERE tablename = 'todos' \
+                 AND indexname = 'idx_todos_done'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(indexes.len(), 1);
+
+        // Idempotent re-run, and the checksum recorded is the DSL *source* — byte-identical to the
+        // one SQLite would record for the same file.
+        assert!(apply(&mut driver, &migrations).unwrap().is_empty());
+        let recorded = read_applied(&mut driver).unwrap();
+        assert_eq!(recorded[0].checksum, migrations[0].checksum);
 
         driver.reset().expect("final cleanup");
     }

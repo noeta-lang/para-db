@@ -137,6 +137,15 @@ impl SqlDriver for SqliteDriver {
         self.conn.execute_batch(sql).map_err(|e| e.to_string())
     }
 
+    fn lower_schema(&self, statements: &[crate::schema::Statement]) -> Result<String, String> {
+        // The dialect is the only thing this driver contributes; the rendering itself is the one
+        // shared implementation, so SQLite and Postgres can never grow divergent DDL writers.
+        Ok(crate::schema::lower(
+            statements,
+            crate::schema::Dialect::Sqlite,
+        ))
+    }
+
     fn reset(&mut self) -> Result<(), String> {
         // Drop every user object. SQLite has no `DROP SCHEMA`, so enumerate `sqlite_master` and drop
         // each table/view/trigger (an index is dropped with its table; the `sqlite_%` internal objects

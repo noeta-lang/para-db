@@ -314,6 +314,15 @@ impl SqlDriver for PostgresDriver {
         self.client.batch_execute(sql).map_err(pg_err)
     }
 
+    fn lower_schema(&self, statements: &[crate::schema::Statement]) -> Result<String, String> {
+        // Same shared renderer as SQLite, one dialect over: `BIGSERIAL PRIMARY KEY` identities and
+        // `DOUBLE PRECISION` floats instead of `INTEGER PRIMARY KEY AUTOINCREMENT` and `REAL`.
+        Ok(crate::schema::lower(
+            statements,
+            crate::schema::Dialect::Postgres,
+        ))
+    }
+
     fn reset(&mut self) -> Result<(), String> {
         // The standard Postgres wipe: drop and recreate the `public` schema. This removes every table,
         // view, sequence, function, and (crucially) the `_noeta_migrations` tracking table in one step,

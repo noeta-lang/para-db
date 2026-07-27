@@ -94,16 +94,16 @@ pub const WATCH_METHODS: &[ExtFn] = &[
         name: "get",
         params: &[],
         ret: RetTy::Concrete(SigType::Int),
-    ..ExtFn::DEFAULTS
-},
+        ..ExtFn::DEFAULTS
+    },
     // `.pump() -> bool` — poll pending notifications; wake if any fired on this channel. Returns
     // whether it woke. Call it from the app's loop (e.g. the serve loop, alongside background tasks).
     ExtFn {
         name: "pump",
         params: &[],
         ret: RetTy::Concrete(SigType::Bool),
-    ..ExtFn::DEFAULTS
-},
+        ..ExtFn::DEFAULTS
+    },
 ];
 
 /// The extern box: the reactive-graph node, the arena cell holding the revision `int`, the shared

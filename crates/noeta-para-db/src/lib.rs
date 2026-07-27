@@ -21,6 +21,7 @@ pub mod driver;
 pub mod migrate;
 #[cfg(feature = "ring-postgres")]
 pub mod pg;
+pub mod schema;
 #[cfg(feature = "ring-sqlite")]
 pub mod sqlite;
 pub mod watch;
@@ -156,6 +157,14 @@ const CONNECTION_DOCS: &[(&str, &str)] = &[
          in its own transaction, and return the number applied (0 when already up to date). Uses the \
          `_noeta_migrations` tracking table and the same checksum/deleted-file integrity checks as \
          `noeta migrate`; call it at boot for a self-migrating app.",
+    ),
+    (
+        "apply_schema",
+        "Apply portable schema-DSL source (`create_table(\"todos\").id().text(\"title\")`, the same \
+         language a `.schema` migration is written in) to this connection, lowered to the driver's \
+         own DDL — `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite, `BIGSERIAL PRIMARY KEY` on \
+         Postgres. Returns the number of statements applied. `para.db.schema`'s builder renders this \
+         source; a migration is the durable way to run it.",
     ),
     (
         "close",

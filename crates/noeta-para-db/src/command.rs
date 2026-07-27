@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 use noeta_ext_abi::{ArgKind, ArgSpec, CommandCtx, ExtCommand, ParsedArgs};
 
 use crate::conn::open_driver;
-use crate::migrate::{self, MigrateError, SCAFFOLD_TEMPLATE};
+use crate::migrate::{
+    self, MigrateError, SCAFFOLD_TEMPLATE, SCHEMA_EXTENSION, SCHEMA_SCAFFOLD_TEMPLATE,
+    SQL_EXTENSION,
+};
 
 /// The default migrations directory when none is configured or passed.
 const DEFAULT_DIR: &str = "migrations";
@@ -89,6 +92,12 @@ pub const MIGRATE_COMMAND: ExtCommand = ExtCommand {
             kind: ArgKind::Bool,
         },
         ArgSpec {
+            name: "schema",
+            help: "For `new`: scaffold a portable schema-DSL migration (`<name>.schema`, lowered \
+                   per driver) instead of a raw `<name>.sql` one",
+            kind: ArgKind::Bool,
+        },
+        ArgSpec {
             name: "yes",
             help: "Skip the interactive confirmation for `--reset` (for scripts/CI)",
             kind: ArgKind::Bool,
@@ -110,11 +119,13 @@ fn migrate_run(ctx: &mut dyn CommandCtx, args: &ParsedArgs) -> u8 {
     execute(&inv, ctx, env_dsn, &mut out, &mut err, &mut TtyPrompt)
 }
 
-/// A `migrate new` scaffold request: a name, an optional target directory, and whether it is a seed.
+/// A `migrate new` scaffold request: a name, an optional target directory, whether it is a seed, and
+/// whether the body is the portable schema DSL rather than raw SQL.
 struct NewArgs {
     name: String,
     dir: Option<PathBuf>,
     seed: bool,
+    schema: bool,
 }
 
 /// The parsed `noeta migrate` invocation.
@@ -143,16 +154,26 @@ impl Invocation {
         let name = args.get_str("name");
         let dir = args.get_path("dir").map(Path::to_path_buf);
         let seed = args.get_bool("seed").unwrap_or(false);
+        let schema = args.get_bool("schema").unwrap_or(false);
         let (new, seed_only) = match action {
             Some("new") => {
                 let name = name.ok_or_else(|| {
                     "`migrate new` needs a name: `noeta migrate new <name>`".to_string()
                 })?;
+                if schema && seed {
+                    // A seed is data, not schema — the DSL has no vocabulary for rows.
+                    return Err(
+                        "`--schema` and `--seed` are mutually exclusive: a seed is re-runnable \
+                         data, which the schema DSL does not describe"
+                            .to_string(),
+                    );
+                }
                 (
                     Some(NewArgs {
                         name: name.to_string(),
                         dir: dir.clone(),
                         seed,
+                        schema,
                     }),
                     false,
                 )
@@ -229,7 +250,7 @@ fn execute(
 ) -> u8 {
     // `migrate new` is database-free: scaffold a file and return.
     if let Some(new) = &inv.new {
-        return match scaffold_new(ctx, &new.name, new.dir.as_deref(), new.seed) {
+        return match scaffold_new(ctx, &new.name, new.dir.as_deref(), new.seed, new.schema) {
             Ok(path) => {
                 let _ = writeln!(out, "Created {}", path.display());
                 0
@@ -404,25 +425,44 @@ fn report_seeds(out: &mut dyn Write, ran: &[String]) -> u8 {
 }
 
 /// Scaffold a new migration or seed file (creating the directory), returning the new path. A
-/// migration goes under the migrations directory with the checksum warning; a seed goes under the
-/// seeds directory with the idempotent-idiom template. Both use the same UTC-timestamp-prefixed,
-/// slugified filename.
+/// migration goes under the migrations directory (raw SQL by default, the portable schema DSL with
+/// `--schema`); a seed goes under the seeds directory with the idempotent-idiom template. All use the
+/// same UTC-timestamp-prefixed, slugified filename — only the extension and the starter body differ,
+/// so the ordering model is identical whichever body language is chosen.
+///
+/// **Raw SQL stays the default.** A `.schema` migration cannot express everything a `.sql` one can,
+/// and every existing project's muscle memory is `migrate new <name>` → a SQL file; making the DSL
+/// opt-in keeps that unchanged and keeps the scaffold honest about which one is the general tool.
 fn scaffold_new(
     ctx: &dyn CommandCtx,
     name: &str,
     dir: Option<&Path>,
     seed: bool,
+    schema: bool,
 ) -> Result<PathBuf, String> {
-    let (dir, template, label) = if seed {
+    let (dir, template, label, extension) = if seed {
         (
             resolve_seeds_dir(ctx, dir),
             migrate::SEED_SCAFFOLD_TEMPLATE,
             "seeds",
+            SQL_EXTENSION,
+        )
+    } else if schema {
+        (
+            resolve_dir(ctx, dir),
+            SCHEMA_SCAFFOLD_TEMPLATE,
+            "migrations",
+            SCHEMA_EXTENSION,
         )
     } else {
-        (resolve_dir(ctx, dir), SCAFFOLD_TEMPLATE, "migrations")
+        (
+            resolve_dir(ctx, dir),
+            SCAFFOLD_TEMPLATE,
+            "migrations",
+            SQL_EXTENSION,
+        )
     };
-    let filename = migrate::scaffold_filename(&utc_timestamp(), name)
+    let filename = migrate::scaffold_filename(&utc_timestamp(), name, extension)
         .map_err(|e: MigrateError| e.to_string())?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("cannot create {label} directory `{}`: {e}", dir.display()))?;
@@ -684,6 +724,7 @@ mod tests {
                 "--dry-run" => parsed.push_bool("dry-run", true),
                 "--reset" => parsed.push_bool("reset", true),
                 "--seed" => parsed.push_bool("seed", true),
+                "--schema" => parsed.push_bool("schema", true),
                 "--yes" => parsed.push_bool("yes", true),
                 positional => {
                     match positionals {
@@ -854,6 +895,112 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "sql"))
             .collect();
         assert_eq!(created.len(), 1);
+    }
+
+    #[test]
+    fn new_schema_scaffolds_a_portable_dsl_migration() {
+        let dir = temp_dir("new_schema", &[]);
+        let ctx = TestCtx::bare();
+
+        let outcome = run_in(
+            &dir,
+            &["new", "create todos", "--schema", "--dir", "migrations"],
+            &ctx,
+            None,
+        );
+        assert_eq!(outcome.code, 0, "{}", outcome.err);
+        assert!(
+            outcome.out.contains("_create_todos.schema"),
+            "{}",
+            outcome.out
+        );
+
+        // Exactly one .schema file landed, carrying the DSL starter body.
+        let created: Vec<_> = std::fs::read_dir(dir.join("migrations"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "schema"))
+            .collect();
+        assert_eq!(created.len(), 1);
+        let body = std::fs::read_to_string(created[0].path()).unwrap();
+        assert!(body.contains("create_table(\"todos\")"), "{body}");
+        assert!(body.contains("raw `.sql` migration"), "{body}");
+    }
+
+    #[test]
+    fn new_schema_and_seed_together_are_a_usage_error() {
+        let dir = temp_dir("new_schema_seed", &[]);
+        let outcome = run_in(
+            &dir,
+            &["new", "demo", "--schema", "--seed"],
+            &TestCtx::bare(),
+            None,
+        );
+        assert_eq!(outcome.code, 2);
+        assert!(
+            outcome.err.contains("mutually exclusive"),
+            "{}",
+            outcome.err
+        );
+    }
+
+    /// The end-to-end portability claim through the CLI: one `.schema` migration and one raw `.sql`
+    /// migration in one directory, applied in filename order against a real SQLite file, then
+    /// re-run as a no-op — the DSL is tracked, checksummed, and ordered exactly like raw SQL.
+    #[test]
+    fn a_schema_migration_applies_beside_raw_sql_through_the_cli() {
+        let dir = project(
+            "mixed",
+            &[
+                (
+                    "0001_todos.schema",
+                    "create_table(\"todos\")\n    .id()\n    .text(\"title\").not_null()\n    \
+                     .bool(\"done\").default(false)\n",
+                ),
+                (
+                    "0002_first.sql",
+                    "INSERT INTO todos (title) VALUES ('write a migration');",
+                ),
+            ],
+        );
+        let ctx = TestCtx::bare();
+        let db = dsn(&dir);
+
+        let first = run_in(&dir, &["--db", &db], &ctx, None);
+        assert_eq!(first.code, 0, "{}", first.err);
+        assert!(
+            first.out.contains("applied 0001_todos.schema"),
+            "{}",
+            first.out
+        );
+        assert!(
+            first.out.contains("applied 0002_first.sql"),
+            "{}",
+            first.out
+        );
+
+        let again = run_in(&dir, &["--db", &db], &ctx, None);
+        assert!(again.out.contains("Already up to date"), "{}", again.out);
+    }
+
+    #[test]
+    fn a_malformed_schema_migration_is_reported_with_its_line() {
+        let dir = project(
+            "bad_schema",
+            &[(
+                "0001_bad.schema",
+                "create_table(\"t\")\n    .frobnicate()\n",
+            )],
+        );
+        let db = dsn(&dir);
+        let outcome = run_in(&dir, &["--db", &db], &TestCtx::bare(), None);
+        assert_eq!(outcome.code, 1, "{}", outcome.err);
+        assert!(
+            outcome.err.contains("not valid portable schema DSL"),
+            "{}",
+            outcome.err
+        );
+        assert!(outcome.err.contains("line 2"), "{}", outcome.err);
     }
 
     #[test]

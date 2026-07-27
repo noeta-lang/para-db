@@ -76,5 +76,12 @@ missing_debug_implementations = "warn"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+# The extension ABI documents `ExtFn { name, params, ret, ..ExtFn::DEFAULTS }` as how an out-of-tree
+# registry table keeps compiling when the ABI grows an optional field (additive evolution, N3.6).
+# `ExtFn` happens to have exactly those three fields in the pinned toolchain release, so clippy reads
+# every such literal as a redundant struct update — true of this ABI version, wrong of the pattern.
+# Dropping the `..DEFAULTS` would break the next time the ABI gains a field, so the lint is allowed
+# rather than the convention abandoned.
+needless_update = "allow"
 
 [workspace]

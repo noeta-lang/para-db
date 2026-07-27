@@ -44,6 +44,20 @@ pub trait SqlDriver: Send {
         Err("this driver does not support multi-statement batch execution".to_string())
     }
 
+    /// Lower a **portable schema-DSL** statement list ([`crate::schema`]) into this backend's DDL —
+    /// the schema peer of the `?`→`$N` placeholder rewrite, and for the same reason: a dialect
+    /// difference is absorbed *here*, at the one seam a backend is wired in, so the migration engine
+    /// and the Noeta layers above it never branch on the driver. The returned script is a
+    /// `;`-terminated batch for [`SqlDriver::execute_batch`]. A driver that has no dialect mapping
+    /// leaves the default error, and only raw-SQL migrations work against it.
+    fn lower_schema(&self, statements: &[crate::schema::Statement]) -> Result<String, String> {
+        let _ = statements;
+        Err(
+            "this driver does not lower the portable schema DSL — write the migration as raw SQL"
+                .to_string(),
+        )
+    }
+
     /// **Destructively** reset the database to an empty schema — drop every object this connection
     /// owns. The dialect-specific wipe lives in each driver (SQLite drops every user table/view/
     /// trigger; Postgres `DROP SCHEMA public CASCADE; CREATE SCHEMA public`), so the migration runner
