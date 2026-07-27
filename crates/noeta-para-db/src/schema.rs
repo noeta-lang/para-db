@@ -1207,7 +1207,7 @@ fn validate_alter(root: &Call, alter: &AlterTable) -> Parsed<()> {
     Ok(())
 }
 
-// --- Canonical rendering --------------------------------------------------------------------------
+// --- Canonical rendering ------------------------------------------------------------------------
 
 /// Render statements back into **canonical** schema-DSL source — the inverse of [`parse`], in one
 /// fixed shape: one statement per line, every link inline, no comments, no indentation, arguments
