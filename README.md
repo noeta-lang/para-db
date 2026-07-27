@@ -10,6 +10,7 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
   - `postgres://user:pass@host:5432/db` (`postgresql://` too) — PostgreSQL
 - **`Connection`** — `execute(sql, params) -> int` / `query(sql, params) -> List<Map<string, dyn>>` with positional `?` bind parameters (rewritten per driver; never string-spliced, so no injection risk), plus `notify(channel)` (fire a change notification: Postgres `NOTIFY`, an in-process bus publish on SQLite), `migrate(dir)`, `seed(dir)`, `close()`.
 - **`para.db.query`** (pure Noeta) — a fluent query builder: `table("users").filter("age", ">", 18).order("name", "asc").limit(20)`.
+- **`para.db.schema`** (pure Noeta) — a portable schema builder, the DDL peer of the query builder: `create_table("todos").id().text("title").bool("done").default(false).timestamps()`, lowered to each driver's own DDL. The same notation is the body of a `.schema` migration.
 - **`para.db.repo`** (pure Noeta) — repository + unit-of-work: stage writes during a request, flush them as one transactional batch.
 - **`para.db.sql`** (pure Noeta) — the typed `@sql { … }` block tier: `${…}` holes are always bound parameters, never spliced.
 - **`para.db.reactive`** (pure Noeta) — `LiveRepository` + `db.watch`: reactive queries that re-run when the data changes (SQLite update hooks / Postgres `LISTEN`/`NOTIFY`).
@@ -27,7 +28,7 @@ native = ["para/db"]     # authorizes the package's native driver crate
 commands = ["para/db"]   # opts in to the `noeta migrate` CLI command
 ```
 
-The package is keyed `para`, so its modules address as `para.db`, `para.db.query`, `para.db.repo`, `para.db.sql`, and `para.db.reactive`. Optionally add a `[db]` table for `noeta migrate` (see below).
+The package is keyed `para`, so its modules address as `para.db`, `para.db.query`, `para.db.schema`, `para.db.repo`, `para.db.sql`, and `para.db.reactive`. Optionally add a `[db]` table for `noeta migrate` (see below).
 
 ## Usage
 
@@ -69,6 +70,77 @@ rows = run(conn, q)        // List<Map<string, dyn>>
 
 In an `update(columns, values)`, the SET bindings come first and the builder's filter bindings follow; `delete()` binds this builder's filters. Filter values become bound parameters, so a query built from untrusted input carries no injection risk.
 
+## Schema DSL — portable DDL, lowered per driver
+
+The query builder solves portability for *statements*: it emits neutral `?` placeholders and each driver rewrites them into its own binding syntax. `para.db.schema` is the same idea one level up, for *schema*: a table is described backend-neutrally and each driver lowers that description into its own DDL. The one description creates the table on SQLite and on PostgreSQL — so a project can develop on a SQLite file and deploy on Postgres from one set of migrations.
+
+```noeta
+use para.db
+use para.db.schema.{create_table, create_index, apply}
+
+conn = db.connect("sqlite::memory:")        // or postgres://… — nothing below changes
+
+apply(conn, [
+    create_table("todos")
+        .id()                               // driver-appropriate auto-assigned primary key
+        .text("title").not_null()
+        .bool("done").default(false)
+        .timestamps()                       // created_at + updated_at
+        .render(),
+    create_index("todos").column("done").render(),
+])
+```
+
+`id()` lowers to `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite and `BIGSERIAL PRIMARY KEY` on PostgreSQL; `float` lowers to `REAL` or `DOUBLE PRECISION`. Everything else in the vocabulary is spelled identically on both. **The lowering lives in the driver** (`SqlDriver::lower_schema`), exactly where the `?`→`$N` rewrite lives, so nothing above the driver seam branches on the backend — and a third driver gets the whole DSL by naming its dialect.
+
+A builder renders **schema-DSL source**: the very text a `.schema` migration file holds. `echo create_table("todos").id().render()` prints something you can paste straight into `migrations/`. There is one grammar and one lowering, both native, so the Noeta builder and the migration file cannot drift apart. `apply(conn, statements)` is for schema you build at runtime — a test fixture, a scratch database; for a durable change, write a `.schema` **migration** (below), which is checksummed, tracked, and applied exactly once.
+
+### The vocabulary
+
+The tables below name the **Noeta builder** methods. The `.schema` file notation is the same, with the one difference that a list argument is spelled as plain arguments: `primary_key(["a", "b"])` in Noeta is `primary_key("a", "b")` in a file. Every builder also has a `link(name, args)` escape hatch that emits an arbitrary DSL call, so a statement the Noeta surface has not wrapped yet is still reachable.
+
+| Statement | Chain |
+| --- | --- |
+| `create_table(name)` | columns, column modifiers, `primary_key([…])`, `unique([…])`, `if_not_exists()` |
+| `alter_table(name)` | `add_text/int/bigint/float/bool/timestamp(name)` (+ modifiers), `drop_column(name)`, `rename_column(from, to)`, `rename_to(name)` |
+| `drop_table(name)` | `if_exists()` |
+| `create_index(table)` | `column(name)`, `columns([…])`, `name(index)`, `unique()`, `if_not_exists()` |
+| `drop_index(name)` | `if_exists()` |
+
+| Column | SQLite | PostgreSQL |
+| --- | --- | --- |
+| `id()` | `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGSERIAL PRIMARY KEY` |
+| `text(n)` | `TEXT` | `TEXT` |
+| `int(n)` | `INTEGER` | `INTEGER` |
+| `bigint(n)` | `BIGINT` | `BIGINT` |
+| `float(n)` | `REAL` | `DOUBLE PRECISION` |
+| `bool(n)` | `BOOLEAN` | `BOOLEAN` |
+| `timestamp(n)` | `TIMESTAMP` | `TIMESTAMP` |
+| `timestamps()` | `created_at` + `updated_at`, both `TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP` | same |
+
+Column modifiers: `not_null()`, `default(literal)` (string / int / float / bool), `default_now()` (`CURRENT_TIMESTAMP`), `unique()`, `primary_key()`, and `references(table, column)` with `on_delete(action)` / `on_update(action)` (`"cascade"`, `"restrict"`, `"set_null"`, `"set_default"`, `"no_action"`). At table level, `primary_key(["a", "b"])` and `unique(["a", "b"])` are composite constraints. A column is **nullable unless you say otherwise**, exactly as in SQL — the DSL never invents a default SQL does not have. Use `bigint` for a foreign key onto an `id()` key: that is the width `id()` produces on both backends.
+
+A statement ends where its chain does — the next top-level call starts a new statement, so no separator is needed. Line comments are `//` or `--`, whichever reads better in a given file.
+
+Identifiers are **validated, never quoted**: letters, digits, and underscores, starting with a letter or underscore. That is one rule doing two jobs — a name needing quotes would behave differently under Postgres's case folding than under SQLite's case preservation, and an unquotable name cannot be spliced into DDL by an attacker.
+
+### What is deliberately not portable
+
+The DSL covers what lowers to genuinely equivalent DDL on both backends. Everything else is left to a raw `.sql` migration rather than approximated — a `jsonb` column silently becoming SQLite `TEXT` would compile and then behave differently, which is worse than not offering it. Out of scope, by design:
+
+- **Types with no honest counterpart** — `uuid`, `json`/`jsonb`, `bytea`/`blob`, and exact `decimal`. (SQLite has no exact-decimal type at all; `NUMERIC(10,2)` there is an affinity hint over a float.) The neutral value surface is `int` / `float` / `bool` / `string` / `null`, and the DSL offers only column types that round-trip through it.
+- **Everything that is not a table or an index** — views, triggers, functions, sequences, extensions, schemas.
+- **Check constraints, partial and expression indexes, generated columns, `DROP … CASCADE`.**
+- **Arbitrary expression defaults.** Only literals and `CURRENT_TIMESTAMP`.
+- **Length-bounded text** (`VARCHAR(n)`). Both backends accept the syntax, but SQLite does not enforce the bound — a constraint on one backend and a comment on the other is exactly the kind of approximation this DSL refuses. Use `text`.
+
+Two portability facts the DSL surfaces rather than hides:
+
+- **`ALTER TABLE ADD COLUMN` is much narrower on SQLite than on Postgres.** Adding a `not_null` column without a `default(…)`, a `unique()` or `primary_key()` column, a column whose default is `default_now()`, or an identity column are all **rejected at parse time**, with a message naming the portable alternative (for uniqueness: add the column, then `create_index(…).unique()`). Emitting DDL that works on Postgres and fails on SQLite would make a "portable" migration backend-dependent.
+- **A `bool` column reads back differently.** SQLite has no boolean storage class, so it comes back as `0`/`1`; Postgres returns `true`/`false`. That is the existing driver value mapping, not something the schema layer can paper over. Likewise a `TIMESTAMP` column must be selected as `CAST(col AS TEXT)` on Postgres to cross the neutral row surface — the migration engine's own tracking-table read does exactly that.
+
+Foreign keys are emitted on both backends, but **SQLite only enforces them when `PRAGMA foreign_keys = ON`** is set on the connection (it is off by default). The clause is still worth writing: it documents the relationship and is enforced by Postgres.
+
 ## Repository & unit of work — typed models, batched writes
 
 `para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and the repository is constructed with the model's runtime type **name** (generics are erased, so it is passed as a string), its table, and its primary-key column. Reads go straight to the connection — `find(conn, id)` (a `?dyn`; `none` when absent), `all(conn)`, and `where(conn, col, op, value)`, each mapped to the model; narrow a result with `.as<User>()`. Writes are the **unit of work**: `add(entity)` / `save(entity)` / `remove(id)` *stage* an insert / a by-primary-key update / a delete, and `flush(conn)` commits everything staged as one batch inside a single transaction (`BEGIN` … `COMMIT`), returning the statement count — a failure before `COMMIT` leaves the batch to the transaction to undo. `discard()` drops the staged changes without touching the database.
@@ -103,12 +175,30 @@ adults = users.where(conn, "age", ">", 18)
 
 `para/db` ships a migration engine, surfaced as the `noeta migrate` command **this package contributes to the CLI** (trust it with `[trust] commands = ["para/db"]`) and the programmatic `conn.migrate(dir)` method. There is one engine (in `noeta-para-db`); the command and the Noeta method are thin callers, so both drivers migrate through the same code.
 
-**Migrations are plain SQL files** in a project `migrations/` directory, one statement or many per file, applied in the order their filenames sort. `noeta migrate new <name>` scaffolds the next file with a **UTC-timestamp prefix** — `YYYYMMDDHHMMSS_<name>.sql`. Timestamps are the default because they never collide when two branches each add a migration (a sequential `0007_…` would); the engine sorts lexicographically over the whole filename, so any monotonic scheme (including zero-padded sequence numbers) also works. A migration body is run **verbatim in the target database's native SQL** — there is no cross-dialect translation, so write portable SQL (a per-dialect `migrations/postgres/` overlay is a planned option, not in v1).
+**Migrations are files** in a project `migrations/` directory, one statement or many per file, applied in the order their filenames sort. `noeta migrate new <name>` scaffolds the next file with a **UTC-timestamp prefix** — `YYYYMMDDHHMMSS_<name>.sql`. Timestamps are the default because they never collide when two branches each add a migration (a sequential `0007_…` would); the engine sorts lexicographically over the whole filename, so any monotonic scheme (including zero-padded sequence numbers) also works.
 
-**A tracking table `_noeta_migrations`** records, for each applied migration, its `filename`, a **sha256 `checksum`** of the file contents, and `applied_at`. Two integrity checks run before anything is applied, both hard errors that name the file:
+**A migration's extension picks its body language**, and the two kinds live in the same directory under one ordering:
+
+| File | Body | Applied as |
+| --- | --- | --- |
+| `<name>.sql` | native SQL for the connected database | run **verbatim** — no `?`→`$N` rewrite, no translation |
+| `<name>.schema` | the [portable schema DSL](#schema-dsl--portable-ddl-lowered-per-driver) | **lowered** to the connected driver's DDL just before it applies |
+
+A project can therefore write portable migrations wherever the vocabulary reaches and drop to raw SQL for the steps it does not. `noeta migrate new <name> --schema` scaffolds a `.schema` migration; plain `noeta migrate new <name>` still scaffolds `.sql`. Raw SQL stays the **default** deliberately: the DSL cannot express everything SQL can, so the scaffold should not imply it does, and every existing project's `migrate new` keeps behaving exactly as before.
+
+```
+migrations/
+  20260727000001_create_notes.schema     # portable: create_table("notes").id().text("title")…
+  20260727000002_backfill.sql            # raw SQL: whatever the DSL does not cover
+  20260727000003_add_archived.schema     # portable: alter_table("notes").add_bool("archived")…
+```
+
+**A tracking table `_noeta_migrations`** records, for each applied migration, its `filename`, a **sha256 `checksum`** of the file contents, and `applied_at`. The checksum is taken over the **file source**, never over the lowered DDL: the source is what the author wrote and is byte-identical on every backend, so a `.schema` migration has one identity across SQLite and PostgreSQL, and a future improvement to the lowering can never read as edited history. Two integrity checks run before anything is applied, both hard errors that name the file:
 
 - **Checksum drift** — an already-applied migration's file was edited. History is immutable; revert the edit or make the change in a new migration.
 - **Deleted applied migration** — a file recorded as applied is gone. Restore it, or `--reset` in development.
+
+A `.schema` body is parsed and lowered **before** its transaction opens, so a DSL syntax error stops the run with the file and line named and nothing touched.
 
 **Transactionality.** Each migration runs inside its own transaction — `BEGIN`, the file body, the tracking-row insert, `COMMIT`. The first failure rolls that migration back and stops, reporting the exact file. Postgres has fully transactional DDL; SQLite is transactional for the ordinary DDL migrations use — so a migration is all-or-nothing, and a failed run leaves every prior migration applied. (Do not put `BEGIN`/`COMMIT` in a migration file — the runner owns the transaction.)
 
@@ -135,7 +225,8 @@ A mid-seed failure stops at that file (naming it) with the prior seeds committed
 noeta migrate                      # apply every pending migration, printing each applied file
 noeta migrate --status             # table of applied / pending migrations
 noeta migrate --dry-run            # list what would be applied, without touching the database
-noeta migrate new <name>           # scaffold migrations/<timestamp>_<name>.sql
+noeta migrate new <name>           # scaffold migrations/<timestamp>_<name>.sql  (raw SQL)
+noeta migrate new <name> --schema  # scaffold migrations/<timestamp>_<name>.schema  (portable DSL)
 noeta migrate new --seed <name>    # scaffold seeds/<timestamp>_<name>.sql
 noeta migrate --seed               # apply pending migrations, then run the seed files
 noeta migrate seed                 # run the seed files ONLY (errors if any migration is pending)
@@ -164,7 +255,7 @@ applied = conn.migrate("migrations")   // returns the count applied; a no-op whe
 seeded  = conn.seed("seeds")           // runs every seed file every time; returns how many ran
 ```
 
-`conn.migrate(dir)` applies every pending migration under `dir` and returns how many it applied, with the same tracking table and integrity checks as the CLI. `conn.seed(dir)` runs every seed file under `dir` (untracked, re-runnable) and returns how many it ran.
+`conn.migrate(dir)` applies every pending migration under `dir` — `.sql` and `.schema` alike — and returns how many it applied, with the same tracking table and integrity checks as the CLI. `conn.seed(dir)` runs every seed file under `dir` (untracked, re-runnable) and returns how many it ran. `conn.apply_schema(source)` applies schema-DSL source directly, without tracking it; that is what `para.db.schema`'s `apply` calls.
 
 ## TLS (PostgreSQL)
 
@@ -243,7 +334,7 @@ For **other editors** (or a custom setup), `@sql { … }` bodies highlight as SQ
 
 ## Examples
 
-[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder), `repo_demo.noe` (repository + unit-of-work), `sql_demo.noe` (the `@sql` tier), `migrate_demo.noe` + `seed_demo.noe` (the engine), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
+[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder), `schema_demo.noe` (the schema DSL) + `schema_migrate_demo.noe` (`.schema` and `.sql` migrations side by side, under `schema_migrations/`), `repo_demo.noe` (repository + unit-of-work), `sql_demo.noe` (the `@sql` tier), `migrate_demo.noe` + `seed_demo.noe` (the engine), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
 
 ## Requirements
 
