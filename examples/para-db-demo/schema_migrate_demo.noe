@@ -1,0 +1,42 @@
+// Portable schema migrations end to end: `schema_migrations/` holds two `.schema` files (the
+// portable DSL) and one `.sql` file (raw SQL) side by side. `conn.migrate(dir)` applies all three in
+// filename order through the one engine — the DSL bodies lowered to the connected driver's DDL, the
+// SQL body run verbatim — and tracks every one of them in `_noeta_migrations` exactly the same way.
+//
+// The point: this program is dsn-agnostic. Point it at "postgres://…" and the same three files build
+// the same schema there, with `BIGSERIAL PRIMARY KEY` where SQLite got
+// `INTEGER PRIMARY KEY AUTOINCREMENT`. Run from the repo root:
+//
+//   noeta run examples/para-db-demo/schema_migrate_demo.noe
+use para.db
+
+conn = db.connect("sqlite::memory:") // or "postgres://…" — the migrations do not change
+
+// 1. Apply: a `.schema` create, a raw `.sql` insert, then a `.schema` alter — one ordering.
+applied = conn.migrate("examples/para-db-demo/schema_migrations")
+echo "applied ${applied} migration(s)"
+
+// 2. Re-running is a no-op: a DSL migration is checksummed and tracked like any other. The checksum
+//    is over the file's SOURCE, so it is identical on SQLite and PostgreSQL.
+again = conn.migrate("examples/para-db-demo/schema_migrations")
+echo "re-run applied ${again} migration(s)"
+
+// 3. The schema the DSL described is live, including the column the alter added.
+rows = conn.query("SELECT id, title, pinned, archived FROM notes ORDER BY id", [])
+echo "notes -> ${rows.len()}"
+for row in rows {
+    id = row["id"]
+    title = row["title"]
+    pinned = row["pinned"]
+    archived = row["archived"]
+    echo "  #${id} ${title} (pinned=${pinned}, archived=${archived})"
+}
+
+// 4. The tracking table records the DSL migrations under their own filenames.
+tracked = conn.query("SELECT filename FROM _noeta_migrations ORDER BY filename", [])
+for row in tracked {
+    name = row["filename"]
+    echo "  tracked ${name}"
+}
+
+conn.close()

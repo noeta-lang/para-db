@@ -1,0 +1,396 @@
+// para.db.schema — the **portable schema builder**, the DDL peer of the `para.db.query` builder.
+//
+// The query builder composes a statement with neutral `?` placeholders that each driver rewrites into
+// its own binding syntax. This builder composes a **schema statement** in a neutral notation that each
+// driver lowers into its own DDL: `id()` becomes `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite and
+// `BIGSERIAL PRIMARY KEY` on PostgreSQL, `float` becomes `REAL` or `DOUBLE PRECISION`, and so on. The
+// dialect lives in the native driver seam — nothing here knows which backend is connected.
+//
+//     use para.db
+//     use para.db.schema.{create_table, create_index, apply}
+//
+//     conn = db.connect("sqlite::memory:")     // or postgres://…
+//     apply(conn, [
+//         create_table("todos")
+//             .id()
+//             .text("title").not_null()
+//             .bool("done").default(false)
+//             .timestamps()
+//             .render(),
+//         create_index("todos").column("done").render(),
+//     ])
+//
+// A builder renders **schema-DSL source** — the very same text a `.schema` migration file contains,
+// so `echo create_table(…).render()` prints something you can paste into `migrations/` verbatim.
+// There is one grammar and one lowering (both native), so the builder and the migration file can
+// never drift apart. For a durable schema change, prefer a `.schema` migration (`noeta migrate new
+// <name> --schema`): it is checksummed, tracked, and applied once. `apply` is for the cases a
+// migration does not cover — a test fixture, a scratch database, a schema computed at runtime.
+//
+// The vocabulary is deliberately only what lowers to equivalent DDL on both backends. Anything
+// dialect-specific (views, triggers, `jsonb`/`uuid`/exact-decimal columns, partial indexes, check
+// constraints) belongs in a raw `.sql` migration — see the package README.
+
+namespace para.db.schema
+
+use para.db.Connection
+
+// --- Statement builders ---------------------------------------------------------------------------
+
+// A `create_table` under construction. Every method returns the builder, so calls chain; a column
+// method starts a new column and the modifiers that follow apply to it.
+pub class Table {
+    mut src: string
+
+    fn new(name: string): Table {
+        return Table { src: "create_table(${quoted(name)})" }
+    }
+
+    // Append a raw `.name(args…)` link on a new line. The column and table-level methods below all
+    // route through here; it is also the escape hatch for a DSL call this surface has not wrapped yet.
+    fn link(name: string, args: List<dyn>): Table {
+        self.src = self.src ~ render_link(name, args)
+        return self
+    }
+
+    // Append a raw `.name(args…)` link beside the column it modifies (no line break).
+    fn modifier(name: string, args: List<dyn>): Table {
+        self.src = self.src ~ render_inline(name, args)
+        return self
+    }
+
+    // --- Columns ---------------------------------------------------------------------------------
+
+    // The table's identity column: a driver-appropriate auto-assigned integer primary key.
+    fn id(name: string = "id"): Table {
+        if name == "id" {
+            return self.link("id", [])
+        }
+        return self.link("id", [name])
+    }
+
+    fn text(name: string): Table {
+        return self.link("text", [name])
+    }
+
+    fn int(name: string): Table {
+        return self.link("int", [name])
+    }
+
+    // A 64-bit integer — the type that matches an `id()` primary key in a foreign key.
+    fn bigint(name: string): Table {
+        return self.link("bigint", [name])
+    }
+
+    fn float(name: string): Table {
+        return self.link("float", [name])
+    }
+
+    fn bool(name: string): Table {
+        return self.link("bool", [name])
+    }
+
+    fn timestamp(name: string): Table {
+        return self.link("timestamp", [name])
+    }
+
+    // `created_at` + `updated_at`, both NOT NULL defaulting to the current time.
+    fn timestamps(): Table {
+        return self.link("timestamps", [])
+    }
+
+    // --- Column modifiers (they apply to the column declared just before) --------------------------
+
+    fn not_null(): Table {
+        return self.modifier("not_null", [])
+    }
+
+    // A literal default — a string, int, float, or bool.
+    fn default(value: dyn): Table {
+        return self.modifier("default", [value])
+    }
+
+    // `DEFAULT CURRENT_TIMESTAMP`.
+    fn default_now(): Table {
+        return self.modifier("default_now", [])
+    }
+
+    // A foreign key on the preceding column. Follow it with `on_delete`/`on_update` to add a
+    // referential action ("cascade", "restrict", "set_null", "set_default", "no_action").
+    fn references(table: string, column: string = "id"): Table {
+        return self.modifier("references", [table, column])
+    }
+
+    fn on_delete(action: string): Table {
+        return self.modifier("on_delete", [action])
+    }
+
+    fn on_update(action: string): Table {
+        return self.modifier("on_update", [action])
+    }
+
+    // --- Keys ------------------------------------------------------------------------------------
+
+    // With no columns: mark the preceding column the primary key. With columns: a composite
+    // table-level `PRIMARY KEY (…)`. A table has one or the other, never both.
+    fn primary_key(columns: List<string> = []): Table {
+        if columns.len() == 0 {
+            return self.modifier("primary_key", [])
+        }
+        return self.link("primary_key", widen(columns))
+    }
+
+    // With no columns: mark the preceding column UNIQUE. With columns: a composite `UNIQUE (…)`.
+    fn unique(columns: List<string> = []): Table {
+        if columns.len() == 0 {
+            return self.modifier("unique", [])
+        }
+        return self.link("unique", widen(columns))
+    }
+
+    fn if_not_exists(): Table {
+        return self.link("if_not_exists", [])
+    }
+
+    // The schema-DSL source for this statement — paste it into a `.schema` migration, or hand it to
+    // `apply`.
+    fn render(): string {
+        return self.src
+    }
+}
+
+// An `alter_table` under construction: a sequence of changes to an existing table, each lowered to
+// its own `ALTER TABLE` statement (SQLite takes one action per statement, so that is the portable
+// shape).
+pub class Alter {
+    mut src: string
+
+    fn new(name: string): Alter {
+        return Alter { src: "alter_table(${quoted(name)})" }
+    }
+
+    // Append a raw `.name(args…)` action on a new line — the escape hatch, as on `Table`.
+    fn link(name: string, args: List<dyn>): Alter {
+        self.src = self.src ~ render_link(name, args)
+        return self
+    }
+
+    // Append a raw `.name(args…)` link beside the column it modifies (no line break).
+    fn modifier(name: string, args: List<dyn>): Alter {
+        self.src = self.src ~ render_inline(name, args)
+        return self
+    }
+
+    fn add_text(name: string): Alter {
+        return self.link("add_text", [name])
+    }
+
+    fn add_int(name: string): Alter {
+        return self.link("add_int", [name])
+    }
+
+    fn add_bigint(name: string): Alter {
+        return self.link("add_bigint", [name])
+    }
+
+    fn add_float(name: string): Alter {
+        return self.link("add_float", [name])
+    }
+
+    fn add_bool(name: string): Alter {
+        return self.link("add_bool", [name])
+    }
+
+    fn add_timestamp(name: string): Alter {
+        return self.link("add_timestamp", [name])
+    }
+
+    // An added column may be `not_null` only with a `default` — SQLite cannot add a NOT NULL column
+    // without one, so the DSL refuses the combination rather than emitting Postgres-only DDL.
+    fn not_null(): Alter {
+        return self.modifier("not_null", [])
+    }
+
+    fn default(value: dyn): Alter {
+        return self.modifier("default", [value])
+    }
+
+    fn references(table: string, column: string = "id"): Alter {
+        return self.modifier("references", [table, column])
+    }
+
+    fn on_delete(action: string): Alter {
+        return self.modifier("on_delete", [action])
+    }
+
+    fn on_update(action: string): Alter {
+        return self.modifier("on_update", [action])
+    }
+
+    fn drop_column(name: string): Alter {
+        return self.link("drop_column", [name])
+    }
+
+    fn rename_column(from: string, to: string): Alter {
+        return self.link("rename_column", [from, to])
+    }
+
+    // Rename the table. It must be the only change in its chain — a later action would name a table
+    // that no longer exists.
+    fn rename_to(name: string): Alter {
+        return self.link("rename_to", [name])
+    }
+
+    fn render(): string {
+        return self.src
+    }
+}
+
+// A `create_index` under construction. Without an explicit `name`, the index is named
+// `idx_<table>_<columns>` on both backends, so a later `drop_index` can spell it.
+pub class Index {
+    mut src: string
+
+    fn new(table: string): Index {
+        return Index { src: "create_index(${quoted(table)})" }
+    }
+
+    // Append a raw `.name(args…)` link. An index is short, so its links stay on one line.
+    fn link(name: string, args: List<dyn>): Index {
+        self.src = self.src ~ render_inline(name, args)
+        return self
+    }
+
+    fn column(name: string): Index {
+        return self.link("column", [name])
+    }
+
+    fn columns(names: List<string>): Index {
+        return self.link("columns", widen(names))
+    }
+
+    fn name(index: string): Index {
+        return self.link("name", [index])
+    }
+
+    fn unique(): Index {
+        return self.link("unique", [])
+    }
+
+    fn if_not_exists(): Index {
+        return self.link("if_not_exists", [])
+    }
+
+    fn render(): string {
+        return self.src
+    }
+}
+
+// A `drop_table` / `drop_index` under construction — the guard is the only thing to say about it.
+pub class Drop {
+    mut src: string
+
+    fn new(head: string): Drop {
+        return Drop { src: head }
+    }
+
+    fn if_exists(): Drop {
+        self.src = self.src ~ render_inline("if_exists", [])
+        return self
+    }
+
+    fn render(): string {
+        return self.src
+    }
+}
+
+// --- Entry points -----------------------------------------------------------------------------
+
+// Start a `CREATE TABLE`.
+pub fn create_table(name: string): Table {
+    return Table.new(name)
+}
+
+// Start an `ALTER TABLE`.
+pub fn alter_table(name: string): Alter {
+    return Alter.new(name)
+}
+
+// Start a `CREATE INDEX` on `table`.
+pub fn create_index(table: string): Index {
+    return Index.new(table)
+}
+
+// `DROP TABLE name`.
+pub fn drop_table(name: string): Drop {
+    return Drop.new("drop_table(${quoted(name)})")
+}
+
+// `DROP INDEX name`.
+pub fn drop_index(name: string): Drop {
+    return Drop.new("drop_index(${quoted(name)})")
+}
+
+// Join rendered statements into one schema-DSL source text — what a `.schema` migration file holds.
+pub fn source(statements: List<string>): string {
+    return statements.join("\n\n") ~ "\n"
+}
+
+// Apply rendered statements to `conn`, lowered to that connection's own DDL. Returns the number of
+// statements applied. Not tracked and not transactional — a durable schema change belongs in a
+// `.schema` migration, which the engine checksums, records, and applies exactly once.
+pub fn apply(conn: Connection, statements: List<string>): int {
+    return conn.apply_schema(source(statements))
+}
+
+// --- Rendering helpers --------------------------------------------------------------------------
+
+// One `.name(arg, …)` link that starts its own indented line — a column, a table-level constraint,
+// or an alter action. Rendered output therefore reads like a hand-written `.schema` file.
+fn render_link(name: string, args: List<dyn>): string {
+    return "\n    ." ~ name ~ "(" ~ render_args(args) ~ ")"
+}
+
+// One `.name(arg, …)` link that stays on the current line — a modifier belongs beside the column it
+// modifies (`.text("title").not_null()`), exactly as it is written by hand.
+fn render_inline(name: string, args: List<dyn>): string {
+    return "." ~ name ~ "(" ~ render_args(args) ~ ")"
+}
+
+// A call's arguments as DSL literals.
+fn render_args(args: List<dyn>): string {
+    rendered = args.map(fn(a) => literal(a))
+    return rendered.join(", ")
+}
+
+// A `List<string>` as the `List<dyn>` the link renderer takes.
+fn widen(values: List<string>): List<dyn> {
+    mut out: List<dyn> = []
+    for v in values {
+        out = out ~ [v]
+    }
+    return out
+}
+
+// A DSL literal: a bool, a whole or fractional number, or a quoted string. Anything else is a
+// programming error at the call site, not something to render as a guess.
+fn literal(value: dyn): string {
+    if value is bool {
+        return if value then "true" else "false"
+    }
+    if value is int {
+        return "${value}"
+    }
+    if value is float {
+        return "${value}"
+    }
+    if value is string {
+        return quoted(value)
+    }
+    panic("para.db.schema: a schema-DSL argument must be a string, int, float, or bool")
+}
+
+// A double-quoted DSL string with `\` and `"` escaped — the same escapes the native lexer reads.
+fn quoted(value: string): string {
+    return "\"" ~ value.replace("\\", "\\\\").replace("\"", "\\\"") ~ "\""
+}

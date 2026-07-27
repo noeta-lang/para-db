@@ -1,0 +1,12 @@
+// A portable schema migration: this ONE file creates the table on SQLite and on PostgreSQL.
+// The engine lowers it through the connected driver just before applying it, and checksums the
+// source you see here — not the generated DDL — so its identity is the same on either backend.
+
+create_table("notes")
+    .id()
+    .text("title").not_null()
+    .text("body")
+    .bool("pinned").default(false)
+    .timestamps()
+
+create_index("notes").column("pinned")

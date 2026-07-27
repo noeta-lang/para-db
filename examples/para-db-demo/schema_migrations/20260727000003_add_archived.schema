@@ -1,0 +1,6 @@
+// Evolving a table is portable too. A column added to an existing table may be `not_null` only with
+// a `default(…)` — SQLite cannot add one without it, so the DSL refuses the unportable combination
+// rather than emitting DDL that only Postgres accepts.
+
+alter_table("notes")
+    .add_bool("archived").not_null().default(false)
