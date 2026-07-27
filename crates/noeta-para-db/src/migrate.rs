@@ -1,7 +1,7 @@
 //! The **database migration engine** (aether DB6) — the single implementation behind both the
 //! `noeta migrate` CLI verb and the programmatic `Connection.migrate(dir)` surface. It drives any
-//! [`SqlDriver`] and reads plain-SQL migration files, so SQLite and Postgres migrate through the same
-//! code with no per-backend branch above the driver seam.
+//! [`SqlDriver`], so SQLite and Postgres migrate through the same code with no per-backend branch
+//! above the driver seam.
 //!
 //! # Design
 //!
@@ -20,7 +20,8 @@
 //!     migrates both SQLite and Postgres.
 //!
 //! Both kinds live in the **same** directory and interleave in one filename order, so a project
-//! writes portable migrations by default and drops to raw SQL for the one step that needs it.
+//! writes portable migrations wherever the DSL's vocabulary reaches and drops to raw SQL for the
+//! steps it does not (`migrate new` still scaffolds `.sql` unless asked for `--schema`).
 //! **A migration's checksum is taken over its file source, never over the lowered DDL** — the source
 //! is what the author owns and is identical on every backend, so a DSL migration's identity is stable
 //! across SQLite and Postgres and across para/db versions (a lowering improvement must never read as
