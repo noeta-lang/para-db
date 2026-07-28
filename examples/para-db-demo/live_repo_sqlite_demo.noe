@@ -26,7 +26,7 @@ fn settle(users: LiveRepository): void {
 conn = db.connect("sqlite::memory:")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
 
-users = LiveRepository.new("User", "users", "id", conn)
+users = LiveRepository.new(type_name::<User>(), "users", "id", conn)
 live_users = users.all()
 
 effect(fn() {

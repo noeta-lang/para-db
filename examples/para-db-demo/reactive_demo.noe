@@ -19,7 +19,7 @@ struct User {
 
 conn = db.connect("sqlite::memory:")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
-repo = Repository.new("User", "users", "id")
+repo = Repository.new(type_name::<User>(), "users", "id")
 
 // The DB-revision signal — bumped after every mutation through the repo.
 rev = signal(0)

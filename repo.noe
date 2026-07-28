@@ -20,9 +20,15 @@ use para.db.query.{table, run, exec, Query}
 use std.json
 
 // A repository over one model + table. Construct it with the model's runtime type name, its table,
-// and its primary-key column: `Repository.new("User", "users", "id")`.
+// and its primary-key column: `Repository.new(type_name::<User>(), "users", "id")`.
+//
+// The name is a `string` because generics are erased — a `Repository<T>` could not recover `T` at
+// run time, and the JSON decode registry this maps rows through is keyed by name. `type_name::<T>()`
+// supplies that name as the QUALIFIED identity the registry holds, resolved at compile time, so a
+// model declared under a `namespace` needs no hand-written `"app.storage.User"` and a rename cannot
+// silently desynchronize it.
 pub class Repository {
-    model: string // the model's runtime type name (generics are erased — pass the name)
+    model: string // the model's qualified runtime type name — pass `type_name::<Model>()`
     tbl: string // the backing table
     pk: string // the primary-key column
     mut pending_new: List<dyn> // staged inserts (whole entities)
@@ -167,7 +173,8 @@ pub class Repository {
     }
 }
 
-// Construct a repository over a model (runtime type name), its table, and its primary-key column.
+// Construct a repository over a model (its qualified runtime type name — `type_name::<Model>()`),
+// its table, and its primary-key column.
 pub fn repository(model: string, tbl: string, pk: string): Repository {
     return Repository.new(model, tbl, pk)
 }

@@ -1,0 +1,36 @@
+// A repository over a model declared in a NAMESPACED module.
+//
+//   noeta run examples/para-db-namespaced/main.noe
+//
+// A namespaced model's runtime identity is its qualified name (`demo.storage.Todo`), because that is
+// the key the `@derive(Deserialize<Json>)` registry stores it under. Passing the short `"Todo"` finds
+// nothing and every row comes back unmapped — silently, since an unmappable row is returned as-is.
+//
+// `type_name::<Todo>()` produces that qualified identity at COMPILE time from the local name the
+// `use` binds, so this file never spells `"demo.storage.Todo"`: move the model to another namespace
+// or rename it and this keeps working, whereas a hand-written string would rot.
+use para.db
+use para.db.repo.Repository
+use demo.storage.Todo
+
+conn = db.connect("sqlite::memory:")
+conn.execute("CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT, rank INTEGER)", [])
+
+echo "model identity: ${type_name::<Todo>()}"
+
+todos = Repository.new(type_name::<Todo>(), "todos", "id")
+
+todos.add(Todo { id: 1, title: "write the migration", rank: 1 })
+todos.add(Todo { id: 2, title: "ship it", rank: 2 })
+echo "flushed ${todos.flush(conn)} statements"
+
+fn render(row: dyn): string {
+    return match row.as<Todo>() {
+        some(t) => "  #${t.id} ${t.title} (rank=${t.rank})",
+        none => "  <unmapped — the model name did not resolve>",
+    }
+}
+
+for row in todos.all(conn) {
+    echo render(row)
+}

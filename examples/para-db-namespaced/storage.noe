@@ -1,0 +1,16 @@
+// The model lives under a `namespace`, so its runtime identity is `demo.storage.Todo` — NOT `Todo`.
+// That is the whole point of this example: the repository is keyed by that qualified name, and
+// nothing here writes it out by hand.
+//
+// `rank` is an `int` rather than a `bool` on purpose. SQLite has no boolean storage class and reads
+// one back as 0/1, so a `bool` field would fail to decode from a SQLite row (`expected bool, found
+// JSON number`) and every row would come back unmapped — a driver read-back fact, unrelated to the
+// name resolution this example is about. Postgres has a real `boolean` and maps it fine.
+namespace demo.storage
+
+@derive(Serialize<Json>, Deserialize<Json>)
+pub struct Todo {
+    pub id: int
+    pub title: string
+    pub rank: int
+}

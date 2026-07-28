@@ -37,8 +37,10 @@ conn = db.connect("sqlite::memory:")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
 
 // Construct the repository over the model's runtime type NAME (generics are erased), its table, and
-// its primary-key column.
-users = Repository.new("User", "users", "id")
+// its primary-key column. `type_name::<User>()` yields that name as the *qualified* identity the
+// registry actually holds, so it keeps working when the model moves into a `namespace` — and it is
+// checked at compile time, unlike a hand-written string.
+users = Repository.new(type_name::<User>(), "users", "id")
 
 // --- Unit of work: stage two inserts, then flush them as one batch in a single transaction. -----
 users.add(User { id: 1, name: "Ada", age: 36 })

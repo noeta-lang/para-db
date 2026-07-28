@@ -32,8 +32,9 @@ pub class LiveRepository {
     watch: Watch // over the table's NOTIFY channel
     channel: string // the NOTIFY channel (the table name)
 
-    // Construct over the model's runtime type name, its table, its primary-key column, and a
-    // connection. The NOTIFY channel is the table name; the watch listens on it immediately.
+    // Construct over the model's qualified runtime type name (`type_name::<Model>()`), its table,
+    // its primary-key column, and a connection. The NOTIFY channel is the table name; the watch
+    // listens on it immediately.
     fn new(model: string, tbl: string, pk: string, conn: Connection): LiveRepository {
         return LiveRepository {
             repo: Repository.new(model, tbl, pk),
