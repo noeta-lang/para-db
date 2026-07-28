@@ -1,0 +1,70 @@
+// Portable conflict handling in the query builder (DB1): the two terminals that make an INSERT
+// re-runnable, which is what a seed needs. Neither is lowered per dialect — SQLite and PostgreSQL
+// accept both spellings verbatim, so the same statement seeds either backend.
+//
+//   noeta run examples/para-db-demo/conflict_demo.noe
+//   noeta test examples/para-db-demo/conflict_demo.noe
+//
+// No database is opened here: what this demo is about is the SQL the builder composes, so the
+// assertions below are the portability contract in executable form.
+use para.db.query.{table}
+
+skip = table("users").insert_or_ignore(["id", "name"], [1, "Ada"])
+echo "insert_or_ignore: ${skip.sql}"
+
+up = table("users").upsert(["id", "name"], [1, "Ada Lovelace"], ["id"])
+echo "upsert:           ${up.sql}"
+
+composite = table("memberships").upsert(
+    ["team", "person", "role"],
+    ["core", "ada", "lead"],
+    ["team", "person"]
+)
+echo "composite upsert: ${composite.sql}"
+
+@test {
+    fn insert_is_all_placeholders(): void {
+        q = table("users").insert(["name", "age"], ["Ada", 36])
+        assert(q.sql == "INSERT INTO users (name, age) VALUES (?, ?)", q.sql)
+        assert(q.params.len() == 2)
+    }
+
+    fn insert_or_ignore_appends_the_portable_conflict_clause(): void {
+        q = table("users").insert_or_ignore(["id", "name"], [1, "Ada"])
+        assert(
+            q.sql == "INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            q.sql
+        )
+        // Values stay bound — the conflict clause adds no placeholders of its own.
+        assert(q.params.len() == 2)
+    }
+
+    fn upsert_sets_every_column_outside_the_conflict_target(): void {
+        q = table("users").upsert(["id", "name", "age"], [1, "Ada", 36], ["id"])
+        assert(
+            q.sql == "INSERT INTO users (id, name, age) VALUES (?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, age = excluded.age",
+            q.sql
+        )
+        assert(q.params.len() == 3)
+    }
+
+    fn upsert_takes_a_composite_conflict_target(): void {
+        q = table("memberships").upsert(
+            ["team", "person", "role"],
+            ["core", "ada", "lead"],
+            ["team", "person"]
+        )
+        assert(
+            q.sql == "INSERT INTO memberships (team, person, role) VALUES (?, ?, ?) ON CONFLICT (team, person) DO UPDATE SET role = excluded.role",
+            q.sql
+        )
+    }
+
+    fn an_upsert_with_nothing_left_to_set_degrades_to_do_nothing(): void {
+        // Every column is part of the conflict target, so there is no assignment to make — and an
+        // empty `SET` is a syntax error on both backends. "Overwrite with what is already there"
+        // and "do nothing" are the same thing, so it emits the legal one.
+        q = table("tags").upsert(["a", "b"], [1, 2], ["a", "b"])
+        assert(q.sql == "INSERT INTO tags (a, b) VALUES (?, ?) ON CONFLICT DO NOTHING", q.sql)
+    }
+}

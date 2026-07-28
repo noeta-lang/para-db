@@ -83,6 +83,49 @@ pub class Q {
         return Query { sql: sql, params: values }
     }
 
+    // Build an idempotent `INSERT … ON CONFLICT DO NOTHING`: the row is inserted unless it would
+    // violate a unique/primary-key constraint, in which case the statement is a no-op (0 rows
+    // affected) instead of an error. Re-running it is therefore safe — the idiom a **seed** wants.
+    //
+    // The emitted conflict clause is portable with no per-dialect lowering: SQLite and PostgreSQL
+    // both accept the untargeted `ON CONFLICT DO NOTHING`. (The SQLite-only `INSERT OR IGNORE`
+    // spelling of the same idea is a hard syntax error on PostgreSQL — this builder never emits it.)
+    fn insert_or_ignore(columns: List<string>, values: List<dyn>): Query {
+        base = self.insert(columns, values)
+        return Query { sql: base.sql ~ " ON CONFLICT DO NOTHING", params: base.params }
+    }
+
+    // Build an **upsert**: `INSERT … ON CONFLICT (<conflict>) DO UPDATE SET c = excluded.c, …`. The
+    // row is inserted when it is new, and every column that is *not* part of `conflict` is
+    // overwritten from the incoming row (`excluded`) when it already exists. `conflict` names the
+    // columns of the unique constraint that decides "already exists" (typically the primary key), so
+    // it may not be empty — the conflict target is what makes `DO UPDATE` legal on both backends.
+    //
+    // Like `insert_or_ignore`, what it emits is accepted verbatim by SQLite and PostgreSQL, so an
+    // upsert seed is portable. When `conflict` covers *every* inserted column there is nothing left
+    // to assign, and the statement degrades to `ON CONFLICT DO NOTHING` — the same meaning, since
+    // overwriting a row with the values it already has is a no-op, and an empty `SET` is a syntax
+    // error on both backends.
+    fn upsert(columns: List<string>, values: List<dyn>, conflict: List<string>): Query {
+        if conflict.len() == 0 {
+            panic("para.db.query: upsert needs at least one conflict column (the unique/primary-key columns that decide whether the row already exists); use insert_or_ignore for an untargeted skip")
+        }
+        base = self.insert(columns, values)
+        mut assignments: List<string> = []
+        for c in columns {
+            if !conflict.contains(c) {
+                assignments = assignments ~ ["${c} = excluded.${c}"]
+            }
+        }
+        if assignments.len() == 0 {
+            return Query { sql: base.sql ~ " ON CONFLICT DO NOTHING", params: base.params }
+        }
+        target = conflict.join(", ")
+        set_list = assignments.join(", ")
+        sql = base.sql ~ " ON CONFLICT (${target}) DO UPDATE SET ${set_list}"
+        return Query { sql: sql, params: base.params }
+    }
+
     // Build an `UPDATE <table> SET col = ?, … WHERE …`. `columns`/`values` are the SET assignments;
     // the WHERE bindings (this builder's filters) follow the SET bindings in order.
     fn update(columns: List<string>, values: List<dyn>): Query {

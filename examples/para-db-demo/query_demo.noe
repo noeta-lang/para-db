@@ -23,3 +23,22 @@ for r in rows {
     age = r["age"]
     echo "${name} is ${age}"
 }
+
+// Conflict handling — the pair that makes a re-runnable seed portable. Both spellings are accepted
+// verbatim by SQLite and PostgreSQL, so neither needs per-dialect lowering.
+skip = table("users").insert_or_ignore(["id", "name", "age"], [1, "Ada", 36])
+echo "skip: ${skip.sql}"
+exec(conn, skip) // the row is already there: 0 rows affected, no error
+
+up = table("users").upsert(["id", "name", "age"], [1, "Ada Lovelace", 37], ["id"])
+echo "upsert: ${up.sql}"
+exec(conn, up)
+after = run(conn, table("users").filter("id", "=", 1).select("name, age"))
+for r in after {
+    name = r["name"]
+    age = r["age"]
+    echo "row 1 is now ${name}, ${age}"
+}
+
+// The exact SQL these emit is asserted in `conflict_demo.noe` — a wrong conflict clause is a
+// portability bug, not a formatting one.
