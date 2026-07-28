@@ -17,13 +17,15 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use noeta_ext_abi::{ArgKind, ArgSpec, CommandCtx, ExtCommand, ParsedArgs};
+use noeta_ext_abi::{ArgKind, ArgSpec, CommandCtx, EntryArg, EntryCall, ExtCommand, ParsedArgs};
 
 use crate::conn::open_driver;
 use crate::migrate::{
-    self, MigrateError, SCAFFOLD_TEMPLATE, SCHEMA_EXTENSION, SCHEMA_SCAFFOLD_TEMPLATE,
+    self, DirKind, MigrateError, PROGRAM_EXTENSION, ProgramFailure, ProgramRunner,
+    SCAFFOLD_TEMPLATE, SCHEMA_EXTENSION, SCHEMA_SCAFFOLD_TEMPLATE, SEED_PROGRAM_SCAFFOLD_TEMPLATE,
     SQL_EXTENSION,
 };
+use crate::program::{SEED_ENTRY_FUNC, SEED_ENTRY_IDENT, SEED_ENTRY_MODULE};
 
 /// The default migrations directory when none is configured or passed.
 const DEFAULT_DIR: &str = "migrations";
@@ -98,6 +100,12 @@ pub const MIGRATE_COMMAND: ExtCommand = ExtCommand {
             kind: ArgKind::Bool,
         },
         ArgSpec {
+            name: "program",
+            help: "For `new --seed`: scaffold a Noeta program seed (`<name>.noe`, run through the \
+                   portable query builder) instead of a raw `<name>.sql` one",
+            kind: ArgKind::Bool,
+        },
+        ArgSpec {
             name: "yes",
             help: "Skip the interactive confirmation for `--reset` (for scripts/CI)",
             kind: ArgKind::Bool,
@@ -120,12 +128,14 @@ fn migrate_run(ctx: &mut dyn CommandCtx, args: &ParsedArgs) -> u8 {
 }
 
 /// A `migrate new` scaffold request: a name, an optional target directory, whether it is a seed, and
-/// whether the body is the portable schema DSL rather than raw SQL.
+/// which body language it is written in (raw SQL by default; the portable schema DSL for a migration
+/// with `--schema`, a Noeta program for a seed with `--program`).
 struct NewArgs {
     name: String,
     dir: Option<PathBuf>,
     seed: bool,
     schema: bool,
+    program: bool,
 }
 
 /// The parsed `noeta migrate` invocation.
@@ -155,6 +165,7 @@ impl Invocation {
         let dir = args.get_path("dir").map(Path::to_path_buf);
         let seed = args.get_bool("seed").unwrap_or(false);
         let schema = args.get_bool("schema").unwrap_or(false);
+        let program = args.get_bool("program").unwrap_or(false);
         let (new, seed_only) = match action {
             Some("new") => {
                 let name = name.ok_or_else(|| {
@@ -168,12 +179,28 @@ impl Invocation {
                             .to_string(),
                     );
                 }
+                if program && schema {
+                    return Err(
+                        "`--program` and `--schema` are mutually exclusive: they are two different \
+                         body languages"
+                            .to_string(),
+                    );
+                }
+                if program && !seed {
+                    // The scope fence, at the scaffold: `.noe` is a seed body language, so there is
+                    // no such thing as a program migration to scaffold.
+                    return Err("`--program` scaffolds a SEED body, so it needs `--seed`: \
+                         `noeta migrate new --seed --program <name>`. A migration is `.sql` or \
+                         `.schema` — a program is not a migration body language"
+                        .to_string());
+                }
                 (
                     Some(NewArgs {
                         name: name.to_string(),
                         dir: dir.clone(),
                         seed,
                         schema,
+                        program,
                     }),
                     false,
                 )
@@ -242,7 +269,7 @@ impl ResetPrompt for TtyPrompt {
 /// process boundary. Returns the process exit code.
 fn execute(
     inv: &Invocation,
-    ctx: &dyn CommandCtx,
+    ctx: &mut dyn CommandCtx,
     env_dsn: Option<String>,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -250,7 +277,14 @@ fn execute(
 ) -> u8 {
     // `migrate new` is database-free: scaffold a file and return.
     if let Some(new) = &inv.new {
-        return match scaffold_new(ctx, &new.name, new.dir.as_deref(), new.seed, new.schema) {
+        return match scaffold_new(
+            &*ctx,
+            &new.name,
+            new.dir.as_deref(),
+            new.seed,
+            new.schema,
+            new.program,
+        ) {
             Ok(path) => {
                 let _ = writeln!(out, "Created {}", path.display());
                 0
@@ -259,14 +293,14 @@ fn execute(
         };
     }
 
-    let dir = resolve_dir(ctx, inv.dir.as_deref());
-    let dsn = match resolve_dsn(ctx, inv.db.as_deref(), env_dsn) {
+    let dir = resolve_dir(&*ctx, inv.dir.as_deref());
+    let dsn = match resolve_dsn(&*ctx, inv.db.as_deref(), env_dsn) {
         Ok(dsn) => dsn,
         Err(message) => return usage_error(err, &message),
     };
 
     // Discover + checksum the migration files (a missing directory is a usage error).
-    let migrations = match migrate::load_dir(&dir) {
+    let migrations = match migrate::load_dir(&dir, DirKind::Migrations) {
         Ok(migrations) => migrations,
         Err(e) => return usage_error(err, &e.to_string()),
     };
@@ -279,11 +313,12 @@ fn execute(
 
     // `migrate seed` — run seeds only, refusing if any migration is still pending.
     if inv.seed_only {
-        let seeds = match load_seeds(ctx, inv.seeds_dir.as_deref(), err) {
+        let seeds = match load_seeds(&*ctx, inv.seeds_dir.as_deref(), err) {
             Ok(seeds) => seeds,
             Err(exit) => return exit,
         };
-        return match migrate::seed_only(driver, &migrations, &seeds) {
+        let mut programs = CtxPrograms { ctx, dsn: &dsn };
+        return match migrate::seed_only(driver, &migrations, &seeds, &mut programs) {
             Ok(ran) => report_seeds(out, &ran),
             Err(e) => run_error(err, &e.to_string()),
         };
@@ -336,7 +371,7 @@ fn execute(
                 }
                 // `--reset --seed`: the full dev loop — reseed the freshly rebuilt schema.
                 if inv.seed {
-                    run_seeds(ctx, driver, inv.seeds_dir.as_deref(), out, err)
+                    run_seeds(ctx, driver, &dsn, inv.seeds_dir.as_deref(), out, err)
                 } else {
                     0
                 }
@@ -354,7 +389,7 @@ fn execute(
                 migrations.len()
             );
             if inv.seed {
-                run_seeds(ctx, driver, inv.seeds_dir.as_deref(), out, err)
+                run_seeds(ctx, driver, &dsn, inv.seeds_dir.as_deref(), out, err)
             } else {
                 0
             }
@@ -370,7 +405,7 @@ fn execute(
                 let _ = writeln!(out, "  applied {name}");
             }
             if inv.seed {
-                run_seeds(ctx, driver, inv.seeds_dir.as_deref(), out, err)
+                run_seeds(ctx, driver, &dsn, inv.seeds_dir.as_deref(), out, err)
             } else {
                 0
             }
@@ -379,21 +414,77 @@ fn execute(
     }
 }
 
+/// The command's [`ProgramRunner`]: a `.noe` seed is loaded, checked and run **on the real host**
+/// through the driving [`CommandCtx`], with `db.run_seed("<dsn>", seed)` appended as its trailing
+/// statement — the same synthesized-entry mechanism `noeta serve` uses for `http.serve(port, fetch)`.
+///
+/// The dsn is the one the command already resolved (`--db` → `DATABASE_URL` → `[db] url`), passed as
+/// a literal argument: the seed program never names a connection string of its own, and nothing is
+/// smuggled to it through the environment.
+struct CtxPrograms<'a> {
+    ctx: &'a mut dyn CommandCtx,
+    dsn: &'a str,
+}
+
+impl ProgramRunner for CtxPrograms<'_> {
+    fn run_program(&mut self, path: &Path) -> Result<(), ProgramFailure> {
+        if is_private_memory_dsn(self.dsn) {
+            return Err(ProgramFailure::Unsupported(format!(
+                "a `.noe` seed opens its own connection, but `{}` names a private in-memory \
+                 database that exists only inside the connection that created it — the seed would \
+                 fill a second, empty one while this database stayed untouched. Point `--db` / \
+                 `DATABASE_URL` / `[db] url` at a SQLite file (`sqlite:app.db`) or at a server.",
+                self.dsn
+            )));
+        }
+        let entry = EntryCall {
+            module: SEED_ENTRY_MODULE,
+            func: SEED_ENTRY_FUNC,
+            args: vec![
+                EntryArg::Str(self.dsn.to_string()),
+                EntryArg::Ident(SEED_ENTRY_IDENT),
+            ],
+        };
+        // The program's own diagnostics reach stderr before this returns; the exit code only says
+        // which kind of failure it was — 2 for a file the driver could not read, 1 for a program
+        // that failed to check or to run.
+        match self.ctx.run_file(path, Some(&entry), None) {
+            0 => Ok(()),
+            2 => Err(ProgramFailure::Failed(
+                "the seed program could not be read".to_string(),
+            )),
+            _ => Err(ProgramFailure::Failed(
+                "the seed program reported an error (see above)".to_string(),
+            )),
+        }
+    }
+}
+
+/// Whether `dsn` names a **private in-memory** SQLite database — one that lives inside the single
+/// connection that opened it. A seed program connects for itself, so against such a dsn it would
+/// populate a second, empty database; the runner refuses it with an explanation rather than
+/// appearing to succeed.
+fn is_private_memory_dsn(dsn: &str) -> bool {
+    matches!(dsn, ":memory:" | "sqlite::memory:" | "sqlite:")
+}
+
 /// Load the seed files for `--seed` / `--reset --seed`, then run them, mapping the outcome to an
 /// exit code. A missing seeds directory when `--seed` was explicitly requested is a usage error
 /// (nothing to seed from); an empty one is a clean no-op.
 fn run_seeds(
-    ctx: &dyn CommandCtx,
+    ctx: &mut dyn CommandCtx,
     driver: &mut dyn crate::driver::SqlDriver,
+    dsn: &str,
     flag: Option<&Path>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let seeds = match load_seeds(ctx, flag, err) {
+    let seeds = match load_seeds(&*ctx, flag, err) {
         Ok(seeds) => seeds,
         Err(exit) => return exit,
     };
-    match migrate::seed(driver, &seeds) {
+    let mut programs = CtxPrograms { ctx, dsn };
+    match migrate::seed(driver, &seeds, &mut programs) {
         Ok(ran) => report_seeds(out, &ran),
         Err(e) => run_error(err, &e.to_string()),
     }
@@ -408,7 +499,7 @@ fn load_seeds(
     err: &mut dyn Write,
 ) -> Result<Vec<migrate::Migration>, u8> {
     let dir = resolve_seeds_dir(ctx, flag);
-    migrate::load_dir(&dir).map_err(|e| usage_error(err, &e.to_string()))
+    migrate::load_dir(&dir, DirKind::Seeds).map_err(|e| usage_error(err, &e.to_string()))
 }
 
 /// Print the seed-run summary (an empty run is an explicit no-op line).
@@ -439,8 +530,16 @@ fn scaffold_new(
     dir: Option<&Path>,
     seed: bool,
     schema: bool,
+    program: bool,
 ) -> Result<PathBuf, String> {
-    let (dir, template, label, extension) = if seed {
+    let (dir, template, label, extension) = if seed && program {
+        (
+            resolve_seeds_dir(ctx, dir),
+            SEED_PROGRAM_SCAFFOLD_TEMPLATE,
+            "seeds",
+            PROGRAM_EXTENSION,
+        )
+    } else if seed {
         (
             resolve_seeds_dir(ctx, dir),
             migrate::SEED_SCAFFOLD_TEMPLATE,
@@ -584,12 +683,33 @@ mod tests {
     /// because `migrate` never runs a program.
     struct TestCtx {
         manifest: Vec<(&'static str, String)>,
+        /// Every program `run_file` was asked to run, with the entry call the command synthesized
+        /// for it — the whole `.noe` seed mechanism, observable without a CLI.
+        programs: Vec<ProgramRun>,
+        /// The exit code this fake driver reports for a program (0 = it ran and succeeded).
+        program_exit: u8,
+    }
+
+    /// One recorded `run_file`: which file, and the trailing entry call rendered as source.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ProgramRun {
+        path: PathBuf,
+        entry: String,
     }
 
     impl TestCtx {
         fn bare() -> TestCtx {
             TestCtx {
                 manifest: Vec::new(),
+                programs: Vec::new(),
+                program_exit: 0,
+            }
+        }
+
+        fn with_manifest(manifest: Vec<(&'static str, String)>) -> TestCtx {
+            TestCtx {
+                manifest,
+                ..TestCtx::bare()
             }
         }
     }
@@ -597,11 +717,29 @@ mod tests {
     impl CommandCtx for TestCtx {
         fn run_file(
             &mut self,
-            _file: &Path,
-            _entry: Option<&noeta_ext_abi::EntryCall>,
+            file: &Path,
+            entry: Option<&noeta_ext_abi::EntryCall>,
             _banner: Option<&str>,
         ) -> u8 {
-            unreachable!("`noeta migrate` never runs a program")
+            let entry = entry
+                .map(|call| {
+                    let args: Vec<String> = call
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            noeta_ext_abi::EntryArg::Str(value) => format!("\"{value}\""),
+                            noeta_ext_abi::EntryArg::Int(value) => value.to_string(),
+                            noeta_ext_abi::EntryArg::Ident(name) => (*name).to_string(),
+                        })
+                        .collect();
+                    format!("{}.{}({})", call.module, call.func, args.join(", "))
+                })
+                .unwrap_or_default();
+            self.programs.push(ProgramRun {
+                path: file.to_path_buf(),
+                entry,
+            });
+            self.program_exit
         }
         fn manifest_str(&self, table: &str, key: &str) -> Option<String> {
             if table != "db" {
@@ -682,7 +820,7 @@ mod tests {
     /// scripted (non-TTY) prompt. `dir` is the project directory the migrations/seeds paths are
     /// anchored to (the CLI anchors them to the cwd; the test anchors them explicitly so parallel
     /// tests never chdir).
-    fn run_in(dir: &Path, words: &[&str], ctx: &TestCtx, env_dsn: Option<&str>) -> Outcome {
+    fn run_in(dir: &Path, words: &[&str], ctx: &mut TestCtx, env_dsn: Option<&str>) -> Outcome {
         run_full(
             dir,
             words,
@@ -698,7 +836,7 @@ mod tests {
     fn run_full(
         dir: &Path,
         words: &[&str],
-        ctx: &TestCtx,
+        ctx: &mut TestCtx,
         env_dsn: Option<&str>,
         prompt: &mut dyn ResetPrompt,
     ) -> Outcome {
@@ -725,6 +863,7 @@ mod tests {
                 "--reset" => parsed.push_bool("reset", true),
                 "--seed" => parsed.push_bool("seed", true),
                 "--schema" => parsed.push_bool("schema", true),
+                "--program" => parsed.push_bool("program", true),
                 "--yes" => parsed.push_bool("yes", true),
                 positional => {
                     match positionals {
@@ -802,10 +941,10 @@ mod tests {
     #[test]
     fn apply_then_rerun_is_idempotent() {
         let dir = project("apply", &[M1, M2]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
 
-        let first = run_in(&dir, &["--db", &db], &ctx, None);
+        let first = run_in(&dir, &["--db", &db], &mut ctx, None);
         assert_eq!(first.code, 0, "{}", first.err);
         assert!(
             first.out.contains("Applied 2 migration(s)"),
@@ -819,7 +958,7 @@ mod tests {
         );
 
         // Re-running applies nothing.
-        let second = run_in(&dir, &["--db", &db], &ctx, None);
+        let second = run_in(&dir, &["--db", &db], &mut ctx, None);
         assert_eq!(second.code, 0, "{}", second.err);
         assert!(second.out.contains("Already up to date"), "{}", second.out);
     }
@@ -827,11 +966,11 @@ mod tests {
     #[test]
     fn status_reports_applied_and_pending() {
         let dir = project("status", &[M1, M2]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
 
         // Before applying: both pending.
-        let before = run_in(&dir, &["--db", &db, "--status"], &ctx, None);
+        let before = run_in(&dir, &["--db", &db, "--status"], &mut ctx, None);
         assert_eq!(before.code, 0, "{}", before.err);
         assert!(
             before.out.contains("0 applied, 2 pending"),
@@ -839,9 +978,9 @@ mod tests {
             before.out
         );
 
-        assert_eq!(run_in(&dir, &["--db", &db], &ctx, None).code, 0);
+        assert_eq!(run_in(&dir, &["--db", &db], &mut ctx, None).code, 0);
 
-        let after = run_in(&dir, &["--db", &db, "--status"], &ctx, None);
+        let after = run_in(&dir, &["--db", &db, "--status"], &mut ctx, None);
         assert_eq!(after.code, 0, "{}", after.err);
         assert!(after.out.contains("2 applied, 0 pending"), "{}", after.out);
     }
@@ -849,10 +988,10 @@ mod tests {
     #[test]
     fn dry_run_lists_without_applying() {
         let dir = project("dryrun", &[M1]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
 
-        let dry = run_in(&dir, &["--db", &db, "--dry-run"], &ctx, None);
+        let dry = run_in(&dir, &["--db", &db, "--dry-run"], &mut ctx, None);
         assert_eq!(dry.code, 0, "{}", dry.err);
         assert!(
             dry.out.contains("Would apply 1 migration(s)"),
@@ -861,7 +1000,7 @@ mod tests {
         );
 
         // The dry-run did not apply anything: a real status still shows it pending.
-        let status = run_in(&dir, &["--db", &db, "--status"], &ctx, None);
+        let status = run_in(&dir, &["--db", &db, "--status"], &mut ctx, None);
         assert!(
             status.out.contains("0 applied, 1 pending"),
             "{}",
@@ -872,12 +1011,12 @@ mod tests {
     #[test]
     fn new_scaffolds_a_timestamped_file() {
         let dir = temp_dir("new", &[]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
 
         let outcome = run_in(
             &dir,
             &["new", "add posts table", "--dir", "migrations"],
-            &ctx,
+            &mut ctx,
             None,
         );
         assert_eq!(outcome.code, 0, "{}", outcome.err);
@@ -900,12 +1039,12 @@ mod tests {
     #[test]
     fn new_schema_scaffolds_a_portable_dsl_migration() {
         let dir = temp_dir("new_schema", &[]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
 
         let outcome = run_in(
             &dir,
             &["new", "create todos", "--schema", "--dir", "migrations"],
-            &ctx,
+            &mut ctx,
             None,
         );
         assert_eq!(outcome.code, 0, "{}", outcome.err);
@@ -933,7 +1072,7 @@ mod tests {
         let outcome = run_in(
             &dir,
             &["new", "demo", "--schema", "--seed"],
-            &TestCtx::bare(),
+            &mut TestCtx::bare(),
             None,
         );
         assert_eq!(outcome.code, 2);
@@ -963,10 +1102,10 @@ mod tests {
                 ),
             ],
         );
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
 
-        let first = run_in(&dir, &["--db", &db], &ctx, None);
+        let first = run_in(&dir, &["--db", &db], &mut ctx, None);
         assert_eq!(first.code, 0, "{}", first.err);
         assert!(
             first.out.contains("applied 0001_todos.schema"),
@@ -979,7 +1118,7 @@ mod tests {
             first.out
         );
 
-        let again = run_in(&dir, &["--db", &db], &ctx, None);
+        let again = run_in(&dir, &["--db", &db], &mut ctx, None);
         assert!(again.out.contains("Already up to date"), "{}", again.out);
     }
 
@@ -993,7 +1132,7 @@ mod tests {
             )],
         );
         let db = dsn(&dir);
-        let outcome = run_in(&dir, &["--db", &db], &TestCtx::bare(), None);
+        let outcome = run_in(&dir, &["--db", &db], &mut TestCtx::bare(), None);
         assert_eq!(outcome.code, 1, "{}", outcome.err);
         assert!(
             outcome.err.contains("not valid portable schema DSL"),
@@ -1006,7 +1145,7 @@ mod tests {
     #[test]
     fn new_without_a_name_is_a_usage_error() {
         let dir = temp_dir("new_no_name", &[]);
-        let outcome = run_in(&dir, &["new"], &TestCtx::bare(), None);
+        let outcome = run_in(&dir, &["new"], &mut TestCtx::bare(), None);
         assert_eq!(outcome.code, 2);
         assert!(outcome.err.contains("needs a name"), "{}", outcome.err);
     }
@@ -1014,7 +1153,7 @@ mod tests {
     #[test]
     fn an_unknown_action_word_is_a_usage_error() {
         let dir = temp_dir("bad_action", &[]);
-        let outcome = run_in(&dir, &["frobnicate"], &TestCtx::bare(), None);
+        let outcome = run_in(&dir, &["frobnicate"], &mut TestCtx::bare(), None);
         assert_eq!(outcome.code, 2);
         assert!(outcome.err.contains("unknown action"), "{}", outcome.err);
     }
@@ -1022,11 +1161,11 @@ mod tests {
     #[test]
     fn reset_reapplies_with_yes() {
         let dir = project("reset", &[M1, M2]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
-        assert_eq!(run_in(&dir, &["--db", &db], &ctx, None).code, 0);
+        assert_eq!(run_in(&dir, &["--db", &db], &mut ctx, None).code, 0);
 
-        let outcome = run_in(&dir, &["--db", &db, "--reset", "--yes"], &ctx, None);
+        let outcome = run_in(&dir, &["--db", &db, "--reset", "--yes"], &mut ctx, None);
         assert_eq!(outcome.code, 0, "{}", outcome.err);
         assert!(
             outcome.out.contains("dropped the schema and re-applied 2"),
@@ -1039,7 +1178,7 @@ mod tests {
     fn reset_without_yes_is_refused_in_a_non_tty() {
         let dir = project("reset_refuse", &[M1]);
         let db = dsn(&dir);
-        let outcome = run_in(&dir, &["--db", &db, "--reset"], &TestCtx::bare(), None);
+        let outcome = run_in(&dir, &["--db", &db, "--reset"], &mut TestCtx::bare(), None);
         assert_eq!(outcome.code, 2);
         assert!(
             outcome.err.contains("needs confirmation"),
@@ -1051,14 +1190,14 @@ mod tests {
     #[test]
     fn reset_declined_at_the_prompt_is_a_clean_cancel() {
         let dir = project("reset_decline", &[M1]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
-        assert_eq!(run_in(&dir, &["--db", &db], &ctx, None).code, 0);
+        assert_eq!(run_in(&dir, &["--db", &db], &mut ctx, None).code, 0);
 
         let outcome = run_full(
             &dir,
             &["--db", &db, "--reset"],
-            &ctx,
+            &mut ctx,
             None,
             &mut ScriptedPrompt {
                 terminal: true,
@@ -1085,16 +1224,16 @@ mod tests {
                 ),
             ],
         );
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
 
-        let outcome = run_in(&dir, &["--db", &db], &ctx, None);
+        let outcome = run_in(&dir, &["--db", &db], &mut ctx, None);
         assert_eq!(outcome.code, 1, "{}", outcome.err);
         assert!(outcome.err.contains("0002_bad.sql"), "{}", outcome.err);
         assert!(outcome.err.contains("rolled back"), "{}", outcome.err);
 
         // The first migration committed; the failed one is still pending.
-        let status = run_in(&dir, &["--db", &db, "--status"], &ctx, None);
+        let status = run_in(&dir, &["--db", &db, "--status"], &mut ctx, None);
         assert!(
             status.out.contains("1 applied, 1 pending"),
             "{}",
@@ -1105,9 +1244,9 @@ mod tests {
     #[test]
     fn editing_an_applied_migration_is_rejected() {
         let dir = project("drift", &[("0001_a.sql", "CREATE TABLE a (id INTEGER);")]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
-        assert_eq!(run_in(&dir, &["--db", &db], &ctx, None).code, 0);
+        assert_eq!(run_in(&dir, &["--db", &db], &mut ctx, None).code, 0);
 
         // Edit the already-applied file, then re-run.
         std::fs::write(
@@ -1115,7 +1254,7 @@ mod tests {
             "CREATE TABLE a (id INTEGER, extra TEXT);",
         )
         .unwrap();
-        let outcome = run_in(&dir, &["--db", &db], &ctx, None);
+        let outcome = run_in(&dir, &["--db", &db], &mut ctx, None);
         assert_eq!(outcome.code, 1);
         assert!(
             outcome.err.contains("was edited after it was applied"),
@@ -1127,7 +1266,7 @@ mod tests {
     #[test]
     fn no_dsn_configured_is_a_usage_error() {
         let dir = project("no_dsn", &[M1]);
-        let outcome = run_in(&dir, &["--status"], &TestCtx::bare(), None);
+        let outcome = run_in(&dir, &["--status"], &mut TestCtx::bare(), None);
         assert_eq!(outcome.code, 2);
         assert!(
             outcome.err.contains("no database configured"),
@@ -1141,7 +1280,7 @@ mod tests {
         let dir = project("env_dsn", &[M1]);
         let db = format!("sqlite:{}", dir.join("env.db").display());
         // The env layer is threaded in exactly where `migrate_run` reads `DATABASE_URL`.
-        let outcome = run_in(&dir, &[], &TestCtx::bare(), Some(&db));
+        let outcome = run_in(&dir, &[], &mut TestCtx::bare(), Some(&db));
         assert_eq!(outcome.code, 0, "{}", outcome.err);
         assert!(
             outcome.out.contains("Applied 1 migration(s)"),
@@ -1153,7 +1292,7 @@ mod tests {
     #[test]
     fn an_empty_database_url_env_is_ignored() {
         let dir = project("empty_env_dsn", &[M1]);
-        let outcome = run_in(&dir, &["--status"], &TestCtx::bare(), Some(""));
+        let outcome = run_in(&dir, &["--status"], &mut TestCtx::bare(), Some(""));
         assert_eq!(outcome.code, 2);
         assert!(
             outcome.err.contains("no database configured"),
@@ -1164,9 +1303,7 @@ mod tests {
 
     #[test]
     fn db_flag_wins_over_env_and_manifest() {
-        let ctx = TestCtx {
-            manifest: vec![("url", "sqlite:manifest.db".to_string())],
-        };
+        let ctx = TestCtx::with_manifest(vec![("url", "sqlite:manifest.db".to_string())]);
         assert_eq!(
             resolve_dsn(&ctx, Some("sqlite::memory:"), Some("sqlite:env.db".into())).unwrap(),
             "sqlite::memory:"
@@ -1181,10 +1318,10 @@ mod tests {
     #[test]
     fn migrate_seed_flag_applies_then_seeds() {
         let dir = project_with_seeds("seed_flag", &[M1], &[SEED_IDEMPOTENT]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
 
-        let outcome = run_in(&dir, &["--db", &db, "--seed"], &ctx, None);
+        let outcome = run_in(&dir, &["--db", &db, "--seed"], &mut ctx, None);
         assert_eq!(outcome.code, 0, "{}", outcome.err);
         assert!(
             outcome.out.contains("Applied 1 migration(s)"),
@@ -1209,7 +1346,7 @@ mod tests {
         let db = dsn(&dir);
 
         // Nothing migrated yet: seeding a stale schema is refused with guidance.
-        let outcome = run_in(&dir, &["--db", &db, "seed"], &TestCtx::bare(), None);
+        let outcome = run_in(&dir, &["--db", &db, "seed"], &mut TestCtx::bare(), None);
         assert_eq!(outcome.code, 1, "{}", outcome.err);
         assert!(
             outcome.err.contains("migration(s) are still pending"),
@@ -1222,13 +1359,13 @@ mod tests {
     #[test]
     fn migrate_seed_subcommand_runs_when_current_and_is_rerunnable() {
         let dir = project_with_seeds("seed_current", &[M1], &[SEED_IDEMPOTENT]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
-        assert_eq!(run_in(&dir, &["--db", &db], &ctx, None).code, 0);
+        assert_eq!(run_in(&dir, &["--db", &db], &mut ctx, None).code, 0);
 
         // Seeds-only against the up-to-date schema, twice — the idempotent idiom keeps it a no-op.
         for _ in 0..2 {
-            let outcome = run_in(&dir, &["--db", &db, "seed"], &ctx, None);
+            let outcome = run_in(&dir, &["--db", &db, "seed"], &mut ctx, None);
             assert_eq!(outcome.code, 0, "{}", outcome.err);
             assert!(
                 outcome.out.contains("Ran 1 seed file(s)"),
@@ -1241,14 +1378,14 @@ mod tests {
     #[test]
     fn reset_seed_is_the_full_dev_loop() {
         let dir = project_with_seeds("reset_seed", &[M1], &[SEED_IDEMPOTENT]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
-        assert_eq!(run_in(&dir, &["--db", &db], &ctx, None).code, 0);
+        assert_eq!(run_in(&dir, &["--db", &db], &mut ctx, None).code, 0);
 
         let outcome = run_in(
             &dir,
             &["--db", &db, "--reset", "--seed", "--yes"],
-            &ctx,
+            &mut ctx,
             None,
         );
         assert_eq!(outcome.code, 0, "{}", outcome.err);
@@ -1267,13 +1404,13 @@ mod tests {
     #[test]
     fn new_seed_scaffolds_under_the_seeds_directory() {
         let dir = temp_dir("new_seed", &[]);
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
 
         // For a seed scaffold, `--dir` names the SEEDS directory (same as the old subcommand).
         let outcome = run_in(
             &dir,
             &["new", "demo users", "--seed", "--dir", "seeds"],
-            &ctx,
+            &mut ctx,
             None,
         );
         assert_eq!(outcome.code, 0, "{}", outcome.err);
@@ -1288,7 +1425,10 @@ mod tests {
             .collect();
         assert_eq!(created.len(), 1);
         let body = std::fs::read_to_string(created[0].path()).unwrap();
-        assert!(body.contains("INSERT OR IGNORE"), "{body}");
+        // The idiom it teaches is the portable one, and it says plainly that the SQLite-only
+        // spelling is not.
+        assert!(body.contains("ON CONFLICT DO NOTHING"), "{body}");
+        assert!(body.contains("SQLite-only"), "{body}");
         assert!(!dir.join("migrations").exists());
     }
 
@@ -1301,13 +1441,13 @@ mod tests {
                 ("data/0001_users.sql", SEED_IDEMPOTENT.1),
             ],
         );
-        let ctx = TestCtx::bare();
+        let mut ctx = TestCtx::bare();
         let db = dsn(&dir);
 
         let outcome = run_in(
             &dir,
             &["--db", &db, "--seed", "--seeds-dir", "data"],
-            &ctx,
+            &mut ctx,
             None,
         );
         assert_eq!(outcome.code, 0, "{}", outcome.err);
@@ -1329,15 +1469,13 @@ mod tests {
         );
         // The manifest's `[db]` table names the dirs and the url (the test ctx plays the role the
         // CLI's `manifest_str` driver does over the nearest noeta.toml).
-        let ctx = TestCtx {
-            manifest: vec![
-                ("url", dsn(&dir)),
-                ("migrations", dir.join("migrations").display().to_string()),
-                ("seeds", dir.join("fixtures").display().to_string()),
-            ],
-        };
+        let mut ctx = TestCtx::with_manifest(vec![
+            ("url", dsn(&dir)),
+            ("migrations", dir.join("migrations").display().to_string()),
+            ("seeds", dir.join("fixtures").display().to_string()),
+        ]);
 
-        let outcome = run_in(&dir, &["--seed"], &ctx, None);
+        let outcome = run_in(&dir, &["--seed"], &mut ctx, None);
         assert_eq!(outcome.code, 0, "{}", outcome.err);
         assert!(
             outcome.out.contains("Ran 1 seed file(s)"),
@@ -1352,16 +1490,14 @@ mod tests {
             "manifest_dsn",
             &[("migrations/0001_a.sql", "CREATE TABLE a (id INTEGER);")],
         );
-        let ctx = TestCtx {
-            manifest: vec![
-                (
-                    "url",
-                    format!("sqlite:{}", dir.join("manifest.db").display()),
-                ),
-                ("migrations", dir.join("migrations").display().to_string()),
-            ],
-        };
-        let outcome = run_in(&dir, &[], &ctx, None);
+        let mut ctx = TestCtx::with_manifest(vec![
+            (
+                "url",
+                format!("sqlite:{}", dir.join("manifest.db").display()),
+            ),
+            ("migrations", dir.join("migrations").display().to_string()),
+        ]);
+        let outcome = run_in(&dir, &[], &mut ctx, None);
         assert_eq!(outcome.code, 0, "{}", outcome.err);
         assert!(
             outcome.out.contains("Applied 1 migration(s)"),
@@ -1382,5 +1518,160 @@ mod tests {
         let ctx = TestCtx::bare();
         assert_eq!(resolve_dir(&ctx, None), PathBuf::from("migrations"));
         assert_eq!(resolve_seeds_dir(&ctx, None), PathBuf::from("seeds"));
+    }
+
+    // --- `.noe` seed bodies ---------------------------------------------------------------------
+
+    /// A minimal program seed. Its body is never parsed here — the fake driver stands in for the
+    /// CLI's loader — so what these tests pin down is the *mechanism*: which file is run, and with
+    /// which entry call.
+    const SEED_PROGRAM: (&str, &str) = (
+        "0002_programmatic.noe",
+        "use para.db\nfn seed(conn: db.Connection): void {}\n",
+    );
+
+    #[test]
+    fn a_program_seed_is_run_through_the_driver_with_the_resolved_dsn_as_its_entry_call() {
+        let dir = project_with_seeds("seed_program", &[M1], &[SEED_IDEMPOTENT, SEED_PROGRAM]);
+        let mut ctx = TestCtx::bare();
+        let db = dsn(&dir);
+
+        let outcome = run_in(&dir, &["--db", &db, "--seed"], &mut ctx, None);
+
+        assert_eq!(outcome.code, 0, "{}", outcome.err);
+        // Both body languages report through one summary, in filename order.
+        assert!(
+            outcome.out.contains("Ran 2 seed file(s)"),
+            "{}",
+            outcome.out
+        );
+        assert!(
+            outcome.out.contains("seeded 0002_programmatic.noe"),
+            "{}",
+            outcome.out
+        );
+        // The `.sql` seed went to the database; only the `.noe` one was run as a program.
+        assert_eq!(
+            ctx.programs,
+            vec![ProgramRun {
+                path: dir.join("seeds").join(SEED_PROGRAM.0),
+                // The dsn the command resolved, passed as a literal — nothing is smuggled through
+                // the environment — plus the program's own `seed` function by name.
+                entry: format!("db.run_seed(\"{db}\", seed)"),
+            }]
+        );
+    }
+
+    #[test]
+    fn migrate_seed_only_runs_program_seeds_too() {
+        let dir = project_with_seeds("seed_program_only", &[M1], &[SEED_PROGRAM]);
+        let mut ctx = TestCtx::bare();
+        let db = dsn(&dir);
+        assert_eq!(run_in(&dir, &["--db", &db], &mut ctx, None).code, 0);
+
+        let outcome = run_in(&dir, &["--db", &db, "seed"], &mut ctx, None);
+
+        assert_eq!(outcome.code, 0, "{}", outcome.err);
+        assert!(
+            outcome.out.contains("Ran 1 seed file(s)"),
+            "{}",
+            outcome.out
+        );
+        assert_eq!(ctx.programs.len(), 1);
+    }
+
+    #[test]
+    fn a_program_seed_that_fails_stops_the_run_and_names_the_file() {
+        let dir = project_with_seeds("seed_program_fail", &[M1], &[SEED_PROGRAM]);
+        let mut ctx = TestCtx::bare();
+        ctx.program_exit = 1; // the program loaded and reported an error
+        let db = dsn(&dir);
+
+        let outcome = run_in(&dir, &["--db", &db, "--seed"], &mut ctx, None);
+
+        assert_eq!(outcome.code, 1, "{}", outcome.out);
+        assert!(
+            outcome.err.contains("seed program `0002_programmatic.noe`"),
+            "{}",
+            outcome.err
+        );
+    }
+
+    #[test]
+    fn a_program_seed_against_a_private_in_memory_dsn_is_refused_with_the_reason() {
+        // Seeding an in-memory SQLite database from a separate program is impossible in principle:
+        // the program's own connection creates a second, empty database. Saying so beats "Ran 1
+        // seed file(s)" over a database that never changed.
+        let dir = project_with_seeds("seed_program_memory", &[M1], &[SEED_PROGRAM]);
+        let mut ctx = TestCtx::bare();
+
+        let outcome = run_in(&dir, &["--db", "sqlite::memory:", "--seed"], &mut ctx, None);
+
+        assert_eq!(outcome.code, 1, "{}", outcome.out);
+        assert!(outcome.err.contains("in-memory"), "{}", outcome.err);
+        assert!(outcome.err.contains("sqlite:app.db"), "{}", outcome.err);
+        assert!(ctx.programs.is_empty(), "{:?}", ctx.programs);
+    }
+
+    #[test]
+    fn a_program_body_in_the_migrations_directory_is_a_usage_error() {
+        // The scope fence, from the command's side: `noeta migrate` refuses to run at all rather
+        // than applying the `.sql` migrations and quietly ignoring the `.noe` file beside them.
+        let dir = project(
+            "noe_migration",
+            &[M1, ("0002_b.noe", "fn seed(conn: db.Connection): void {}")],
+        );
+        let mut ctx = TestCtx::bare();
+        let db = dsn(&dir);
+
+        let outcome = run_in(&dir, &["--db", &db], &mut ctx, None);
+
+        assert_eq!(outcome.code, 2, "{}", outcome.out);
+        assert!(outcome.err.contains("0002_b.noe"), "{}", outcome.err);
+        assert!(outcome.err.contains("seeds directory"), "{}", outcome.err);
+        assert!(ctx.programs.is_empty());
+    }
+
+    #[test]
+    fn new_seed_program_scaffolds_a_noe_seed_under_the_seeds_directory() {
+        let dir = temp_dir("new_seed_program", &[]);
+        let mut ctx = TestCtx::bare();
+
+        let outcome = run_in(
+            &dir,
+            &["new", "demo users", "--seed", "--program", "--dir", "seeds"],
+            &mut ctx,
+            None,
+        );
+
+        assert_eq!(outcome.code, 0, "{}", outcome.err);
+        assert!(outcome.out.contains("_demo_users.noe"), "{}", outcome.out);
+        let created: Vec<_> = std::fs::read_dir(dir.join("seeds"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "noe"))
+            .collect();
+        assert_eq!(created.len(), 1);
+        let body = std::fs::read_to_string(created[0].path()).unwrap();
+        assert!(body.contains("fn seed(conn: db.Connection)"), "{body}");
+        assert!(body.contains("insert_or_ignore"), "{body}");
+    }
+
+    #[test]
+    fn new_program_without_seed_is_a_usage_error() {
+        // There is no such thing as a program migration to scaffold — the fence again, at the one
+        // place a user would first try to cross it.
+        let dir = temp_dir("new_program_migration", &[]);
+        let mut ctx = TestCtx::bare();
+
+        let outcome = run_in(
+            &dir,
+            &["new", "add posts", "--program", "--dir", "migrations"],
+            &mut ctx,
+            None,
+        );
+
+        assert_eq!(outcome.code, 2, "{}", outcome.out);
+        assert!(outcome.err.contains("--seed"), "{}", outcome.err);
     }
 }

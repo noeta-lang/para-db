@@ -81,12 +81,14 @@ pub const DB_CAPABILITIES: &[ExtCapability] = &[ExtCapability {
 const CONNECTION_SIG: SigType = SigType::Named(CONNECTION_TYPE_NAME);
 
 /// `db.watch(conn, channel) -> Watch` — a higher-order (ctx) function: it reaches the reactive engine.
-pub const WATCH_FNS: &[ExtFn] = &[ExtFn {
+/// Registered as one entry of the `db` module's ctx-function list (`DB_CTX_FNS`), beside the seed
+/// entry `db.run_seed`.
+pub const WATCH_FN: ExtFn = ExtFn {
     name: "watch",
     params: &[CONNECTION_SIG, SigType::String],
     ret: RetTy::Concrete(SigType::Named(WATCH_TYPE_NAME)),
     ..ExtFn::DEFAULTS
-}];
+};
 
 pub const WATCH_METHODS: &[ExtFn] = &[
     // `.get() -> int` — a reactive read of the revision (subscribes the running computation).
@@ -154,7 +156,7 @@ impl ExternValue for WatchBox {
     }
 }
 
-/// The `db.watch` ctx dispatch (paired with [`WATCH_FNS`]).
+/// The `db.watch` ctx dispatch (paired with [`WATCH_FN`]).
 pub fn watch_ctx_dispatch(
     func: &str,
     ctx: &mut dyn NativeCtx,

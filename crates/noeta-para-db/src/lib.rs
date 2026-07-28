@@ -3,6 +3,7 @@
 //!
 //! One module and one extern type, rooted at `para`:
 //!   * `db`         — `db.connect(dsn) -> Connection`; the dsn scheme selects the driver.
+//!   * `db`         — `db.run_seed(dsn, seed)`; the `.noe` seed entry convention ([`program`]).
 //!   * `Connection` — `execute(sql, params) -> int`, `query(sql, params) -> List<Map<string, dyn>>`,
 //!     `migrate(dir) -> int`, `seed(dir) -> int`, `close()`; a shared handle over a boxed
 //!     [`driver::SqlDriver`].
@@ -21,6 +22,7 @@ pub mod driver;
 pub mod migrate;
 #[cfg(feature = "ring-postgres")]
 pub mod pg;
+pub mod program;
 pub mod schema;
 #[cfg(feature = "ring-sqlite")]
 pub mod sqlite;
@@ -45,7 +47,7 @@ pub(crate) fn pg_test_guard() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-use noeta_ext_abi::registry::{ExtModule, ExtType, Extension};
+use noeta_ext_abi::registry::{ExtFn, ExtModule, ExtType, Extension};
 
 /// The `para.db` extension unit — the `db` module and the `Connection` extern type. `root() ==
 /// "para"`, so the module resolves as `para.db` and the type as `para.db.Connection`.
@@ -91,13 +93,21 @@ const PARA_DB_MODULES: &[ExtModule] = &[ExtModule {
     name: "db",
     functions: crate::conn::DB_FNS,
     dispatch: crate::conn::db_dispatch,
-    // `db.watch(conn, channel)` reaches the reactive engine, so it is a higher-order (ctx) function
-    // alongside the plain `db.connect` (aether DB5, reactive DB source).
-    ctx_functions: crate::watch::WATCH_FNS,
-    ctx_dispatch: Some(|func, ctx, args| crate::watch::watch_ctx_dispatch(func, ctx, args)),
+    // The higher-order (ctx) functions, which re-enter the backend: `db.watch(conn, channel)`
+    // reaches the reactive engine (aether DB5, reactive DB source), and `db.run_seed(dsn, seed)`
+    // calls a seed program's entry function with a fresh connection (the `.noe` seed convention).
+    ctx_functions: DB_CTX_FNS,
+    ctx_dispatch: Some(|func, ctx, args| match func {
+        crate::program::SEED_ENTRY_FUNC => crate::program::run_seed_ctx_dispatch(func, ctx, args),
+        _ => crate::watch::watch_ctx_dispatch(func, ctx, args),
+    }),
     docs: DB_DOCS,
     ..ExtModule::DEFAULTS
 }];
+
+/// The `db` module's higher-order (ctx) functions, in one list because a module registers one:
+/// the reactive `watch` source and the `run_seed` entry a `.noe` seed is run through.
+const DB_CTX_FNS: &[ExtFn] = &[crate::watch::WATCH_FN, crate::program::RUN_SEED_FN];
 
 /// The `para.db` extern types — the `Connection` handle and the reactive `Watch` source (DB5).
 /// `Connection` declares `deep_marshal` so its `List<dyn>` params project to a full `NativeValue`
@@ -131,6 +141,15 @@ const DB_DOCS: &[(&str, &str)] = &[
          `:memory:`) for an in-memory database, `sqlite:PATH` (or a bare path) for a SQLite file, or \
          `postgres://user:pass@host:5432/db` (`postgresql://` too) for a PostgreSQL server. Returns a \
          `Connection`.",
+    ),
+    (
+        "run_seed",
+        "Open `dsn`, call `seed(conn)` with a connection to it, then release the connection — the \
+         entry convention behind a `.noe` seed file. `noeta migrate --seed` appends exactly this call \
+         to a seed program it runs, so the command's mechanism is a function a program can also call \
+         directly. No transaction is opened around the body: a seed program owns its own (write \
+         idempotent statements — `insert_or_ignore`/`upsert` in `para.db.query` — so a re-run is a \
+         no-op).",
     ),
     (
         "watch",

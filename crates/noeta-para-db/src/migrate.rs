@@ -21,7 +21,8 @@
 //!
 //! Both kinds live in the **same** directory and interleave in one filename order, so a project
 //! writes portable migrations wherever the DSL's vocabulary reaches and drops to raw SQL for the
-//! steps it does not (`migrate new` still scaffolds `.sql` unless asked for `--schema`).
+//! steps it does not (`migrate new` still scaffolds `.sql` unless asked for `--schema`). A **seed**
+//! takes a third body language on top of these two — see the seeds section below.
 //!
 //! # What a migration's checksum is taken over
 //!
@@ -59,14 +60,30 @@
 //! **Forward-only.** There are no down/rollback files: a down migration is routinely wrong against
 //! production data, and `--reset` (drop the schema, re-apply from zero) covers the development loop.
 //!
-//! **Seeds.** Plain `.sql` files under a project `seeds/` directory, discovered and ordered by the
-//! very same [`load_dir`] loader migrations use, run **after** migrations by [`seed`]. Seeds are
-//! re-runnable development data, **never** recorded in the tracking table: each runs in its own
-//! transaction every time it is invoked, so idempotency is the seed author's concern (the
-//! `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` idiom). [`seed_only`] refuses to run when migrations
-//! are pending — seeding a stale schema is a footgun.
+//! **Seeds.** Files under a project `seeds/` directory, discovered and ordered by the very same
+//! [`load_dir`] loader migrations use, run **after** migrations by [`seed`]. Seeds are re-runnable
+//! development data, **never** recorded in the tracking table: each runs every time it is invoked,
+//! so idempotency is the seed author's concern (the portable `ON CONFLICT DO NOTHING` idiom — the
+//! SQLite-only `INSERT OR IGNORE` spelling of the same idea is a hard syntax error on Postgres).
+//! [`seed_only`] refuses to run when migrations are pending — seeding a stale schema is a footgun.
+//!
+//! **Three body languages in the seeds directory, one ordering.** A seed adds a third
+//! ([`MigrationKind::Program`]) to the two a migration has:
+//!   * `.sql` — verbatim SQL, in its own transaction. The permanent escape hatch.
+//!   * `.schema` — the portable schema DSL, lowered per driver (rarely what a seed wants — a seed is
+//!     data — but the two directories deliberately understand the same files).
+//!   * `.noe` — a **Noeta program**: an ordinary program that connects and writes its rows through
+//!     the `para.db.query` builder, so one seed file seeds every backend without its author writing
+//!     dialect SQL. The engine owns discovery, ordering and stop-on-first-failure; *running* the
+//!     program is delegated to a [`ProgramRunner`], because only the CLI can load, check and run a
+//!     program on the real host (`CommandCtx::run_file`, behind `noeta migrate`).
+//!
+//! `.noe` is a **seeds-only** body language, gated at discovery by [`DirKind`]: a migration is
+//! tracked history, and what a program migration's checksum identity and replay should mean is a
+//! separate design. A `.noe` file under the migrations directory is a hard error
+//! ([`MigrateError::ProgramMigration`]) — never silently ignored, never half-run.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -83,27 +100,79 @@ pub const SQL_EXTENSION: &str = "sql";
 /// The extension of a portable schema-DSL migration — the body is lowered per driver.
 pub const SCHEMA_EXTENSION: &str = "schema";
 
-/// How a migration's body becomes DDL. Decided by the file's **extension**, so the body language is
-/// visible in the directory listing and needs no in-file marker (which a checksum would then have to
-/// treat as history).
+/// The extension of a **Noeta program** seed body — the file is run as a program, not as SQL.
+/// Seeds only ([`DirKind`]).
+pub const PROGRAM_EXTENSION: &str = "noe";
+
+/// How a migration's or seed's body becomes an effect on the database. Decided by the file's
+/// **extension**, so the body language is visible in the directory listing and needs no in-file
+/// marker (which a checksum would then have to treat as history).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationKind {
     /// A `.sql` body: native SQL for the connected backend, run verbatim.
     Sql,
     /// A `.schema` body: the portable schema DSL, lowered by the driver at apply time.
     Schema,
+    /// A `.noe` body: a Noeta program, run through a [`ProgramRunner`] rather than the driver.
+    /// A **seed** body language only — see [`DirKind`].
+    Program,
 }
 
 impl MigrationKind {
-    /// The kind a filename declares — [`MigrationKind::Schema`] for `.schema`, otherwise raw SQL.
+    /// The kind a filename declares — `.schema` → [`MigrationKind::Schema`], `.noe` →
+    /// [`MigrationKind::Program`], anything else raw SQL (the loader only ever offers names whose
+    /// extension it already accepted).
     fn of(name: &str) -> MigrationKind {
-        let is_schema = std::path::Path::new(name)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case(SCHEMA_EXTENSION));
-        if is_schema {
+        let has_extension = |wanted: &str| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(wanted))
+        };
+        if has_extension(SCHEMA_EXTENSION) {
             MigrationKind::Schema
+        } else if has_extension(PROGRAM_EXTENSION) {
+            MigrationKind::Program
         } else {
             MigrationKind::Sql
+        }
+    }
+}
+
+/// Which directory a load is for — the **body-language gate**, and the noun the loader's errors use.
+///
+/// The loader is deliberately shared between migrations and seeds so the two directories order files
+/// identically, but they do **not** accept the same bodies: `.noe` is a seed body language only. Every
+/// call names its purpose, so adding a body language can never silently widen the other directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirKind {
+    /// The migrations directory: `.sql` and `.schema` only. Tracked, checksummed history.
+    Migrations,
+    /// The seeds directory: `.sql`, `.schema` and `.noe`. Untracked, re-runnable data.
+    Seeds,
+}
+
+impl DirKind {
+    /// The noun this directory is reported as ("migration" / "seed").
+    fn noun(self) -> &'static str {
+        match self {
+            DirKind::Migrations => "migration",
+            DirKind::Seeds => "seed",
+        }
+    }
+
+    /// The directory's own name in an error ("migrations directory" / "seeds directory").
+    fn label(self) -> &'static str {
+        match self {
+            DirKind::Migrations => "migrations",
+            DirKind::Seeds => "seeds",
+        }
+    }
+
+    /// Whether a body language is accepted here — the whole scope fence for `.noe`.
+    fn accepts(self, kind: MigrationKind) -> bool {
+        match kind {
+            MigrationKind::Sql | MigrationKind::Schema => true,
+            MigrationKind::Program => self == DirKind::Seeds,
         }
     }
 }
@@ -126,21 +195,28 @@ pub struct Migration {
     pub checksum: String,
     /// How [`Migration::lowered`] turns `body` into DDL.
     pub kind: MigrationKind,
+    /// Where the file lives — what a [`MigrationKind::Program`] seed is run from (a program is
+    /// loaded from disk by the CLI, not handed over as a string). [`Migration::new`] defaults it to
+    /// the bare filename; [`load_dir`] sets the real path.
+    pub path: PathBuf,
 }
 
 impl Migration {
     /// Build a migration from a filename and its contents, computing the checksum and reading the
-    /// body language off the extension.
+    /// body language off the extension. The path defaults to the filename itself — [`load_dir`]
+    /// replaces it with the file's real location.
     pub fn new(name: impl Into<String>, body: impl Into<String>) -> Migration {
         let name = name.into();
         let body = body.into();
         let kind = MigrationKind::of(&name);
         let checksum = sha256_hex(identity_text(kind, &body).as_bytes());
+        let path = PathBuf::from(&name);
         Migration {
             name,
             body,
             checksum,
             kind,
+            path,
         }
     }
 
@@ -164,6 +240,13 @@ impl Migration {
                         message,
                     })
             }
+            // A program body has no SQL to lower — it is run, not executed as a statement. Neither
+            // caller reaches this (the seed engine routes a program to its [`ProgramRunner`] first,
+            // and the migrations loader refuses `.noe` at discovery), so this arm exists to keep the
+            // match total with an honest error rather than a panic.
+            MigrationKind::Program => Err(MigrateError::ProgramMigration {
+                filename: self.name.clone(),
+            }),
         }
     }
 }
@@ -211,6 +294,18 @@ pub enum MigrateError {
     /// dialect mapping for it). Reported **before** the migration's transaction opens, so nothing was
     /// touched.
     Schema { filename: String, message: String },
+    /// A `.noe` **program body** was found in the migrations directory, where it is not a body
+    /// language. Reported at discovery, before anything is applied — the scope fence that keeps
+    /// adding a seed body language from silently widening what a migration may be.
+    ProgramMigration { filename: String },
+    /// A `.noe` seed could not be run because the caller has no way to run a program — the
+    /// programmatic `Connection.seed(dir)` surface, which drives a database driver, not the CLI's
+    /// loader. Carries the reason so the message names the one path that does work.
+    ProgramUnsupported { filename: String, message: String },
+    /// A `.noe` seed **ran** and failed (a check error, a panic, a non-zero exit). Distinct from
+    /// [`MigrateError::Seed`] because nothing was rolled back for it: a program owns its own
+    /// connection and its own transactions, so whatever it committed before failing stands.
+    SeedProgram { filename: String, message: String },
     /// A seed file failed while running; its transaction was rolled back. Distinct from
     /// [`MigrateError::Apply`] so output names it as a seed, not a migration (seeds are untracked
     /// dev data — the prior seeds stay committed, the same stop-on-first-failure shape).
@@ -254,6 +349,23 @@ impl std::fmt::Display for MigrateError {
                 f,
                 "migration `{filename}` is not valid portable schema DSL: {message}"
             ),
+            MigrateError::ProgramMigration { filename } => write!(
+                f,
+                "`{filename}` is a `.noe` program, which the migrations directory does not accept \
+                 (a migration body is `.sql` or `.schema`). A program body is a SEED body language: \
+                 move it under the seeds directory and run it with `noeta migrate --seed`. \
+                 Migrations are tracked, checksummed history, and what a program's identity and \
+                 replay mean there is deliberately still open — so this is refused outright rather \
+                 than half-run.",
+            ),
+            MigrateError::ProgramUnsupported { filename, message } => {
+                write!(f, "seed `{filename}` cannot run here: {message}")
+            }
+            MigrateError::SeedProgram { filename, message } => write!(
+                f,
+                "seed program `{filename}` failed: {message}. Seeds before it stand — a `.noe` seed \
+                 owns its own connection, so the engine has no transaction to roll back for it.",
+            ),
             MigrateError::Seed { filename, message } => {
                 write!(f, "seed `{filename}` failed and was rolled back: {message}")
             }
@@ -289,9 +401,11 @@ impl std::error::Error for MigrateError {}
 /// That migration cannot be applied at all ([`Migration::lowered`] fails before its transaction
 /// opens), so the fallback checksum is never recorded; it exists only so discovery
 /// ([`load_dir`]) and [`plan`] stay total in the face of a malformed file.
+/// A [`MigrationKind::Program`] body hashes as its source text. It is only ever a *seed*, and a seed
+/// is not history, so nothing reads that checksum — computing it keeps discovery uniform.
 fn identity_text(kind: MigrationKind, body: &str) -> String {
     match kind {
-        MigrationKind::Sql => body.to_string(),
+        MigrationKind::Sql | MigrationKind::Program => body.to_string(),
         MigrationKind::Schema => {
             crate::schema::canonicalize(body).unwrap_or_else(|_| body.to_string())
         }
@@ -309,29 +423,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Discover every `*.sql` and `*.schema` file directly under `dir`, sorted by filename, each with its
-/// checksum and its body language ([`MigrationKind`]). The shared loader for **both** migrations and
-/// seeds — [`seed`] reuses it for the `seeds/` dir (a seed simply ignores the computed checksum, since
-/// seeds are not tracked history).
+/// Discover every body file directly under `dir`, sorted by filename, each with its checksum, its
+/// body language ([`MigrationKind`]) and its path. The shared loader for **both** migrations and
+/// seeds — [`seed`] reuses it for the `seeds/` dir (a seed simply ignores the computed checksum,
+/// since seeds are not tracked history).
 ///
-/// The two extensions share **one** ordering: the sort is over the whole filename, so a raw-SQL and a
-/// DSL migration interleave by their timestamp prefixes exactly as two `.sql` files would, and the
+/// `kind` says which directory this is, and that is exactly what decides which body languages are
+/// accepted: `.sql` and `.schema` in both, `.noe` in the seeds directory alone. A `.noe` file under
+/// the migrations directory is refused here, at discovery, with [`MigrateError::ProgramMigration`] —
+/// before anything is applied, and never quietly skipped (a silently ignored migration is a schema
+/// that differs between two machines).
+///
+/// The extensions share **one** ordering: the sort is over the whole filename, so a raw-SQL and a DSL
+/// migration interleave by their timestamp prefixes exactly as two `.sql` files would, and the
 /// tracking table needs no notion of body language (the filename it already records carries it).
 ///
 /// A missing directory is an error (the caller asked to migrate but there is nowhere to read from);
 /// an *empty* existing directory yields an empty list (migrate is then a clean no-op). Sub-directories
 /// and files with any other extension are ignored — leaving room for a future per-dialect
 /// `dir/postgres/` overlay without disturbing what exists.
-pub fn load_dir(dir: &Path) -> Result<Vec<Migration>, MigrateError> {
+pub fn load_dir(dir: &Path, kind: DirKind) -> Result<Vec<Migration>, MigrateError> {
+    let label = kind.label();
     if !dir.exists() {
         return Err(MigrateError::Io(format!(
-            "migrations directory `{}` does not exist",
+            "{label} directory `{}` does not exist",
             dir.display()
         )));
     }
     let entries = std::fs::read_dir(dir).map_err(|e| {
         MigrateError::Io(format!(
-            "cannot read migrations directory `{}`: {e}",
+            "cannot read {label} directory `{}`: {e}",
             dir.display()
         ))
     })?;
@@ -341,19 +462,34 @@ pub fn load_dir(dir: &Path) -> Result<Vec<Migration>, MigrateError> {
         let entry =
             entry.map_err(|e| MigrateError::Io(format!("reading `{}`: {e}", dir.display())))?;
         let path = entry.path();
-        let is_migration = path.is_file()
-            && path.extension().is_some_and(|ext| {
-                ext.eq_ignore_ascii_case(SQL_EXTENSION)
-                    || ext.eq_ignore_ascii_case(SCHEMA_EXTENSION)
-            });
-        if !is_migration {
+        if !path.is_file() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
+        let body_kind = match path.extension() {
+            Some(ext) if ext.eq_ignore_ascii_case(SQL_EXTENSION) => MigrationKind::Sql,
+            Some(ext) if ext.eq_ignore_ascii_case(SCHEMA_EXTENSION) => MigrationKind::Schema,
+            Some(ext) if ext.eq_ignore_ascii_case(PROGRAM_EXTENSION) => MigrationKind::Program,
+            // Not a body file at all (a README, a `.bak`, a `.gitkeep`) — ignored in both
+            // directories, as it always has been.
+            _ => continue,
+        };
+        // The scope fence: a body language this directory does not accept is named and refused, not
+        // skipped.
+        if !kind.accepts(body_kind) {
+            return Err(MigrateError::ProgramMigration { filename: name });
+        }
         let body = std::fs::read_to_string(&path).map_err(|e| {
-            MigrateError::Io(format!("cannot read migration `{}`: {e}", path.display()))
+            MigrateError::Io(format!(
+                "cannot read {} `{}`: {e}",
+                kind.noun(),
+                path.display()
+            ))
         })?;
-        migrations.push(Migration::new(name, body));
+        migrations.push(Migration {
+            path,
+            ..Migration::new(name, body)
+        });
     }
     migrations.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(migrations)
@@ -549,17 +685,83 @@ pub fn reset(
     apply(driver, migrations)
 }
 
-/// Run every **seed** file in `seeds` in filename order, each in its own transaction, returning the
-/// names run. Seeds are re-runnable development data, **never tracked** in [`TRACKING_TABLE`]: this
-/// applies every file every time it is called, so idempotency is the seed author's concern (use
-/// `INSERT OR IGNORE` on SQLite / `ON CONFLICT DO NOTHING` on Postgres to make a re-run a no-op). A
-/// seed uses the same discovery/ordering as a migration — [`load_dir`] loads both — but no checksum
-/// is recorded (a seed is not history). The first failure rolls that seed back and stops, naming the
+/// How a [`MigrationKind::Program`] seed body is actually run — the seam between this engine, which
+/// owns discovery, ordering and stop-on-first-failure, and the one caller that can load, check and
+/// run a Noeta program on the real host.
+///
+/// Only the CLI can do that (`CommandCtx::run_file`, the same mechanism behind `noeta serve`), and
+/// this crate must not depend on the CLI, so the engine takes the capability as an argument instead.
+/// Callers that have no program driver pass [`UnsupportedPrograms`], which turns a `.noe` seed into a
+/// clear error naming the path that does work.
+pub trait ProgramRunner {
+    /// Run the seed program at `path` to completion.
+    fn run_program(&mut self, path: &Path) -> Result<(), ProgramFailure>;
+}
+
+/// Why a [`ProgramRunner`] did not complete a seed program — kept apart because they are different
+/// problems for the person reading the output: one is a program bug, the other is "you are driving
+/// seeds from a surface that cannot run programs".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramFailure {
+    /// The program ran (loaded, checked, executed) and did not succeed.
+    Failed(String),
+    /// This runner cannot run programs at all; the message names the path that can.
+    Unsupported(String),
+}
+
+/// The [`ProgramRunner`] for callers with no way to run a program — the programmatic
+/// `Connection.seed(dir)` surface, which holds a database driver, not the CLI's loader. Every `.noe`
+/// seed it meets becomes a [`MigrateError::ProgramUnsupported`] naming the command that can run it.
+#[derive(Debug, Clone, Copy)]
+pub struct UnsupportedPrograms;
+
+impl ProgramRunner for UnsupportedPrograms {
+    fn run_program(&mut self, path: &Path) -> Result<(), ProgramFailure> {
+        Err(ProgramFailure::Unsupported(format!(
+            "`{}` is a `.noe` seed — a Noeta program, which only the CLI can load, check and run. \
+             Run the seeds with `noeta migrate --seed` (or `noeta migrate seed`); \
+             `conn.seed(dir)` runs `.sql` and `.schema` seed bodies only.",
+            path.display()
+        )))
+    }
+}
+
+/// Run every **seed** file in `seeds` in filename order, returning the names run. Seeds are
+/// re-runnable development data, **never tracked** in [`TRACKING_TABLE`]: this applies every file
+/// every time it is called, so idempotency is the seed author's concern (`ON CONFLICT DO NOTHING`,
+/// which both backends accept, or the `para.db.query` builder's `insert_or_ignore`/`upsert` that
+/// emit it). A seed uses the same discovery/ordering as a migration — [`load_dir`] loads both — but
+/// no checksum is recorded (a seed is not history). The first failure stops the run, naming the
 /// file, with the prior seeds left committed — the same stop-on-first-failure shape as [`apply`].
-pub fn seed(driver: &mut dyn SqlDriver, seeds: &[Migration]) -> Result<Vec<String>, MigrateError> {
+///
+/// The body language decides how a file runs: a `.sql`/`.schema` seed goes to `driver` inside its own
+/// transaction ([`seed_one`]), while a `.noe` seed goes to `programs` — a separate program with its
+/// own connection, and therefore its own transactions (an implicit outer transaction here would
+/// collide with any the program opens itself, e.g. through a repository's `flush`).
+pub fn seed(
+    driver: &mut dyn SqlDriver,
+    seeds: &[Migration],
+    programs: &mut dyn ProgramRunner,
+) -> Result<Vec<String>, MigrateError> {
     let mut done = Vec::with_capacity(seeds.len());
     for file in seeds {
-        seed_one(driver, file)?;
+        match file.kind {
+            MigrationKind::Program => {
+                programs
+                    .run_program(&file.path)
+                    .map_err(|failure| match failure {
+                        ProgramFailure::Failed(message) => MigrateError::SeedProgram {
+                            filename: file.name.clone(),
+                            message,
+                        },
+                        ProgramFailure::Unsupported(message) => MigrateError::ProgramUnsupported {
+                            filename: file.name.clone(),
+                            message,
+                        },
+                    })?;
+            }
+            MigrationKind::Sql | MigrationKind::Schema => seed_one(driver, file)?,
+        }
         done.push(file.name.clone());
     }
     Ok(done)
@@ -568,9 +770,10 @@ pub fn seed(driver: &mut dyn SqlDriver, seeds: &[Migration]) -> Result<Vec<Strin
 /// Run one seed file inside its own transaction: `BEGIN`, the verbatim body, `COMMIT` — no tracking
 /// insert (seeds are not history). Any failure rolls back (best-effort) and reports the file.
 fn seed_one(driver: &mut dyn SqlDriver, file: &Migration) -> Result<(), MigrateError> {
-    // Seeds share the loader, so they share the body languages too: a `.sql` seed runs verbatim and a
-    // `.schema` one lowers through the driver first (rarely what a seed wants — seeds are data — but
-    // there is no reason for the two directories to understand different files).
+    // Seeds share the loader, so they share the SQL body languages too: a `.sql` seed runs verbatim
+    // and a `.schema` one lowers through the driver first (rarely what a seed wants — seeds are data
+    // — but there is no reason for the two directories to understand different files). A `.noe` seed
+    // never reaches here: [`seed`] routes it to the [`ProgramRunner`] instead.
     let body = file.lowered(driver)?;
     driver.execute_batch("BEGIN").map_err(MigrateError::Db)?;
     match driver.execute_batch(&body) {
@@ -593,6 +796,7 @@ pub fn seed_only(
     driver: &mut dyn SqlDriver,
     migrations: &[Migration],
     seeds: &[Migration],
+    programs: &mut dyn ProgramRunner,
 ) -> Result<Vec<String>, MigrateError> {
     ensure_tracking_table(driver)?;
     let applied = read_applied(driver)?;
@@ -602,7 +806,7 @@ pub fn seed_only(
             pending: plan.pending.len(),
         });
     }
-    seed(driver, seeds)
+    seed(driver, seeds, programs)
 }
 
 /// Build the filename for a new migration: `{prefix}_{slug}.{extension}`, where `slug` is `name`
@@ -659,11 +863,39 @@ pub const SCHEMA_SCAFFOLD_TEMPLATE: &str = "// Migration (portable schema DSL): 
      // Anything dialect-specific (views, triggers, json/uuid/decimal columns, partial indexes)\n\
      // belongs in a raw `.sql` migration beside this one — the two interleave in filename order.\n";
 
-/// The starter body written into a freshly scaffolded seed file — re-runnable dev data, so it
-/// documents the idempotent-insert idiom inline.
+/// The starter body written into a freshly scaffolded raw-SQL seed file — re-runnable dev data, so it
+/// documents the idempotent-insert idiom inline, in the spelling that works on **both** backends.
 pub const SEED_SCAFFOLD_TEMPLATE: &str = "-- Seed: re-runnable development data. This file runs on every `noeta migrate seed` / `--seed`,\n\
      -- each in its own transaction, and is NOT tracked. Make inserts idempotent so a re-run is a\n\
-     -- no-op: `INSERT OR IGNORE` on SQLite, `... ON CONFLICT DO NOTHING` on Postgres.\n";
+     -- no-op — `ON CONFLICT DO NOTHING` is accepted verbatim by SQLite and PostgreSQL:\n\
+     --\n\
+     --   INSERT INTO users (id, name) VALUES (1, 'Ada') ON CONFLICT DO NOTHING;\n\
+     --\n\
+     -- (`INSERT OR IGNORE` means the same thing but is SQLite-only — it is a syntax error on\n\
+     -- PostgreSQL, so a seed written that way is not portable.)\n\
+     --\n\
+     -- This body runs VERBATIM in the connected database's own SQL dialect. For a seed that writes\n\
+     -- its rows through the portable query builder instead, scaffold a program seed:\n\
+     -- `migrate new --seed --program <name>`.\n";
+
+/// The starter body written into a freshly scaffolded **program** (`.noe`) seed — the entry
+/// convention (`fn seed(conn)`) plus the portable idempotent insert, since neither is guessable.
+pub const SEED_PROGRAM_SCAFFOLD_TEMPLATE: &str = "// Seed (Noeta program): re-runnable development data written in Noeta rather than SQL, so one file\n\
+     // seeds every backend. `noeta migrate --seed` / `noeta migrate seed` loads and runs it, then\n\
+     // calls the `seed` function below with a connection to the project's database (the `--db` flag,\n\
+     // `DATABASE_URL`, or `[db] url` in noeta.toml — resolved once, by the command).\n\
+     //\n\
+     // The function MUST be named `seed` and take one `Connection`: that is the entry convention.\n\
+     // A program seed owns its connection, so it also owns its transactions — the engine has none to\n\
+     // roll back for it.\n\
+     use para.db\n\
+     use para.db.query.{table, exec}\n\
+     \n\
+     fn seed(conn: db.Connection): void {\n\
+     \x20   // `insert_or_ignore` emits `... ON CONFLICT DO NOTHING`, which SQLite and PostgreSQL both\n\
+     \x20   // accept — so running the seeds twice leaves the same rows.\n\
+     \x20   exec(conn, table(\"users\").insert_or_ignore([\"id\", \"name\"], [1, \"Ada\"]))\n\
+     }\n";
 
 #[cfg(test)]
 mod tests {
@@ -966,11 +1198,14 @@ mod tests {
     #[test]
     fn load_dir_errors_when_missing_but_is_empty_when_bare() {
         let missing = std::path::Path::new("/does/not/exist/noeta-migrate-xyz");
-        assert!(matches!(load_dir(missing), Err(MigrateError::Io(_))));
+        assert!(matches!(
+            load_dir(missing, DirKind::Migrations),
+            Err(MigrateError::Io(_))
+        ));
 
         let dir = std::env::temp_dir().join(format!("noeta-migrate-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(load_dir(&dir).unwrap(), Vec::new());
+        assert_eq!(load_dir(&dir, DirKind::Migrations).unwrap(), Vec::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -982,7 +1217,7 @@ mod tests {
         std::fs::write(dir.join("0001_a.sql"), "SELECT 1;").unwrap();
         std::fs::write(dir.join("README.md"), "not a migration").unwrap();
 
-        let migrations = load_dir(&dir).unwrap();
+        let migrations = load_dir(&dir, DirKind::Migrations).unwrap();
         assert_eq!(
             migrations
                 .iter()
@@ -1004,7 +1239,7 @@ mod tests {
         std::fs::write(dir.join("0002_b.sql"), "SELECT 2;").unwrap();
         std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
 
-        let migrations = load_dir(&dir).unwrap();
+        let migrations = load_dir(&dir, DirKind::Migrations).unwrap();
         assert_eq!(
             migrations
                 .iter()
@@ -1018,6 +1253,238 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn the_seeds_directory_takes_all_three_body_languages_in_one_order() {
+        let dir = std::env::temp_dir().join(format!("noeta-seeds-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0003_c.schema"), "create_table(\"c\").int(\"x\")").unwrap();
+        std::fs::write(dir.join("0001_a.sql"), "SELECT 1;").unwrap();
+        std::fs::write(
+            dir.join("0002_b.noe"),
+            "fn seed(conn: db.Connection): void {}",
+        )
+        .unwrap();
+
+        let seeds = load_dir(&dir, DirKind::Seeds).unwrap();
+        assert_eq!(
+            seeds
+                .iter()
+                .map(|m| (m.name.as_str(), m.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("0001_a.sql", MigrationKind::Sql),
+                ("0002_b.noe", MigrationKind::Program),
+                ("0003_c.schema", MigrationKind::Schema),
+            ]
+        );
+        // A program is run from disk, so the loader records where it is (a `.sql` body travels as
+        // text; a `.noe` body travels as a path).
+        assert_eq!(seeds[1].path, dir.join("0002_b.noe"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_program_body_in_the_migrations_directory_is_refused_not_ignored() {
+        // The scope fence. A `.noe` migration is neither applied nor quietly skipped: skipping it
+        // would leave two machines with different schemas and no error to explain why.
+        let dir = std::env::temp_dir().join(format!("noeta-noe-migration-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0001_a.sql"), "SELECT 1;").unwrap();
+        std::fs::write(
+            dir.join("0002_b.noe"),
+            "fn seed(conn: db.Connection): void {}",
+        )
+        .unwrap();
+
+        let err = load_dir(&dir, DirKind::Migrations).unwrap_err();
+        assert_eq!(
+            err,
+            MigrateError::ProgramMigration {
+                filename: "0002_b.noe".to_string()
+            }
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("0002_b.noe"), "{rendered}");
+        assert!(rendered.contains("seeds directory"), "{rendered}");
+        // The same directory, loaded as seeds, takes the very same file — the gate is the purpose,
+        // not the file.
+        assert_eq!(load_dir(&dir, DirKind::Seeds).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_program_seed_scaffold_teaches_the_entry_convention_and_the_portable_idiom() {
+        assert!(SEED_PROGRAM_SCAFFOLD_TEMPLATE.contains("fn seed(conn: db.Connection)"));
+        assert!(SEED_PROGRAM_SCAFFOLD_TEMPLATE.contains("insert_or_ignore"));
+        assert!(SEED_PROGRAM_SCAFFOLD_TEMPLATE.contains("use para.db.query"));
+        // The SQL seed scaffold points at the program one, so either starting point names the other.
+        assert!(SEED_SCAFFOLD_TEMPLATE.contains("--seed --program"));
+    }
+}
+
+/// The [`ProgramRunner`] seam, exercised without a CLI: a recording fake stands in for
+/// `CommandCtx::run_file`, so ordering, delegation and the two failure shapes are unit-testable.
+#[cfg(all(test, feature = "ring-sqlite"))]
+mod program_seeds {
+    use super::*;
+    use crate::sqlite::SqliteDriver;
+
+    /// Records the programs it was asked to run, and can be told to fail on one of them.
+    struct RecordingRunner {
+        ran: Vec<String>,
+        fail_on: Option<&'static str>,
+    }
+
+    impl RecordingRunner {
+        fn new() -> RecordingRunner {
+            RecordingRunner {
+                ran: Vec::new(),
+                fail_on: None,
+            }
+        }
+    }
+
+    impl ProgramRunner for RecordingRunner {
+        fn run_program(&mut self, path: &Path) -> Result<(), ProgramFailure> {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let failing = self.fail_on == Some(name.as_str());
+            self.ran.push(name);
+            if failing {
+                return Err(ProgramFailure::Failed("boom".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    const PROGRAM_BODY: &str = "fn seed(conn: db.Connection): void {}";
+
+    #[test]
+    fn sql_seeds_go_to_the_driver_and_program_seeds_to_the_runner_in_one_order() {
+        let mut driver = SqliteDriver::open_in_memory().unwrap();
+        driver
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let seeds = vec![
+            Migration::new("0001_a.sql", "INSERT INTO t (id) VALUES (1);"),
+            Migration::new("0002_b.noe", PROGRAM_BODY),
+            Migration::new("0003_c.sql", "INSERT INTO t (id) VALUES (3);"),
+        ];
+
+        let mut runner = RecordingRunner::new();
+        let ran = seed(&mut driver, &seeds, &mut runner).unwrap();
+
+        // Every file is reported, in filename order, whatever its body language.
+        assert_eq!(ran, vec!["0001_a.sql", "0002_b.noe", "0003_c.sql"]);
+        // Only the program went to the runner; the SQL bodies went to the database.
+        assert_eq!(runner.ran, vec!["0002_b.noe"]);
+        assert_eq!(
+            driver
+                .query("SELECT id FROM t ORDER BY id", &[])
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_failing_program_seed_stops_the_run_and_names_the_file() {
+        let mut driver = SqliteDriver::open_in_memory().unwrap();
+        driver
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let seeds = vec![
+            Migration::new("0001_a.noe", PROGRAM_BODY),
+            Migration::new("0002_b.noe", PROGRAM_BODY),
+            Migration::new("0003_c.sql", "INSERT INTO t (id) VALUES (3);"),
+        ];
+
+        let mut runner = RecordingRunner::new();
+        runner.fail_on = Some("0002_b.noe");
+        let err = seed(&mut driver, &seeds, &mut runner).unwrap_err();
+
+        assert_eq!(
+            err,
+            MigrateError::SeedProgram {
+                filename: "0002_b.noe".to_string(),
+                message: "boom".to_string()
+            }
+        );
+        // Stop-on-first-failure: the seed after it never ran.
+        assert_eq!(runner.ran, vec!["0001_a.noe", "0002_b.noe"]);
+        assert_eq!(driver.query("SELECT id FROM t", &[]).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_driver_only_caller_reports_a_program_seed_as_unsupported() {
+        // What `conn.seed(dir)` does: it holds a driver, not the CLI's loader, so it cannot run a
+        // program — and says so, naming the command that can, rather than skipping the file.
+        let mut driver = SqliteDriver::open_in_memory().unwrap();
+        let seeds = vec![Migration::new("0001_a.noe", PROGRAM_BODY)];
+
+        let err = seed(&mut driver, &seeds, &mut UnsupportedPrograms).unwrap_err();
+        let rendered = err.to_string();
+        assert!(matches!(err, MigrateError::ProgramUnsupported { .. }));
+        assert!(rendered.contains("0001_a.noe"), "{rendered}");
+        assert!(rendered.contains("noeta migrate --seed"), "{rendered}");
+    }
+}
+
+/// The exact statements the `para.db.query` builder's `insert_or_ignore` and `upsert` terminals
+/// emit — the same two strings `examples/para-db-demo/conflict_demo.noe`'s `@test` block asserts the
+/// builder produces.
+///
+/// The builder is pure Noeta, so Rust cannot call it; these constants close the loop from the other
+/// side. The Noeta test pins *what the builder emits*, and the two live tests below (one per backend)
+/// pin that *both drivers accept it verbatim*, bound parameters and all — which together is the
+/// portability claim. Changing the builder's output without changing these makes the Noeta test fail;
+/// changing these without the builder makes them describe nothing, which is why they name it.
+#[cfg(test)]
+const BUILDER_INSERT_OR_IGNORE: &str =
+    "INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT DO NOTHING";
+
+/// The `upsert(["id", "name"], …, ["id"])` form. See [`BUILDER_INSERT_OR_IGNORE`].
+#[cfg(test)]
+const BUILDER_UPSERT: &str = "INSERT INTO users (id, name) VALUES (?, ?)      ON CONFLICT (id) DO UPDATE SET name = excluded.name";
+
+/// Run the builder's two conflict statements against `driver` and assert they behave: the second
+/// insert of an existing key is skipped (0 rows, no error), and the upsert overwrites it. Shared by
+/// the SQLite and Postgres e2e modules so both backends are held to the identical script.
+#[cfg(test)]
+fn assert_builder_conflict_statements(driver: &mut dyn SqlDriver) {
+    driver
+        .execute_batch("CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+
+    let ada = [SqlValue::Int(1), SqlValue::Text("Ada".to_string())];
+    assert_eq!(driver.execute(BUILDER_INSERT_OR_IGNORE, &ada).unwrap(), 1);
+    // The same key again: skipped, not an error — what makes a seed re-runnable.
+    let grace = [SqlValue::Int(1), SqlValue::Text("Grace".to_string())];
+    assert_eq!(driver.execute(BUILDER_INSERT_OR_IGNORE, &grace).unwrap(), 0);
+    assert_eq!(
+        driver
+            .query("SELECT name FROM users WHERE id = 1", &[])
+            .unwrap()[0][0]
+            .1,
+        SqlValue::Text("Ada".to_string())
+    );
+
+    // The upsert overwrites the row it collided with.
+    let lovelace = [SqlValue::Int(1), SqlValue::Text("Ada Lovelace".to_string())];
+    assert_eq!(driver.execute(BUILDER_UPSERT, &lovelace).unwrap(), 1);
+    assert_eq!(
+        driver
+            .query("SELECT name FROM users WHERE id = 1", &[])
+            .unwrap()[0][0]
+            .1,
+        SqlValue::Text("Ada Lovelace".to_string())
+    );
+    // And inserts one it does not.
+    let radia = [SqlValue::Int(2), SqlValue::Text("Radia".to_string())];
+    assert_eq!(driver.execute(BUILDER_UPSERT, &radia).unwrap(), 1);
+    assert_eq!(driver.query("SELECT id FROM users", &[]).unwrap().len(), 2);
 }
 
 /// End-to-end tests against a real in-memory SQLite driver (behind `ring-sqlite`, the default
@@ -1030,6 +1497,11 @@ mod sqlite_e2e {
 
     fn mem() -> SqliteDriver {
         SqliteDriver::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn the_query_builders_conflict_statements_run_on_sqlite() {
+        assert_builder_conflict_statements(&mut mem());
     }
 
     fn table_exists(driver: &mut dyn SqlDriver, table: &str) -> bool {
@@ -1187,7 +1659,7 @@ mod sqlite_e2e {
         // `load_dir` sorts; `seed` runs whatever order it is handed — so sort first, like the callers.
         let mut ordered = seeds.clone();
         ordered.sort_by(|a, b| a.name.cmp(&b.name));
-        let ran = seed(&mut driver, &ordered).unwrap();
+        let ran = seed(&mut driver, &ordered, &mut UnsupportedPrograms).unwrap();
         assert_eq!(ran, vec!["0001_a.sql", "0002_b.sql"]);
         assert_eq!(count(&mut driver, "users"), 2);
 
@@ -1212,17 +1684,17 @@ mod sqlite_e2e {
             "0001_plain.sql",
             "INSERT INTO posts (id, title) VALUES (2, 'again');",
         )];
-        seed(&mut driver, &plain).unwrap();
-        seed(&mut driver, &plain).unwrap_err(); // second run trips the PK — proves it re-ran
+        seed(&mut driver, &plain, &mut UnsupportedPrograms).unwrap();
+        seed(&mut driver, &plain, &mut UnsupportedPrograms).unwrap_err(); // second run trips the PK — proves it re-ran
 
         // The documented idempotent idiom makes a re-run a no-op.
         let idempotent = vec![Migration::new(
             "0001_idem.sql",
             "INSERT OR IGNORE INTO posts (id, title) VALUES (3, 'once');",
         )];
-        seed(&mut driver, &idempotent).unwrap();
+        seed(&mut driver, &idempotent, &mut UnsupportedPrograms).unwrap();
         let after_first = count(&mut driver, "posts");
-        seed(&mut driver, &idempotent).unwrap();
+        seed(&mut driver, &idempotent, &mut UnsupportedPrograms).unwrap();
         assert_eq!(count(&mut driver, "posts"), after_first);
     }
 
@@ -1238,7 +1710,7 @@ mod sqlite_e2e {
             ),
             Migration::new("0002_bad.sql", "NONSENSE SQL HERE;"),
         ];
-        let err = seed(&mut driver, &seeds).unwrap_err();
+        let err = seed(&mut driver, &seeds, &mut UnsupportedPrograms).unwrap_err();
         match err {
             MigrateError::Seed { filename, .. } => assert_eq!(filename, "0002_bad.sql"),
             other => panic!("expected a seed error, got {other:?}"),
@@ -1258,7 +1730,8 @@ mod sqlite_e2e {
             "0001_a.sql",
             "INSERT INTO users (id, name) VALUES (1, 'Ada');",
         )];
-        let err = seed_only(&mut driver, &migrations, &seeds).unwrap_err();
+        let err =
+            seed_only(&mut driver, &migrations, &seeds, &mut UnsupportedPrograms).unwrap_err();
         assert_eq!(err, MigrateError::PendingMigrations { pending: 1 });
         // No seed ran — `users` is empty (the schema exists from the first migration).
         assert_eq!(count(&mut driver, "users"), 0);
@@ -1449,7 +1922,7 @@ mod sqlite_e2e {
             "0001_a.sql",
             "INSERT INTO users (id, name) VALUES (1, 'Ada');",
         )];
-        let ran = seed_only(&mut driver, &migrations, &seeds).unwrap();
+        let ran = seed_only(&mut driver, &migrations, &seeds, &mut UnsupportedPrograms).unwrap();
         assert_eq!(ran, vec!["0001_a.sql"]);
         assert_eq!(count(&mut driver, "users"), 1);
     }
@@ -1507,7 +1980,7 @@ mod postgres_e2e {
             "0001_widgets.sql",
             "INSERT INTO widgets (id, name) VALUES (3, 'gamma') ON CONFLICT DO NOTHING;",
         )];
-        let ran = seed_only(&mut driver, &migrations, &seeds).unwrap();
+        let ran = seed_only(&mut driver, &migrations, &seeds, &mut UnsupportedPrograms).unwrap();
         assert_eq!(ran, vec!["0001_widgets.sql"]);
         assert_eq!(
             driver
@@ -1517,7 +1990,7 @@ mod postgres_e2e {
             SqlValue::Int(3)
         );
         // Re-running the idempotent seed is a no-op (ON CONFLICT DO NOTHING), and it was never tracked.
-        seed(&mut driver, &seeds).unwrap();
+        seed(&mut driver, &seeds, &mut UnsupportedPrograms).unwrap();
         assert_eq!(
             driver
                 .query("SELECT COUNT(*) AS n FROM widgets", &[])
@@ -1529,6 +2002,35 @@ mod postgres_e2e {
         // Reset wipes and re-applies.
         let reapplied = reset(&mut driver, &migrations).unwrap();
         assert_eq!(reapplied.len(), 2);
+
+        driver.reset().expect("final cleanup");
+    }
+
+    /// The twin of `sqlite_e2e::the_query_builders_conflict_statements_run_on_sqlite`, against a
+    /// live server: the statements the query builder emits for a re-runnable seed are accepted
+    /// **verbatim** by PostgreSQL too, `?` placeholders rewritten to `$N` and all. This is what makes
+    /// a builder-written seed portable — and what the SQLite-only `INSERT OR IGNORE` spelling fails
+    /// here with (`syntax error at or near "OR"`).
+    #[test]
+    fn the_query_builders_conflict_statements_run_on_postgres_too() {
+        let _pg = crate::pg_test_guard();
+        let Ok(dsn) = std::env::var("NOETA_PG_TEST_DSN") else {
+            return; // no server configured — skip
+        };
+        let mut driver = PostgresDriver::connect(&dsn).expect("connect to NOETA_PG_TEST_DSN");
+        driver.reset().expect("reset");
+
+        assert_builder_conflict_statements(&mut driver);
+
+        // The unportable spelling, proven unportable rather than assumed: this is exactly why the
+        // builder never emits it.
+        let err = driver
+            .execute(
+                "INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)",
+                &[SqlValue::Int(3), SqlValue::Text("Grace".to_string())],
+            )
+            .unwrap_err();
+        assert!(err.contains("syntax error"), "{err}");
 
         driver.reset().expect("final cleanup");
     }

@@ -267,8 +267,11 @@ fn connection_method_dispatch(
             let dir = want_str(method, args, 0)?.to_string();
             // Discover + checksum the migration files before locking the driver (a filesystem read
             // over the real project directory, like the SQLite driver opening its file directly).
-            let migrations =
-                crate::migrate::load_dir(std::path::Path::new(&dir)).map_err(migrate_error)?;
+            let migrations = crate::migrate::load_dir(
+                std::path::Path::new(&dir),
+                crate::migrate::DirKind::Migrations,
+            )
+            .map_err(migrate_error)?;
             let conn = conn_of(recv)?;
             let mut driver = conn
                 .0
@@ -285,8 +288,11 @@ fn connection_method_dispatch(
             let dir = want_str(method, args, 0)?.to_string();
             // Discover + order the seed files with the same loader migrations use (a real-filesystem
             // read over the project's `seeds/` directory), before locking the driver.
-            let seeds =
-                crate::migrate::load_dir(std::path::Path::new(&dir)).map_err(migrate_error)?;
+            let seeds = crate::migrate::load_dir(
+                std::path::Path::new(&dir),
+                crate::migrate::DirKind::Seeds,
+            )
+            .map_err(migrate_error)?;
             let conn = conn_of(recv)?;
             let mut driver = conn
                 .0
@@ -295,7 +301,15 @@ fn connection_method_dispatch(
             // Run every seed (untracked, re-runnable) through the shared engine and report how many
             // ran, so an app can `conn.seed("seeds")` at boot after `conn.migrate(...)`. Seeding is
             // never implicit — the app opts in and controls the order (migrate, then seed).
-            let ran = crate::migrate::seed(&mut **driver, &seeds).map_err(migrate_error)?;
+            // A `.noe` seed is a Noeta program, and this surface holds a driver, not the CLI's
+            // loader: `UnsupportedPrograms` turns one into a clear error naming `noeta migrate
+            // --seed`, rather than skipping it and reporting a seed count that silently omits it.
+            let ran = crate::migrate::seed(
+                &mut **driver,
+                &seeds,
+                &mut crate::migrate::UnsupportedPrograms,
+            )
+            .map_err(migrate_error)?;
             Ok(NativeOut::Scalar(Scalar::Int(ran.len() as i64)))
         }
         "apply_schema" => {
@@ -401,7 +415,7 @@ fn want_str<'a>(method: &str, args: &'a [NativeValue], index: usize) -> Result<&
 }
 
 /// A driver/IO failure as the language's IO error.
-fn io_error(message: impl Into<String>) -> StdError {
+pub(crate) fn io_error(message: impl Into<String>) -> StdError {
     StdError {
         kind: ErrorKind::Io,
         message: message.into(),
