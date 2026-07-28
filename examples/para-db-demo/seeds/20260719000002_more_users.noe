@@ -1,0 +1,26 @@
+// Seed (Noeta program): the other body language a seeds directory takes, beside the raw `.sql` file
+// next to it — the two interleave in one filename order, so this one runs second.
+//
+// `noeta migrate --seed` (or `noeta migrate seed`) loads this file, checks it, and calls `seed` with
+// a connection to the project's database — the dsn it already resolved from `--db`, `DATABASE_URL`,
+// or `[db] url`. Nothing here names a connection string, and nothing runs unless the command asks.
+//
+//   noeta migrate --db sqlite:demo.db --seed --dir examples/para-db-demo/migrations \
+//                 --seeds-dir examples/para-db-demo/seeds
+//
+// Why write a seed this way: the rows go in through the query builder, which binds every value as a
+// parameter and emits conflict handling both backends accept. The same file seeds SQLite and
+// PostgreSQL, with no dialect SQL to keep in sync.
+use para.db
+use para.db.query.{table, exec}
+
+fn seed(conn: db.Connection): void {
+    // `insert_or_ignore` emits `INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT DO NOTHING`:
+    // insert the row, and if it is already there, leave it exactly as it is.
+    exec(conn, table("users").insert_or_ignore(["id", "name"], [102, "Katherine"]))
+
+    // `upsert` emits `... ON CONFLICT (id) DO UPDATE SET name = excluded.name`: insert the row, or
+    // refresh the columns that are not part of the conflict target if it exists. A seed that must
+    // keep its data current across re-runs wants this rather than "do nothing".
+    exec(conn, table("users").upsert(["id", "name"], [103, "Radia"], ["id"]))
+}

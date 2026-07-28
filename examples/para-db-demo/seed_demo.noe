@@ -1,9 +1,14 @@
 // Seeding at boot (aether DB6): after `conn.migrate(dir)` brings the schema up to date, `conn.seed(dir)`
-// runs every re-runnable `.sql` file under a `seeds/` directory — dev data, NOT tracked history, so it
-// runs every time. Idempotent inserts (INSERT OR IGNORE) make a re-run a no-op. Run from the repo root
-// so the relative paths resolve:
+// runs every re-runnable seed file under a directory — dev data, NOT tracked history, so it runs every
+// time. Idempotent inserts (`... ON CONFLICT DO NOTHING`, which both backends accept) make a re-run a
+// no-op. Run from the repo root so the relative paths resolve:
 //
 //   noeta run examples/para-db-demo/seed_demo.noe
+//
+// This is the SELF-SEEDING path — a program seeding itself, with no CLI in the picture — so the
+// directory it reads is SQL-only (`boot_seeds/`). A `.noe` seed is a Noeta program, and only the CLI
+// can load, check and run one: `conn.seed(dir)` says so plainly if it meets one, rather than skipping
+// it. The `noeta migrate` command drives `seeds/`, which has both body languages side by side.
 use para.db
 
 conn = db.connect("sqlite::memory:")
@@ -14,11 +19,12 @@ echo "applied ${applied} migration(s)"
 
 // 2. Seed: add re-runnable dev users. Returns how many seed files ran (never a no-op skip — seeds are
 //    not tracked, so every file runs every call).
-seeded = conn.seed("examples/para-db-demo/seeds")
+seeded = conn.seed("examples/para-db-demo/boot_seeds")
 echo "ran ${seeded} seed file(s)"
 
-// 3. Seeding again runs the same files again — but the INSERT OR IGNORE idiom keeps the data stable.
-conn.seed("examples/para-db-demo/seeds")
+// 3. Seeding again runs the same files again — but the ON CONFLICT DO NOTHING idiom keeps the data
+//    stable, on SQLite and on PostgreSQL alike.
+conn.seed("examples/para-db-demo/boot_seeds")
 
 rows = conn.query("SELECT id, name FROM users ORDER BY id", [])
 echo "users -> ${rows.len()}"

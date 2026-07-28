@@ -70,6 +70,20 @@ rows = run(conn, q)        // List<Map<string, dyn>>
 
 In an `update(columns, values)`, the SET bindings come first and the builder's filter bindings follow; `delete()` binds this builder's filters. Filter values become bound parameters, so a query built from untrusted input carries no injection risk.
 
+**Conflict handling — `insert_or_ignore` and `upsert`.** Two more terminals turn an insert into a *re-runnable* one, which is what a seed needs:
+
+```noeta
+// INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT DO NOTHING
+exec(conn, table("users").insert_or_ignore(["id", "name"], [1, "Ada"]))
+
+// INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name
+exec(conn, table("users").upsert(["id", "name"], [1, "Ada Lovelace"], ["id"]))
+```
+
+`insert_or_ignore` inserts the row unless it would violate a unique/primary-key constraint, in which case the statement affects 0 rows instead of failing. `upsert(columns, values, conflict)` names the columns of the constraint that decides "already exists" and refreshes every *other* column from the incoming row; when `conflict` covers every column there is nothing left to assign and it emits `ON CONFLICT DO NOTHING` (an empty `SET` is a syntax error, and overwriting a row with what it already holds is a no-op anyway).
+
+Both spellings are accepted **verbatim by SQLite and by PostgreSQL** — unlike SQLite's `INSERT OR IGNORE`, which fails on PostgreSQL with `syntax error at or near "OR"` — so neither needs a per-dialect lowering and neither costs the builder a placeholder.
+
 ## Schema DSL — portable DDL, lowered per driver
 
 The query builder solves portability for *statements*: it emits neutral `?` placeholders and each driver rewrites them into its own binding syntax. `para.db.schema` is the same idea one level up, for *schema*: a table is described backend-neutrally and each driver lowers that description into its own DDL. The one description creates the table on SQLite and on PostgreSQL — so a project can develop on a SQLite file and deploy on Postgres from one set of migrations.
@@ -213,18 +227,57 @@ A `.schema` body is parsed and lowered **before** its transaction opens, so a DS
 
 ## Seeds — re-runnable development data
 
-Where a migration is immutable schema *history*, a **seed** is throwaway development *data*: sample rows to develop and demo against. Seeds are plain `.sql` files in a project `seeds/` directory, discovered and ordered by the very same filename-sort convention migrations use, and applied **after** migrations.
+Where a migration is immutable schema *history*, a **seed** is throwaway development *data*: sample rows to develop and demo against. Seeds live in a project `seeds/` directory, discovered and ordered by the very same filename-sort convention migrations use, and applied **after** migrations.
 
-The rerun semantics are deliberately honest and different from migrations. **Seeds run in filename order, each in its own transaction, every time they are invoked — and are never recorded in the tracking table.** They are not history, so there is no checksum and no "already applied" skip: running seeds twice runs every file twice. Idempotency is therefore the seed author's job — write inserts that a re-run turns into a no-op:
+The rerun semantics are deliberately honest and different from migrations. **Seeds run in filename order, every time they are invoked — and are never recorded in the tracking table.** They are not history, so there is no checksum and no "already applied" skip: running seeds twice runs every file twice. Idempotency is therefore the seed author's job.
+
+A mid-seed failure stops at that file (naming it) with the prior seeds committed — the same stop-on-first-failure shape as migrations, minus the tracking.
+
+### Three body languages, one directory
+
+A seed's **extension** picks how its body runs, exactly as a migration's does — and the seeds directory takes one more than the migrations directory does:
+
+| Extension | Body | Runs as |
+| --- | --- | --- |
+| `.sql` | native SQL for the connected backend | verbatim, in its own transaction |
+| `.schema` | the portable schema DSL | lowered per driver, then applied (rarely what a seed wants — a seed is data) |
+| `.noe` | **a Noeta program** | loaded, checked and run by `noeta migrate`, with a connection to the project database |
+
+All three interleave in one filename order, and every file is reported in the same summary.
+
+**`.noe` is a seeds-only body language.** A `.noe` file under the *migrations* directory is a hard error naming the file, not a silent skip: a migration is tracked, checksummed history, and what a program's identity and replay should mean there is a separate design. Move it to the seeds directory or write the migration in `.sql`/`.schema`.
+
+#### A portable `.sql` seed
+
+Raw SQL stays the permanent escape hatch — but a seed written for one backend is not portable, and the SQLite-only `INSERT OR IGNORE` is the usual way that happens (PostgreSQL rejects it with `syntax error at or near "OR"`). `ON CONFLICT DO NOTHING` says the same thing and **both** backends accept it verbatim:
 
 ```sql
--- SQLite
-INSERT OR IGNORE INTO users (id, name) VALUES (1, 'Ada');
--- PostgreSQL
 INSERT INTO users (id, name) VALUES (1, 'Ada') ON CONFLICT DO NOTHING;
 ```
 
-A mid-seed failure stops at that file (naming it) with the prior seeds committed — the same stop-on-first-failure shape as migrations, minus the tracking.
+#### A `.noe` program seed
+
+For anything beyond a literal row, write the seed in Noeta and let the query builder emit the SQL — values are bound, conflict handling is portable, and one file seeds every backend:
+
+```noeta
+// seeds/20260719000002_more_users.noe
+use para.db
+use para.db.query.{table, exec}
+
+fn seed(conn: db.Connection): void {
+    exec(conn, table("users").insert_or_ignore(["id", "name"], [102, "Katherine"]))
+    exec(conn, table("users").upsert(["id", "name"], [103, "Radia"], ["id"]))
+}
+```
+
+The file must declare `fn seed(conn: db.Connection)` — that is the entry convention. `noeta migrate --seed` loads and checks the program and appends one synthesized trailing statement, `db.run_seed("<dsn>", seed)`, the same mechanism `noeta serve` uses to append `http.serve(port, fetch)`. The dsn is the one the command already resolved (`--db` → `DATABASE_URL` → `[db] url`) and reaches the program as a literal argument: a seed file names no connection string of its own, and nothing is passed to it through the environment. `db.run_seed(dsn, body)` is an ordinary registered function, so a program can call it directly too.
+
+A program seed **owns its connection, and therefore its own transactions** — the engine wraps no transaction around it (an implicit one would collide with any `BEGIN` the program issues itself, e.g. through a repository's `flush`). Per-statement idempotency is what makes it re-runnable. If it fails, the seeds before it stand and the run stops, naming the file.
+
+Two limits worth knowing:
+
+- **`conn.seed(dir)` cannot run a `.noe` seed.** The programmatic surface holds a database driver, not the CLI's loader, so it reports the file and names `noeta migrate --seed` instead of skipping it. A self-seeding app's directory is `.sql`/`.schema` only.
+- **A private in-memory dsn is refused** for a program seed (`sqlite::memory:` / `:memory:`): the seed program opens its own connection, which for an in-memory database means a *second, empty* one. The command says so rather than reporting a successful seed over an untouched database.
 
 ### CLI
 
@@ -234,7 +287,8 @@ noeta migrate --status             # table of applied / pending migrations
 noeta migrate --dry-run            # list what would be applied, without touching the database
 noeta migrate new <name>           # scaffold migrations/<timestamp>_<name>.sql  (raw SQL)
 noeta migrate new <name> --schema  # scaffold migrations/<timestamp>_<name>.schema  (portable DSL)
-noeta migrate new --seed <name>    # scaffold seeds/<timestamp>_<name>.sql
+noeta migrate new --seed <name>    # scaffold seeds/<timestamp>_<name>.sql  (raw SQL)
+noeta migrate new --seed --program <name>  # scaffold seeds/<timestamp>_<name>.noe  (a Noeta program)
 noeta migrate --seed               # apply pending migrations, then run the seed files
 noeta migrate seed                 # run the seed files ONLY (errors if any migration is pending)
 noeta migrate --reset --yes        # DESTRUCTIVE: drop the schema and re-apply from zero
@@ -262,7 +316,7 @@ applied = conn.migrate("migrations")   // returns the count applied; a no-op whe
 seeded  = conn.seed("seeds")           // runs every seed file every time; returns how many ran
 ```
 
-`conn.migrate(dir)` applies every pending migration under `dir` — `.sql` and `.schema` alike — and returns how many it applied, with the same tracking table and integrity checks as the CLI. `conn.seed(dir)` runs every seed file under `dir` (untracked, re-runnable) and returns how many it ran. `conn.apply_schema(source)` applies schema-DSL source directly, without tracking it; that is what `para.db.schema`'s `apply` calls.
+`conn.migrate(dir)` applies every pending migration under `dir` — `.sql` and `.schema` alike — and returns how many it applied, with the same tracking table and integrity checks as the CLI. `conn.seed(dir)` runs every `.sql`/`.schema` seed file under `dir` (untracked, re-runnable) and returns how many it ran; a `.noe` program seed needs the CLI, so `conn.seed` names it and errors rather than skipping it. `conn.apply_schema(source)` applies schema-DSL source directly, without tracking it; that is what `para.db.schema`'s `apply` calls.
 
 ## TLS (PostgreSQL)
 
@@ -341,7 +395,7 @@ For **other editors** (or a custom setup), `@sql { … }` bodies highlight as SQ
 
 ## Examples
 
-[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder), `schema_demo.noe` (the schema DSL) + `schema_migrate_demo.noe` (`.schema` and `.sql` migrations side by side, under `schema_migrations/`), `repo_demo.noe` (repository + unit-of-work), `sql_demo.noe` (the `@sql` tier), `migrate_demo.noe` + `seed_demo.noe` (the engine), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
+[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder) + `conflict_demo.noe` (the portable `ON CONFLICT` terminals), `schema_demo.noe` (the schema DSL) + `schema_migrate_demo.noe` (`.schema` and `.sql` migrations side by side, under `schema_migrations/`), `repo_demo.noe` (repository + unit-of-work), `sql_demo.noe` (the `@sql` tier), `migrate_demo.noe` + `seed_demo.noe` (the engine; `seeds/` holds a portable `.sql` seed and a `.noe` program seed side by side, `boot_seeds/` the SQL-only directory a self-seeding app reads), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
 
 ## Requirements
 
