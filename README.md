@@ -107,11 +107,16 @@ apply(conn, [
 
 `id()` lowers to `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite and `BIGSERIAL PRIMARY KEY` on PostgreSQL; `float` lowers to `REAL` or `DOUBLE PRECISION`. Everything else in the vocabulary is spelled identically on both. **The lowering lives in the driver** (`SqlDriver::lower_schema`), exactly where the `?`→`$N` rewrite lives, so nothing above the driver seam branches on the backend — and a third driver gets the whole DSL by naming its dialect.
 
-A builder renders **schema-DSL source**: the very text a `.schema` migration file holds. `echo create_table("todos").id().render()` prints something you can paste straight into `migrations/`. There is one grammar and one lowering, both native, so the Noeta builder and the migration file cannot drift apart. `apply(conn, statements)` is for schema you build at runtime — a test fixture, a scratch database; for a durable change, write a `.schema` **migration** (below), which is checksummed, tracked, and applied exactly once.
+A builder describes a **`Statement`** — the same backend-neutral IR the native side parses a `.schema` file into, with `Statement`, `CreateTable`, `Column`, `DefaultValue` and the rest declared in Noeta field for field against their `schema.rs` twins. `.statement()` hands that value over, and there are two renderings of it:
+
+- **`.render()`** — schema-DSL **source**, laid out the way a migration file is written. `echo create_table("todos").id().render()` prints something you can paste straight into `migrations/`.
+- **`.canonical()`** — the **canonical** rendering, one statement per line in one fixed shape, byte for byte what the native `schema::render` produces from the same statement. It is what a `.schema` migration is *checksummed* over, so a migration's identity is its meaning rather than its formatting.
+
+There is one grammar and one lowering, both native, and a test renders a corpus of builder expressions both ways to hold the Noeta IR and the native IR to one canonical text — so the builder and the migration file cannot drift apart. `apply(conn, statements)` is for schema you build at runtime — a test fixture, a scratch database; for a durable change, write a `.schema` **migration** (below), which is checksummed, tracked, and applied exactly once.
 
 ### The vocabulary
 
-The tables below name the **Noeta builder** methods. The `.schema` file notation is the same, with the one difference that a list argument is spelled as plain arguments: `primary_key(["a", "b"])` in Noeta is `primary_key("a", "b")` in a file. Every builder also has a `link(name, args)` escape hatch that emits an arbitrary DSL call, so a statement the Noeta surface has not wrapped yet is still reachable.
+The tables below name the **Noeta builder** methods. The `.schema` file notation is the same, with the one difference that a list argument is spelled as plain arguments: `primary_key(["a", "b"])` in Noeta is `primary_key("a", "b")` in a file. Every builder also has a `link(name, args)` escape hatch that applies an arbitrary DSL call to the statement under construction, so a call the Noeta surface has not wrapped is still reachable; a name outside the vocabulary is refused there rather than at apply time.
 
 | Statement | Chain |
 | --- | --- |

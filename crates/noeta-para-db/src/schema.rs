@@ -1974,75 +1974,422 @@ mod tests {
         assert_eq!(canonicalize("// only a comment\n").unwrap(), "");
     }
 
+    /// The corpus both *representations* of this DSL are checked over — the schema-DSL source of a
+    /// statement, and the `para.db.schema` (Noeta) builder expression that describes the same one.
+    ///
+    /// It is one list because the two properties it carries are one obligation. The rows vary
+    /// exactly one thing at a time, so [`every_ir_field_reaches_the_canonical_text`] can demand that
+    /// no two canonicalize alike; and each row pairs the source with a builder expression, so
+    /// [`the_noeta_builder_and_the_ir_render_one_canonical_text`] can demand that the Noeta builder
+    /// and this module agree on that canonical text. A field or variant added to the IR fails to
+    /// compile in [`render`] until it is rendered, needs a row here to be *distinguishably* rendered,
+    /// and that row then needs a Noeta spelling — which is what stops the two sides drifting.
+    ///
+    /// The two spellings differ only where the builder takes a list rather than varargs
+    /// (`primary_key(["a"])`, `unique([…])`, `columns([…])`); everywhere else they are the same text,
+    /// which is the point of shaping the builder like the notation it renders.
+    const VARIATIONS: &[(&str, &str)] = &[
+        // CreateTable: name, if_not_exists, columns, primary_key, uniques
+        (
+            r#"create_table("t").int("a").int("b")"#,
+            r#"create_table("t").int("a").int("b")"#,
+        ),
+        (
+            r#"create_table("u").int("a").int("b")"#,
+            r#"create_table("u").int("a").int("b")"#,
+        ),
+        (
+            r#"create_table("t").int("a").int("b").if_not_exists()"#,
+            r#"create_table("t").int("a").int("b").if_not_exists()"#,
+        ),
+        (
+            r#"create_table("t").int("a").int("c")"#,
+            r#"create_table("t").int("a").int("c")"#,
+        ),
+        (
+            r#"create_table("t").int("a").int("b").primary_key("a")"#,
+            r#"create_table("t").int("a").int("b").primary_key(["a"])"#,
+        ),
+        (
+            r#"create_table("t").int("a").int("b").primary_key("a", "b")"#,
+            r#"create_table("t").int("a").int("b").primary_key(["a", "b"])"#,
+        ),
+        (
+            r#"create_table("t").int("a").int("b").unique("a")"#,
+            r#"create_table("t").int("a").int("b").unique(["a"])"#,
+        ),
+        (
+            r#"create_table("t").int("a").int("b").unique("a").unique("b")"#,
+            r#"create_table("t").int("a").int("b").unique(["a"]).unique(["b"])"#,
+        ),
+        // Column: name, ty, not_null, unique, primary_key, default, references
+        (
+            r#"create_table("t").int("a")"#,
+            r#"create_table("t").int("a")"#,
+        ),
+        (
+            r#"create_table("t").int("z")"#,
+            r#"create_table("t").int("z")"#,
+        ),
+        (
+            r#"create_table("t").bigint("a")"#,
+            r#"create_table("t").bigint("a")"#,
+        ),
+        (
+            r#"create_table("t").int("a").not_null()"#,
+            r#"create_table("t").int("a").not_null()"#,
+        ),
+        (
+            r#"create_table("t").int("a").unique()"#,
+            r#"create_table("t").int("a").unique()"#,
+        ),
+        (
+            r#"create_table("t").int("a").primary_key()"#,
+            r#"create_table("t").int("a").primary_key()"#,
+        ),
+        (
+            r#"create_table("t").int("a").default(1)"#,
+            r#"create_table("t").int("a").default(1)"#,
+        ),
+        (
+            r#"create_table("t").int("a").default(2)"#,
+            r#"create_table("t").int("a").default(2)"#,
+        ),
+        (
+            r#"create_table("t").int("a").default(2.0)"#,
+            r#"create_table("t").int("a").default(2.0)"#,
+        ),
+        (
+            r#"create_table("t").int("a").default("2")"#,
+            r#"create_table("t").int("a").default("2")"#,
+        ),
+        (
+            r#"create_table("t").int("a").default(true)"#,
+            r#"create_table("t").int("a").default(true)"#,
+        ),
+        (
+            r#"create_table("t").int("a").default_now()"#,
+            r#"create_table("t").int("a").default_now()"#,
+        ),
+        // The remaining column types, and the identity column in both of its spellings.
+        (
+            r#"create_table("t").text("a")"#,
+            r#"create_table("t").text("a")"#,
+        ),
+        (
+            r#"create_table("t").float("a")"#,
+            r#"create_table("t").float("a")"#,
+        ),
+        (
+            r#"create_table("t").bool("a")"#,
+            r#"create_table("t").bool("a")"#,
+        ),
+        (
+            r#"create_table("t").timestamp("a")"#,
+            r#"create_table("t").timestamp("a")"#,
+        ),
+        (r#"create_table("t").id()"#, r#"create_table("t").id()"#),
+        (
+            r#"create_table("t").id("uid")"#,
+            r#"create_table("t").id("uid")"#,
+        ),
+        // The `timestamps()` shorthand: both sides must expand it into the same two columns.
+        (
+            r#"create_table("t").int("x").timestamps()"#,
+            r#"create_table("t").int("x").timestamps()"#,
+        ),
+        // A text default carrying every escape the lexer reads, and the two float shapes.
+        (
+            r#"create_table("t").text("a").default("a \"quote\", a \\, a \nline and a \ttab")"#,
+            r#"create_table("t").text("a").default("a \"quote\", a \\, a \nline and a \ttab")"#,
+        ),
+        (
+            r#"create_table("t").float("a").default(-0.5)"#,
+            r#"create_table("t").float("a").default(-0.5)"#,
+        ),
+        // ForeignKey: table, column, on_delete, on_update
+        (
+            r#"create_table("t").bigint("a").references("u", "id")"#,
+            r#"create_table("t").bigint("a").references("u", "id")"#,
+        ),
+        (
+            r#"create_table("t").bigint("a").references("v", "id")"#,
+            r#"create_table("t").bigint("a").references("v", "id")"#,
+        ),
+        (
+            r#"create_table("t").bigint("a").references("u", "uid")"#,
+            r#"create_table("t").bigint("a").references("u", "uid")"#,
+        ),
+        (
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("cascade")"#,
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("cascade")"#,
+        ),
+        (
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("restrict")"#,
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("restrict")"#,
+        ),
+        (
+            r#"create_table("t").bigint("a").references("u", "id").on_update("cascade")"#,
+            r#"create_table("t").bigint("a").references("u", "id").on_update("cascade")"#,
+        ),
+        // The remaining referential actions, written in the forgiving spellings both sides accept —
+        // the canonical text normalizes them, so these rows also pin that normalization.
+        (
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("SET-NULL").on_update("No Action")"#,
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("SET-NULL").on_update("No Action")"#,
+        ),
+        (
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("set default")"#,
+            r#"create_table("t").bigint("a").references("u", "id").on_delete("set default")"#,
+        ),
+        // CreateIndex: table, name, columns, unique, if_not_exists
+        (
+            r#"create_index("t").column("a")"#,
+            r#"create_index("t").column("a")"#,
+        ),
+        (
+            r#"create_index("u").column("a")"#,
+            r#"create_index("u").column("a")"#,
+        ),
+        (
+            r#"create_index("t").column("a").name("idx_t_a")"#,
+            r#"create_index("t").column("a").name("idx_t_a")"#,
+        ),
+        (
+            r#"create_index("t").column("b")"#,
+            r#"create_index("t").column("b")"#,
+        ),
+        (
+            r#"create_index("t").columns("a", "b")"#,
+            r#"create_index("t").columns(["a", "b"])"#,
+        ),
+        (
+            r#"create_index("t").columns("b", "a")"#,
+            r#"create_index("t").columns(["b", "a"])"#,
+        ),
+        (
+            r#"create_index("t").column("a").unique()"#,
+            r#"create_index("t").column("a").unique()"#,
+        ),
+        (
+            r#"create_index("t").column("a").if_not_exists()"#,
+            r#"create_index("t").column("a").if_not_exists()"#,
+        ),
+        // DropTable / DropIndex: name, if_exists
+        (r#"drop_table("t")"#, r#"drop_table("t")"#),
+        (r#"drop_table("u")"#, r#"drop_table("u")"#),
+        (
+            r#"drop_table("t").if_exists()"#,
+            r#"drop_table("t").if_exists()"#,
+        ),
+        (r#"drop_index("t")"#, r#"drop_index("t")"#),
+        (
+            r#"drop_index("t").if_exists()"#,
+            r#"drop_index("t").if_exists()"#,
+        ),
+        // AlterTable: name, actions (all four)
+        (
+            r#"alter_table("t").add_text("a")"#,
+            r#"alter_table("t").add_text("a")"#,
+        ),
+        (
+            r#"alter_table("u").add_text("a")"#,
+            r#"alter_table("u").add_text("a")"#,
+        ),
+        (
+            r#"alter_table("t").add_int("a")"#,
+            r#"alter_table("t").add_int("a")"#,
+        ),
+        (
+            r#"alter_table("t").drop_column("a")"#,
+            r#"alter_table("t").drop_column("a")"#,
+        ),
+        (
+            r#"alter_table("t").rename_column("a", "b")"#,
+            r#"alter_table("t").rename_column("a", "b")"#,
+        ),
+        (
+            r#"alter_table("t").rename_column("b", "a")"#,
+            r#"alter_table("t").rename_column("b", "a")"#,
+        ),
+        (
+            r#"alter_table("t").rename_to("a")"#,
+            r#"alter_table("t").rename_to("a")"#,
+        ),
+        (
+            r#"alter_table("t").add_text("a").drop_column("b")"#,
+            r#"alter_table("t").add_text("a").drop_column("b")"#,
+        ),
+        (
+            r#"alter_table("t").drop_column("b").add_text("a")"#,
+            r#"alter_table("t").drop_column("b").add_text("a")"#,
+        ),
+        // The remaining `add_*` types, and an added column carrying its portable modifiers.
+        (
+            r#"alter_table("t").add_bigint("a").references("u", "id")"#,
+            r#"alter_table("t").add_bigint("a").references("u", "id")"#,
+        ),
+        (
+            r#"alter_table("t").add_float("a").add_bool("b").not_null().default(false).add_timestamp("c")"#,
+            r#"alter_table("t").add_float("a").add_bool("b").not_null().default(false).add_timestamp("c")"#,
+        ),
+    ];
+
     #[test]
     fn every_ir_field_reaches_the_canonical_text() {
         // Field-by-field: flip exactly one thing in the source and the canonical text must move. The
         // compiler enforces *presence* (`render` destructures every struct with no `..` and matches
         // every enum with no catch-all); this enforces that what it renders is actually distinct.
-        let variants = [
-            // CreateTable: name, if_not_exists, columns, primary_key, uniques
-            r#"create_table("t").int("a").int("b")"#,
-            r#"create_table("u").int("a").int("b")"#,
-            r#"create_table("t").int("a").int("b").if_not_exists()"#,
-            r#"create_table("t").int("a").int("c")"#,
-            r#"create_table("t").int("a").int("b").primary_key("a")"#,
-            r#"create_table("t").int("a").int("b").primary_key("a", "b")"#,
-            r#"create_table("t").int("a").int("b").unique("a")"#,
-            r#"create_table("t").int("a").int("b").unique("a").unique("b")"#,
-            // Column: name, ty, not_null, unique, primary_key, default, references
-            r#"create_table("t").int("a")"#,
-            r#"create_table("t").int("z")"#,
-            r#"create_table("t").bigint("a")"#,
-            r#"create_table("t").int("a").not_null()"#,
-            r#"create_table("t").int("a").unique()"#,
-            r#"create_table("t").int("a").primary_key()"#,
-            r#"create_table("t").int("a").default(1)"#,
-            r#"create_table("t").int("a").default(2)"#,
-            r#"create_table("t").int("a").default(2.0)"#,
-            r#"create_table("t").int("a").default("2")"#,
-            r#"create_table("t").int("a").default(true)"#,
-            r#"create_table("t").int("a").default_now()"#,
-            // ForeignKey: table, column, on_delete, on_update
-            r#"create_table("t").bigint("a").references("u", "id")"#,
-            r#"create_table("t").bigint("a").references("v", "id")"#,
-            r#"create_table("t").bigint("a").references("u", "uid")"#,
-            r#"create_table("t").bigint("a").references("u", "id").on_delete("cascade")"#,
-            r#"create_table("t").bigint("a").references("u", "id").on_delete("restrict")"#,
-            r#"create_table("t").bigint("a").references("u", "id").on_update("cascade")"#,
-            // CreateIndex: table, name, columns, unique, if_not_exists
-            r#"create_index("t").column("a")"#,
-            r#"create_index("u").column("a")"#,
-            r#"create_index("t").column("a").name("idx_t_a")"#,
-            r#"create_index("t").column("b")"#,
-            r#"create_index("t").columns("a", "b")"#,
-            r#"create_index("t").columns("b", "a")"#,
-            r#"create_index("t").column("a").unique()"#,
-            r#"create_index("t").column("a").if_not_exists()"#,
-            // DropTable / DropIndex: name, if_exists
-            r#"drop_table("t")"#,
-            r#"drop_table("u")"#,
-            r#"drop_table("t").if_exists()"#,
-            r#"drop_index("t")"#,
-            r#"drop_index("t").if_exists()"#,
-            // AlterTable: name, actions (all four)
-            r#"alter_table("t").add_text("a")"#,
-            r#"alter_table("u").add_text("a")"#,
-            r#"alter_table("t").add_int("a")"#,
-            r#"alter_table("t").drop_column("a")"#,
-            r#"alter_table("t").rename_column("a", "b")"#,
-            r#"alter_table("t").rename_column("b", "a")"#,
-            r#"alter_table("t").rename_to("a")"#,
-            r#"alter_table("t").add_text("a").drop_column("b")"#,
-            r#"alter_table("t").drop_column("b").add_text("a")"#,
-        ];
         let mut seen: Vec<(usize, String)> = Vec::new();
-        for (i, src) in variants.iter().enumerate() {
+        for (i, (src, _)) in VARIATIONS.iter().enumerate() {
             let canonical = canonicalize(src).unwrap();
             if let Some((j, _)) = seen.iter().find(|(_, text)| *text == canonical) {
-                panic!("variants {j} and {i} collide on `{canonical}`");
+                panic!("variations {j} and {i} collide on `{canonical}`");
             }
             seen.push((i, canonical));
         }
+    }
+
+    // --- The cross-representation gate ------------------------------------------------------------
+
+    /// The marker the generated program brackets each rendering with. It cannot occur inside one: a
+    /// rendered line always begins with a call name or an indented `.`.
+    const MARK: &str = "###";
+
+    /// The `para.db.schema` builder and this module are two representations of one DSL — a Noeta
+    /// `Statement` and a Rust [`Statement`]. Nothing in either compiler relates them, so this is the
+    /// gate that does: for every row of [`VARIATIONS`], the builder's own canonical rendering of the
+    /// statement it built must equal, byte for byte, what [`render`] produces from the IR [`parse`]d
+    /// out of the same source — and the builder's laid-out `.render()` must [`parse`] back to that
+    /// same IR, so the text a program pastes into `migrations/` means what the builder was told.
+    ///
+    /// It runs the real `noeta` binary against a generated package, because that is the only place
+    /// the Noeta half exists. Without a binary the check is skipped rather than silently passing;
+    /// set `NOETA_CROSS_CHECK=1` (as CI's examples job does, where `noeta` is installed) to make a
+    /// missing binary a failure instead.
+    #[test]
+    fn the_noeta_builder_and_the_ir_render_one_canonical_text() {
+        let Some(rendered) = noeta_renderings() else {
+            return;
+        };
+        assert_eq!(
+            rendered.len(),
+            VARIATIONS.len(),
+            "the generated program printed {} renderings for {} variations",
+            rendered.len(),
+            VARIATIONS.len()
+        );
+        for ((src, expr), (laid_out, canonical)) in VARIATIONS.iter().zip(rendered.iter()) {
+            let ir = parse(src).unwrap_or_else(|e| panic!("`{src}` does not parse: {e}"));
+            assert_eq!(
+                canonical,
+                &render(&ir),
+                "the Noeta builder and the native IR disagree on the canonical text of `{expr}`"
+            );
+            assert_eq!(
+                parse(laid_out).unwrap_or_else(|e| panic!("`{expr}`.render() does not parse: {e}")),
+                ir,
+                "`{expr}`.render() describes a different statement:\n{laid_out}"
+            );
+        }
+    }
+
+    /// Build a throwaway Noeta package that renders every [`VARIATIONS`] builder expression both
+    /// ways, run it, and return the `(laid out, canonical)` pair each row printed.
+    fn noeta_renderings() -> Option<Vec<(String, String)>> {
+        let bin = std::env::var("NOETA_BIN").unwrap_or_else(|_| "noeta".to_string());
+        let required = std::env::var("NOETA_CROSS_CHECK").is_ok_and(|v| !v.is_empty());
+        if std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            assert!(
+                !required,
+                "NOETA_CROSS_CHECK is set but `{bin}` is not runnable — the Noeta half of the \
+                 schema DSL cannot be checked"
+            );
+            eprintln!(
+                "note: skipping the schema cross-representation check — no `{bin}` on PATH (set \
+                 NOETA_CROSS_CHECK=1 to make this a failure)"
+            );
+            return None;
+        }
+
+        // The package root, whose `noeta.toml` names the `para/db` package this crate implements.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the package root is two directories above the crate");
+        let dir = std::env::temp_dir().join("noeta-para-db-schema-cross-check");
+        std::fs::create_dir_all(&dir).expect("a writable temp directory");
+        std::fs::write(
+            dir.join("noeta.toml"),
+            format!(
+                "[package]\nname = \"noeta/schema_cross_check\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies]\npara = {{ path = {root:?} }}\n\n\
+                 [trust]\nnative = [\"para/db\"]\n"
+            ),
+        )
+        .expect("the generated manifest is writable");
+
+        let mut program = String::from(
+            "// Generated by `noeta-para-db`'s schema cross-representation test — do not edit.\n\
+             use para.db.schema.{create_table, create_index, alter_table, drop_table, drop_index}\n\n",
+        );
+        for (i, (_, expr)) in VARIATIONS.iter().enumerate() {
+            program.push_str(&format!(
+                "echo \"{MARK} {i}\"\necho ({expr}).render()\necho \"{MARK} canonical\"\n\
+                 echo ({expr}).canonical()\n"
+            ));
+        }
+        std::fs::write(dir.join("main.noe"), program).expect("the generated program is writable");
+
+        let output = std::process::Command::new(&bin)
+            .arg("run")
+            .arg("main.noe")
+            .current_dir(&dir)
+            .output()
+            .expect("`noeta run` starts");
+        assert!(
+            output.status.success(),
+            "`noeta run` failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(split_renderings(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    /// Split the generated program's output back into one `(laid out, canonical)` pair per variation.
+    fn split_renderings(stdout: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut canonical = false;
+        for line in stdout.lines() {
+            if let Some(rest) = line.strip_prefix(MARK) {
+                canonical = rest.trim() == "canonical";
+                if !canonical {
+                    out.push((String::new(), String::new()));
+                }
+                continue;
+            }
+            let Some((laid_out, canon)) = out.last_mut() else {
+                continue;
+            };
+            // The canonical rendering is newline-terminated and `echo` adds one of its own, so the
+            // blank line closing each canonical block is the echo's and not part of the rendering.
+            if canonical && line.is_empty() {
+                continue;
+            }
+            let target = if canonical { canon } else { laid_out };
+            if !target.is_empty() {
+                target.push('\n');
+            }
+            target.push_str(line);
+        }
+        // The laid-out form carries no trailing newline; the canonical form is newline-terminated.
+        for (_, canon) in out.iter_mut() {
+            canon.push('\n');
+        }
+        out
     }
 
     #[test]

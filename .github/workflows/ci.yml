@@ -95,6 +95,16 @@ jobs:
           DIST="noeta-${NOETA_VERSION}-x86_64-unknown-linux-gnu"
           curl -fsSL "https://github.com/noeta-lang/noeta/releases/download/${NOETA_VERSION}/${DIST}.tar.gz" | tar -xz
           echo "${PWD}/${DIST}" >> "$GITHUB_PATH"
+      # The portable schema DSL has two representations — `schema.noe`'s Noeta `Statement` and
+      # `schema.rs`'s Rust one — and the test that holds them to a single canonical text has to run
+      # the real `noeta` binary against the builder. It therefore lives here rather than in the
+      # `rust` job, where it skips itself for want of a binary. `NOETA_CROSS_CHECK` turns that skip
+      # into a failure, so the gate cannot go quiet.
+      - name: Schema cross-representation gate
+        working-directory: crates/noeta-para-db
+        env:
+          NOETA_CROSS_CHECK: "1"
+        run: cargo test --lib schema::tests::the_noeta_builder_and_the_ir_render_one_canonical_text
       # The postgres/live/watch demos need a reachable PostgreSQL server; gate the hermetic ones.
       - name: noeta check + test the hermetic demos
         working-directory: examples/para-db-demo
