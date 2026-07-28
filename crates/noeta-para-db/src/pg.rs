@@ -664,6 +664,9 @@ mod tests {
     /// and reading each scalar column type back through the neutral surface.
     #[test]
     fn round_trip_against_a_live_server() {
+        // Serialize against the other live-server tests: they share one database and each
+        // wipes it, so concurrent runs race in the system catalog. Held for the whole test.
+        let _pg = crate::pg_test_guard();
         let Ok(dsn) = std::env::var("NOETA_PG_TEST_DSN") else {
             return; // no server configured — skip (the hermetic unit tests above still ran)
         };
@@ -717,6 +720,9 @@ mod tests {
     /// reports the channel — the basis of the reactive DB source (external writes → wake).
     #[test]
     fn listen_notify_round_trip() {
+        // Serialize against the other live-server tests: they share one database and each
+        // wipes it, so concurrent runs race in the system catalog. Held for the whole test.
+        let _pg = crate::pg_test_guard();
         let Ok(dsn) = std::env::var("NOETA_PG_TEST_DSN") else {
             return;
         };

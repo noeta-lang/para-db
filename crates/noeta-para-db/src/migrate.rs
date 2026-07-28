@@ -1466,6 +1466,9 @@ mod postgres_e2e {
 
     #[test]
     fn migrate_round_trip_against_a_live_server() {
+        // Serialize against the other live-server tests: they share one database and each
+        // wipes it, so concurrent runs race in the system catalog. Held for the whole test.
+        let _pg = crate::pg_test_guard();
         let Ok(dsn) = std::env::var("NOETA_PG_TEST_DSN") else {
             return; // no server configured — skip (the hermetic + SQLite tests still ran)
         };
@@ -1537,6 +1540,9 @@ mod postgres_e2e {
     /// [`crate::schema`]'s tests, so this test's absence never leaves the Postgres path uncovered.)
     #[test]
     fn a_portable_schema_migration_applies_to_postgres_too() {
+        // Serialize against the other live-server tests: they share one database and each
+        // wipes it, so concurrent runs race in the system catalog. Held for the whole test.
+        let _pg = crate::pg_test_guard();
         let Ok(dsn) = std::env::var("NOETA_PG_TEST_DSN") else {
             return; // no server configured — skip
         };

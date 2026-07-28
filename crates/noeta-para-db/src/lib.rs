@@ -26,6 +26,25 @@ pub mod schema;
 pub mod sqlite;
 pub mod watch;
 
+/// Serializes the live-PostgreSQL tests.
+///
+/// Every `NOETA_PG_TEST_DSN` test targets the **one** server that env var names, and each begins by
+/// wiping it ([`driver::SqlDriver::reset`] issues `DROP SCHEMA public CASCADE; CREATE SCHEMA
+/// public;`). Under cargo's default thread-per-test that is a data race on a shared resource: one
+/// test drops the schema out from under another's `CREATE TABLE`, and Postgres reports the collision
+/// from its system catalog — `duplicate key value violates unique constraint
+/// "pg_type_typname_nsp_index"` — which reads like a product bug but is purely test interference.
+///
+/// The tests share a database *by design* (one DSN, no per-test database to create), so the fix is to
+/// take turns rather than to isolate. Every live-Postgres test takes this lock first. Poisoning is
+/// deliberately ignored: one test failing mid-critical-section must not cascade into unrelated
+/// failures for the rest.
+#[cfg(all(test, feature = "ring-postgres"))]
+pub(crate) fn pg_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 use noeta_ext_abi::registry::{ExtModule, ExtType, Extension};
 
 /// The `para.db` extension unit — the `db` module and the `Connection` extern type. `root() ==
