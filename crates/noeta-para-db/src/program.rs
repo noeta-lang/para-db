@@ -38,8 +38,11 @@ use noeta_ext_abi::{
 
 use crate::conn::{CONNECTION_TYPE_NAME, ConnectionBox, io_error, open_driver};
 
-/// The module the synthesized seed entry call names (`db.run_seed(…)`).
-pub const SEED_ENTRY_MODULE: &str = "db";
+/// The module the synthesized seed entry call names (`db.run_seed(…)`), **qualified**: the driver
+/// calls its last segment and binds that segment with a synthetic `use para.db`, so a `.noe` seed
+/// resolves the entry call whether or not it imports the module itself. (A bare, single-segment
+/// name binds nothing and leaves resolution to the seed's own imports — see `EntryCall::module`.)
+pub const SEED_ENTRY_MODULE: &str = "para.db";
 
 /// The function the synthesized seed entry call names.
 pub const SEED_ENTRY_FUNC: &str = "run_seed";
