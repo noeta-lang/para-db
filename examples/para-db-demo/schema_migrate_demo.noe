@@ -1,7 +1,13 @@
-// Portable schema migrations end to end: `schema_migrations/` holds two `.schema` files (the
-// portable DSL) and one `.sql` file (raw SQL) side by side. `conn.migrate(dir)` applies all three in
-// filename order through the one engine — the DSL bodies lowered to the connected driver's DDL, the
-// SQL body run verbatim — and tracks every one of them in `_noeta_migrations` exactly the same way.
+// Portable schema migrations end to end: `schema_migrations/` holds two `.schema` files (the schema
+// IR) and one `.sql` file (raw SQL) side by side. `conn.migrate(dir)` applies all three in filename
+// order through the one engine — the IR bodies lowered to the connected driver's DDL, the SQL body
+// run verbatim — and tracks every one of them in `_noeta_migrations` exactly the same way.
+//
+// **Why `.schema` here and not the usual `.noe`.** A migration is normally a Noeta program returning
+// `List<Statement>`, which `noeta migrate` runs. This demo migrates *itself*, from inside a running
+// program, and that surface holds a database driver but not the loader a second program would need —
+// so its directory is `.sql`/`.schema` only. That is the one place writing the IR by hand still earns
+// its keep; a project driven by `noeta migrate` writes Noeta.
 //
 // The point: this program is dsn-agnostic. Point it at "postgres://…" and the same three files build
 // the same schema there, with `BIGSERIAL PRIMARY KEY` where SQLite got

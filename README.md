@@ -10,11 +10,11 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
   - `postgres://user:pass@host:5432/db` (`postgresql://` too) — PostgreSQL
 - **`Connection`** — `execute(sql, params) -> int` / `query(sql, params) -> List<Map<string, dyn>>` with positional `?` bind parameters (rewritten per driver; never string-spliced, so no injection risk), plus `notify(channel)` (fire a change notification: Postgres `NOTIFY`, an in-process bus publish on SQLite), `migrate(dir)`, `seed(dir)`, `close()`.
 - **`para.db.query`** (pure Noeta) — a fluent query builder: `table("users").filter("age", ">", 18).order("name", "asc").limit(20)`.
-- **`para.db.schema`** (pure Noeta) — a portable schema builder, the DDL peer of the query builder: `create_table("todos").id().text("title").bool("done").default(false).timestamps()`, lowered to each driver's own DDL. The same notation is the body of a `.schema` migration.
+- **`para.db.schema`** (pure Noeta) — a portable schema builder, the DDL peer of the query builder: `create_table("todos").id().text("title").bool("done").default(false).timestamps()`, lowered to each driver's own DDL. What a `.noe` migration's `up()` returns.
 - **`para.db.repo`** (pure Noeta) — repository + unit-of-work: stage writes during a request, flush them as one transactional batch.
 - **`para.db.sql`** (pure Noeta) — the typed `@sql { … }` block tier: `${…}` holes are always bound parameters, never spliced.
 - **`para.db.reactive`** (pure Noeta) — `LiveRepository` + `db.watch`: reactive queries that re-run when the data changes (SQLite update hooks / Postgres `LISTEN`/`NOTIFY`).
-- **The `noeta migrate` command** — this package contributes a migration/seed engine to the CLI; a consumer opts in with `[trust] commands = ["para/db"]`.
+- **The `noeta migrate` command** — this package contributes a migration/seed engine to the CLI; a consumer opts in by binding it a local name under `[trust.commands]`.
 - **`editors/sql-tier.tmLanguage.json`** — a TextMate injection grammar so `@sql` bodies highlight as SQL in editors without the official extension.
 
 ## Installation
@@ -24,8 +24,10 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
 para = { version = "^0.1", package = "para/db" }
 
 [trust]
-native = ["para/db"]     # authorizes the package's native driver crate
-commands = ["para/db"]   # opts in to the `noeta migrate` CLI command
+native = ["para/db"]      # authorizes the package's native driver crate
+
+[trust.commands]
+migrate = "para/db"       # `noeta migrate` — the local name this package's command runs under
 ```
 
 The package is keyed `para`, so its modules address as `para.db`, `para.db.query`, `para.db.schema`, `para.db.repo`, `para.db.sql`, and `para.db.reactive`. Optionally add a `[db]` table for `noeta migrate` (see below).
@@ -107,16 +109,16 @@ apply(conn, [
 
 `id()` lowers to `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite and `BIGSERIAL PRIMARY KEY` on PostgreSQL; `float` lowers to `REAL` or `DOUBLE PRECISION`. Everything else in the vocabulary is spelled identically on both. **The lowering lives in the driver** (`SqlDriver::lower_schema`), exactly where the `?`→`$N` rewrite lives, so nothing above the driver seam branches on the backend — and a third driver gets the whole DSL by naming its dialect.
 
-A builder describes a **`Statement`** — the same backend-neutral IR the native side parses a `.schema` file into, with `Statement`, `CreateTable`, `Column`, `DefaultValue` and the rest declared in Noeta field for field against their `schema.rs` twins. `.statement()` hands that value over, and there are two renderings of it:
+A builder describes a **`Statement`** — the same backend-neutral IR the native side parses a `.schema` file into, with `Statement`, `CreateTable`, `Column`, `DefaultValue` and the rest declared in Noeta field for field against their `schema.rs` twins. `.statement()` hands that value over, and that is what a migration's `up()` returns. There are also two renderings of it:
 
-- **`.render()`** — schema-DSL **source**, laid out the way a migration file is written. `echo create_table("todos").id().render()` prints something you can paste straight into `migrations/`.
-- **`.canonical()`** — the **canonical** rendering, one statement per line in one fixed shape, byte for byte what the native `schema::render` produces from the same statement. It is what a `.schema` migration is *checksummed* over, so a migration's identity is its meaning rather than its formatting.
+- **`.render()`** — schema **source**, laid out the way a person reads it. `echo create_table("todos").id().render()` prints the shape of what you built.
+- **`.canonical()`** — the **canonical** rendering, one statement per line in one fixed shape, byte for byte what the native `schema::render` produces from the same statement. It is what a migration is *checksummed* over, so a migration's identity is its meaning rather than its formatting — and it is the form a `.noe` migration's statements cross back to the engine in.
 
-There is one grammar and one lowering, both native, and a test renders a corpus of builder expressions both ways to hold the Noeta IR and the native IR to one canonical text — so the builder and the migration file cannot drift apart. `apply(conn, statements)` is for schema you build at runtime — a test fixture, a scratch database; for a durable change, write a `.schema` **migration** (below), which is checksummed, tracked, and applied exactly once.
+There is one grammar and one lowering, both native, and a test renders a corpus of builder expressions both ways to hold the Noeta IR and the native IR to one canonical text — which is exactly what lets a migration hand its statements over as canonical text and have the engine parse back the same values. `apply(conn, statements)` is for schema you build at runtime — a test fixture, a scratch database; for a durable change, write a **migration** (below), which is checksummed, tracked, and applied exactly once.
 
 ### The vocabulary
 
-The tables below name the **Noeta builder** methods. The `.schema` file notation is the same, with the one difference that a list argument is spelled as plain arguments: `primary_key(["a", "b"])` in Noeta is `primary_key("a", "b")` in a file. Every builder also has a `link(name, args)` escape hatch that applies an arbitrary DSL call to the statement under construction, so a call the Noeta surface has not wrapped is still reachable; a name outside the vocabulary is refused there rather than at apply time.
+The tables below name the **Noeta builder** methods. The `.schema` IR notation is the same, with the one difference that a list argument is spelled as plain arguments: `primary_key(["a", "b"])` in Noeta is `primary_key("a", "b")` in the IR. Every builder also has a `link(name, args)` escape hatch that applies an arbitrary DSL call to the statement under construction, so a call the Noeta surface has not wrapped is still reachable; a name outside the vocabulary is refused there rather than at apply time.
 
 | Statement | Chain |
 | --- | --- |
@@ -192,39 +194,57 @@ adults = users.where(conn, "age", ">", 18)
 
 ## Migrations — evolve the schema over time
 
-`para/db` ships a migration engine, surfaced as the `noeta migrate` command **this package contributes to the CLI** (trust it with `[trust] commands = ["para/db"]`) and the programmatic `conn.migrate(dir)` method. There is one engine (in `noeta-para-db`); the command and the Noeta method are thin callers, so both drivers migrate through the same code.
+`para/db` ships a migration engine, surfaced as the `noeta migrate` command **this package contributes to the CLI** (trust it with `[trust.commands]` / `migrate = "para/db"`) and the programmatic `conn.migrate(dir)` method. There is one engine (in `noeta-para-db`); the command and the Noeta method are thin callers, so both drivers migrate through the same code.
 
 **Migrations are files** in a project `migrations/` directory, one statement or many per file, applied in the order their filenames sort. `noeta migrate new <name>` scaffolds the next file with a **UTC-timestamp prefix** — `YYYYMMDDHHMMSS_<name>.sql`. Timestamps are the default because they never collide when two branches each add a migration (a sequential `0007_…` would); the engine sorts lexicographically over the whole filename, so any monotonic scheme (including zero-padded sequence numbers) also works.
 
-**A migration's extension picks its body language**, and the two kinds live in the same directory under one ordering:
+**A migration's extension picks its body language**, and both kinds live in the same directory under one ordering:
 
 | File | Body | Applied as |
 | --- | --- | --- |
+| `<name>.noe` | **a Noeta program** declaring `up(): List<Statement>` | its `up()` is run, and the [statements](#schema-dsl--portable-ddl-lowered-per-driver) it returns are **lowered** to the connected driver's DDL |
 | `<name>.sql` | native SQL for the connected database | run **verbatim** — no `?`→`$N` rewrite, no translation |
-| `<name>.schema` | the [portable schema DSL](#schema-dsl--portable-ddl-lowered-per-driver) | **lowered** to the connected driver's DDL just before it applies |
 
-A project can therefore write portable migrations wherever the vocabulary reaches and drop to raw SQL for the steps it does not. `noeta migrate new <name> --schema` scaffolds a `.schema` migration; plain `noeta migrate new <name>` still scaffolds `.sql`. Raw SQL stays the **default** deliberately: the DSL cannot express everything SQL can, so the scaffold should not imply it does, and every existing project's `migrate new` keeps behaving exactly as before.
+`noeta migrate new <name>` scaffolds Noeta; `--sql` scaffolds the escape hatch. A project writes the language it is already written in, and drops to SQL exactly where a backend spells something its own way — which is a permanent, principled place to be rather than a gap waiting to be closed.
+
+```noeta
+// migrations/20260727000001_create_notes.noe
+use para.db.schema.{Statement, create_table}
+
+pub fn up(): List<Statement> {
+    return [
+        create_table("notes").id().text("title").not_null().statement(),
+    ]
+}
+```
 
 ```
 migrations/
-  20260727000001_create_notes.schema     # portable: create_table("notes").id().text("title")…
-  20260727000002_backfill.sql            # raw SQL: whatever the DSL does not cover
-  20260727000003_add_archived.schema     # portable: alter_table("notes").add_bool("archived")…
+  20260727000001_create_notes.noe        # Noeta: up() returns the statements
+  20260727000002_backfill.sql            # raw SQL: whatever the vocabulary does not cover
+  20260727000003_add_archived.noe        # Noeta: alter_table("notes").add_bool("archived")…
 ```
+
+**A migration describes; it does not perform.** `up()` takes no connection and returns a value. Applying the statements, wrapping them in a transaction and recording that they ran are the engine's job, so a migration cannot write outside that transaction or leave history nobody recorded — the signature is what rules it out, not a convention asking nicely.
+
+**`.schema` is the IR, not a third language.** A Noeta migration compiles down to the [portable schema notation](#schema-dsl--portable-ddl-lowered-per-driver) — literally the text `.canonical()` renders — and the engine checksums and lowers *that*. The notation is still accepted as a body language on disk, and the `.schema` files any existing project has keep working unchanged, but it is no longer something a project has to learn in order to change a schema.
+
+**Running one needs the CLI.** `noeta migrate` loads, checks and runs the program; the in-process `conn.migrate(dir)` surface holds a database driver, not a loader, so it reports each `.noe` migration by name rather than skipping it. A self-migrating app's directory is `.sql`/`.schema` only — and migrating from inside a booting server is worth avoiding regardless, since every instance then races every other one to alter the schema.
 
 **A tracking table `_noeta_migrations`** records, for each applied migration, its `filename`, a **sha256 `checksum`**, and `applied_at`. The checksum is taken over what the migration *means*, never over the lowered DDL:
 
 - A **`.sql`** migration is hashed over its **file source**. Raw SQL *is* the DDL — the engine does not parse it, so the bytes the author wrote are the identity.
-- A **`.schema`** migration is hashed over the **canonical rendering of its parsed statements**: source → parse → the neutral IR → canonical re-render → sha256. Formatting is gone by the time the hash is taken, so re-indenting a file, wrapping a chain differently, or fixing a typo in a comment does **not** read as tampered history — while a renamed column, a changed default, an added constraint, or a reordered statement always does.
+- A **`.noe`** migration is hashed over **the statements its `up()` returned**, canonically rendered. The Noeta source is never hashed: it is a program, and two programs that build the same statements are the same migration. Reformat it, rename a local, pull a repeated column list into a helper — same identity. Add a column and it changes, because the IR did.
+- A **`.schema`** migration is hashed over the **canonical rendering of its parsed statements**: source → parse → the neutral IR → canonical re-render → sha256. This is the `.noe` case with the parse step swapped for a program run, and it is why the two agree: a migration rewritten from `.schema` into Noeta that builds the same table keeps its checksum.
 
-Hashing the generated DDL instead would be worse on both counts: it is backend-dependent (`INTEGER PRIMARY KEY AUTOINCREMENT` here, `BIGSERIAL PRIMARY KEY` there), so one migration would have two identities — and it would turn any future improvement to the lowering into "history was edited" for every project that had already run it. The checksum is taken **before** lowering and never sees a dialect, so one `.schema` file has one identity across SQLite and PostgreSQL and the code generator stays free to improve.
+Hashing the generated DDL instead would be worse on both counts: it is backend-dependent (`INTEGER PRIMARY KEY AUTOINCREMENT` here, `BIGSERIAL PRIMARY KEY` there), so one migration would have two identities — and it would turn any future improvement to the lowering into "history was edited" for every project that had already run it. The checksum is taken **before** lowering and never sees a dialect, so one migration has one identity across SQLite and PostgreSQL and the code generator stays free to improve.
 
 Two integrity checks run before anything is applied, both hard errors that name the file:
 
-- **Checksum drift** — an already-applied migration's file was edited. History is immutable; revert the edit or make the change in a new migration. (For a `.schema` file, only a change to what it *does* counts — reformat it freely.)
+- **Checksum drift** — an already-applied migration's file was edited. History is immutable; revert the edit or make the change in a new migration. (For a Noeta or `.schema` file, only a change to what it *does* counts — reformat it freely.)
 - **Deleted applied migration** — a file recorded as applied is gone. Restore it, or `--reset` in development.
 
-A `.schema` body is parsed and lowered **before** its transaction opens, so a DSL syntax error stops the run with the file and line named and nothing touched.
+Every `.noe` migration's `up()` runs **before** the driver is even opened — a migration takes no connection, so what it means is knowable without a database, and a program that fails to check says so before anything is applied. Lowering then happens before each transaction opens, so a statement the vocabulary cannot express stops the run with the file named and nothing touched.
 
 **Transactionality.** Each migration runs inside its own transaction — `BEGIN`, the file body, the tracking-row insert, `COMMIT`. The first failure rolls that migration back and stops, reporting the exact file. Postgres has fully transactional DDL; SQLite is transactional for the ordinary DDL migrations use — so a migration is all-or-nothing, and a failed run leaves every prior migration applied. (Do not put `BEGIN`/`COMMIT` in a migration file — the runner owns the transaction.)
 
@@ -238,19 +258,19 @@ The rerun semantics are deliberately honest and different from migrations. **See
 
 A mid-seed failure stops at that file (naming it) with the prior seeds committed — the same stop-on-first-failure shape as migrations, minus the tracking.
 
-### Three body languages, one directory
+### The same two choices, one directory
 
-A seed's **extension** picks how its body runs, exactly as a migration's does — and the seeds directory takes one more than the migrations directory does:
+A seed's **extension** picks how its body runs, exactly as a migration's does, and `noeta migrate new <name> --seed` scaffolds Noeta just as it does for a migration:
 
 | Extension | Body | Runs as |
 | --- | --- | --- |
+| `.noe` | **a Noeta program** declaring `seed(conn)` | loaded, checked and run by `noeta migrate`, with a connection to the project database |
 | `.sql` | native SQL for the connected backend | verbatim, in its own transaction |
-| `.schema` | the portable schema DSL | lowered per driver, then applied (rarely what a seed wants — a seed is data) |
-| `.noe` | **a Noeta program** | loaded, checked and run by `noeta migrate`, with a connection to the project database |
+| `.schema` | the schema IR | lowered per driver, then applied (rarely what a seed wants — a seed is data) |
 
 All three interleave in one filename order, and every file is reported in the same summary.
 
-**`.noe` is a seeds-only body language.** A `.noe` file under the *migrations* directory is a hard error naming the file, not a silent skip: a migration is tracked, checksummed history, and what a program's identity and replay should mean there is a separate design. Move it to the seeds directory or write the migration in `.sql`/`.schema`.
+**The directory decides what a `.noe` file's entry point is.** Under `migrations/` a program is asked for `up(): List<Statement>` and never sees a connection; under `seeds/` it is asked for `seed(conn)` and is handed one. Both go through the same synthesized-entry mechanism — what differs is what the engine asks the program *for*, and therefore what it is allowed to do. A file that wandered into the wrong directory fails to check against a name it does not declare, rather than running with the wrong powers.
 
 #### A portable `.sql` seed
 
@@ -281,7 +301,7 @@ A program seed **owns its connection, and therefore its own transactions** — t
 
 Two limits worth knowing:
 
-- **`conn.seed(dir)` cannot run a `.noe` seed.** The programmatic surface holds a database driver, not the CLI's loader, so it reports the file and names `noeta migrate --seed` instead of skipping it. A self-seeding app's directory is `.sql`/`.schema` only.
+- **`conn.seed(dir)` cannot run a `.noe` seed**, for the same reason `conn.migrate(dir)` cannot run a `.noe` migration: the programmatic surface holds a database driver, not the CLI's loader. It reports the file and names `noeta migrate --seed` instead of skipping it. A self-seeding app's directory is `.sql`/`.schema` only.
 - **A private in-memory dsn is refused** for a program seed (`sqlite::memory:` / `:memory:`): the seed program opens its own connection, which for an in-memory database means a *second, empty* one. The command says so rather than reporting a successful seed over an untouched database.
 
 ### CLI
@@ -290,10 +310,10 @@ Two limits worth knowing:
 noeta migrate                      # apply every pending migration, printing each applied file
 noeta migrate --status             # table of applied / pending migrations
 noeta migrate --dry-run            # list what would be applied, without touching the database
-noeta migrate new <name>           # scaffold migrations/<timestamp>_<name>.sql  (raw SQL)
-noeta migrate new <name> --schema  # scaffold migrations/<timestamp>_<name>.schema  (portable DSL)
-noeta migrate new --seed <name>    # scaffold seeds/<timestamp>_<name>.sql  (raw SQL)
-noeta migrate new --seed --program <name>  # scaffold seeds/<timestamp>_<name>.noe  (a Noeta program)
+noeta migrate new <name>           # scaffold migrations/<timestamp>_<name>.noe  (Noeta)
+noeta migrate new <name> --sql     # scaffold migrations/<timestamp>_<name>.sql  (raw SQL)
+noeta migrate new --seed <name>    # scaffold seeds/<timestamp>_<name>.noe  (Noeta)
+noeta migrate new --seed --sql <name>      # scaffold seeds/<timestamp>_<name>.sql  (raw SQL)
 noeta migrate --seed               # apply pending migrations, then run the seed files
 noeta migrate seed                 # run the seed files ONLY (errors if any migration is pending)
 noeta migrate --reset --yes        # DESTRUCTIVE: drop the schema and re-apply from zero

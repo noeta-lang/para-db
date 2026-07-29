@@ -52,6 +52,35 @@ pub const SEED_ENTRY_FUNC: &str = "run_seed";
 /// file, exactly as if the author had written the call themselves.
 pub const SEED_ENTRY_IDENT: &str = "seed";
 
+/// The module the synthesized **migration** entry call names (`migrations.emit(…)`), qualified for
+/// the same reason [`SEED_ENTRY_MODULE`] is: the driver binds the last segment with a synthetic
+/// `use para.db.migrations`, so a migration resolves the call without importing a module it
+/// otherwise has no reason to name.
+///
+/// Deliberately not `para.db.schema`, where the builder lives: `emit` writes a file, and a module
+/// that reaches `std.fs` is a module every consumer of it reaches `std.fs` through. The builder is
+/// imported by apps and fixtures that have no business touching a filesystem, so the one function
+/// that does sits apart from it.
+///
+/// Deliberately not `para.db.migrate` either, which is what it was called first: this module is
+/// about migrations and only incidentally about the verb, and the plural keeps it from reading as
+/// the implementation of the `noeta migrate` command (which lives in `command.rs`, in Rust).
+pub const SCHEMA_ENTRY_MODULE: &str = "para.db.migrations";
+
+/// The function the synthesized migration entry call names — the Noeta half of the emit convention,
+/// defined in `migrations.noe` rather than here. There is nothing native about writing the canonical
+/// IR out: `canonical` already renders it, so the entry is an ordinary Noeta function and the
+/// mechanism behind the command is one a program could call for itself.
+pub const SCHEMA_ENTRY_FUNC: &str = "emit";
+
+/// The top-level function a `.noe` **migration** must declare: `up(): List<Statement>`.
+///
+/// Deliberately not [`SEED_ENTRY_IDENT`]. The two entry points are what separate describing from
+/// performing — `up()` is handed nothing and returns statements, `seed(conn)` is handed a live
+/// connection and returns nothing — so a file that wandered into the wrong directory fails to check
+/// against a name it does not declare, rather than running with the wrong powers.
+pub const MIGRATION_ENTRY_IDENT: &str = "up";
+
 /// `db.run_seed(dsn, seed)` — open `dsn`, run `seed(conn)`, release the connection. A **ctx**
 /// (higher-order) function: it takes a callable and re-enters the backend to invoke it.
 pub const RUN_SEED_FN: ExtFn = ExtFn {

@@ -9,5 +9,5 @@ keywords = ["database", "sqlite", "postgres", "sql", "migrations"]
 # This package ships a native Rust extension crate (the `para.db` surface — the swappable-driver
 # database layer, SQLite first). A consumer must authorize it under `[trust] native = ["para/db"]`.
 # It also contributes the `noeta migrate` CLI command (para-extraction), which a consumer opts into
-# with `[trust] commands = ["para/db"]`.
+# by binding it a local name under `[trust.commands]` (`migrate = "para/db"`).
 native = "native"

@@ -11,18 +11,27 @@
 //! (`YYYYMMDDHHMMSS_name.sql`) because timestamps never collide across the many concurrent branches
 //! this project is developed on, while still sorting chronologically.
 //!
-//! **Two body languages, one ordering.** A migration's extension picks how its body becomes DDL
+//! **Noeta or SQL, one ordering.** A migration's extension picks how its body becomes DDL
 //! ([`MigrationKind`]):
+//!   * `.noe` — a **Noeta program** that *describes* the change: it declares `up(): List<Statement>`
+//!     and returns the schema statements it wants, built with the [`crate::schema`] builder. It takes
+//!     no connection and touches no database. The engine runs it through a [`SchemaEmitter`] to get
+//!     the canonical IR back ([`resolve_programs`]), then checksums, lowers and applies that — so one
+//!     file migrates both SQLite and Postgres, written in the same language as the rest of the app.
 //!   * `.sql` — run **verbatim** in the target dialect's native SQL (via [`SqlDriver::execute_batch`],
 //!     no `?`→`$N` rewrite). The escape hatch: anything dialect-specific is written here.
-//!   * `.schema` — the **portable schema DSL** ([`crate::schema`]), lowered to the connected driver's
-//!     DDL at the driver seam ([`SqlDriver::lower_schema`]) just before it is applied. One file
-//!     migrates both SQLite and Postgres.
 //!
-//! Both kinds live in the **same** directory and interleave in one filename order, so a project
-//! writes portable migrations wherever the DSL's vocabulary reaches and drops to raw SQL for the
-//! steps it does not (`migrate new` still scaffolds `.sql` unless asked for `--schema`). A **seed**
-//! takes a third body language on top of these two — see the seeds section below.
+//! Both live in the **same** directory and interleave in one filename order, so a project writes
+//! Noeta wherever the schema vocabulary reaches and drops to raw SQL for the steps it does not.
+//!
+//! **`.schema` is the IR, not a third language.** The portable schema DSL
+//! ([`MigrationKind::Schema`]) is what a `.noe` migration *compiles down to* — the same text
+//! [`crate::schema::render`] produces from a `Vec<Statement>`. It remains readable and remains
+//! accepted as a body language, because it is the one form both the builder and the parser agree on
+//! byte for byte, but it is no longer something a project needs to learn or write: `migrate new`
+//! scaffolds `.noe`, and `--sql` is the other choice.
+//!
+//! A **seed** shares all three, and gives `.noe` its other meaning — see the seeds section below.
 //!
 //! # What a migration's checksum is taken over
 //!
@@ -34,6 +43,10 @@
 //! What is hashed is the migration's **meaning**, spelled the one canonical way:
 //!   * `.sql` — the **file source**. Raw SQL *is* the DDL; there is no IR to canonicalize, and the
 //!     engine deliberately does not parse SQL, so the bytes the author wrote are the identity.
+//!   * `.noe` — the **canonical IR its `up()` returned**, which is the `.schema` case below applied to
+//!     the emitted text. The Noeta source is never hashed: it is a program, and two programs that
+//!     build the same statements are the same migration. Reformat it, rename a local, pull a repeated
+//!     column list into a helper — same identity. Add a column and it changes, because the IR did.
 //!   * `.schema` — the **canonical re-rendering of the parsed IR**
 //!     ([`crate::schema::canonicalize`]): source → [`crate::schema::parse`] → `Vec<Statement>` →
 //!     [`crate::schema::render`] → sha256. Whitespace, indentation, line breaks and comments are gone
@@ -67,21 +80,24 @@
 //! SQLite-only `INSERT OR IGNORE` spelling of the same idea is a hard syntax error on Postgres).
 //! [`seed_only`] refuses to run when migrations are pending — seeding a stale schema is a footgun.
 //!
-//! **Three body languages in the seeds directory, one ordering.** A seed adds a third
-//! ([`MigrationKind::Program`]) to the two a migration has:
+//! A seed's `.noe` is the **other** meaning of a Noeta body — a program that *performs* rather than
+//! describes:
 //!   * `.sql` — verbatim SQL, in its own transaction. The permanent escape hatch.
-//!   * `.schema` — the portable schema DSL, lowered per driver (rarely what a seed wants — a seed is
-//!     data — but the two directories deliberately understand the same files).
-//!   * `.noe` — a **Noeta program**: an ordinary program that connects and writes its rows through
+//!   * `.noe` — an ordinary program that declares `seed(conn)`, connects, and writes its rows through
 //!     the `para.db.query` builder, so one seed file seeds every backend without its author writing
 //!     dialect SQL. The engine owns discovery, ordering and stop-on-first-failure; *running* the
 //!     program is delegated to a [`ProgramRunner`], because only the CLI can load, check and run a
 //!     program on the real host (`CommandCtx::run_file`, behind `noeta migrate`).
+//!   * `.schema` — the IR, lowered per driver (rarely what a seed wants — a seed is data — but the
+//!     two directories deliberately understand the same files).
 //!
-//! `.noe` is a **seeds-only** body language, gated at discovery by [`DirKind`]: a migration is
-//! tracked history, and what a program migration's checksum identity and replay should mean is a
-//! separate design. A `.noe` file under the migrations directory is a hard error
-//! ([`MigrateError::ProgramMigration`]) — never silently ignored, never half-run.
+//! **The directory is what a `.noe` file's entry point means.** Under `migrations/` a program is
+//! asked for `up(): List<Statement>` and never sees a connection; under `seeds/` it is asked for
+//! `seed(conn)` and is handed one. Both are the same synthesized-entry mechanism ([`SchemaEmitter`]
+//! and [`ProgramRunner`], the two runner seams) — what differs is what the engine asks the program
+//! *for*, and therefore what it is allowed to do. A migration that could open its own connection
+//! could write outside the engine's transaction and leave history it never recorded; asking it only
+//! to return statements is what makes that unrepresentable rather than merely discouraged.
 
 use std::path::{Path, PathBuf};
 
@@ -97,11 +113,13 @@ pub const TRACKING_TABLE: &str = "_noeta_migrations";
 /// The extension of a raw-SQL migration — the body is run verbatim.
 pub const SQL_EXTENSION: &str = "sql";
 
-/// The extension of a portable schema-DSL migration — the body is lowered per driver.
+/// The extension of a schema-IR body — the body is lowered per driver. What a `.noe` migration
+/// compiles down to, and accepted on disk in its own right.
 pub const SCHEMA_EXTENSION: &str = "schema";
 
-/// The extension of a **Noeta program** seed body — the file is run as a program, not as SQL.
-/// Seeds only ([`DirKind`]).
+/// The extension of a **Noeta program** body — the file is run as a program, not as SQL. Under
+/// `migrations/` it is asked for `up()` and describes; under `seeds/` it is asked for `seed(conn)`
+/// and performs ([`DirKind`]).
 pub const PROGRAM_EXTENSION: &str = "noe";
 
 /// How a migration's or seed's body becomes an effect on the database. Decided by the file's
@@ -111,10 +129,13 @@ pub const PROGRAM_EXTENSION: &str = "noe";
 pub enum MigrationKind {
     /// A `.sql` body: native SQL for the connected backend, run verbatim.
     Sql,
-    /// A `.schema` body: the portable schema DSL, lowered by the driver at apply time.
+    /// A `.schema` body: the portable schema IR, lowered by the driver at apply time. Also what a
+    /// resolved `.noe` *migration* becomes — [`resolve_programs`] flips the kind once `up()` has run
+    /// and its canonical IR is in hand, which is the whole of "compiled down to the IR".
     Schema,
-    /// A `.noe` body: a Noeta program, run through a [`ProgramRunner`] rather than the driver.
-    /// A **seed** body language only — see [`DirKind`].
+    /// A `.noe` body: a Noeta program, run through a runner seam rather than by the driver. Under
+    /// `seeds/` it stays `Program` and is run by a [`ProgramRunner`]; under `migrations/` it is
+    /// *unresolved* until a [`SchemaEmitter`] has turned it into [`MigrationKind::Schema`].
     Program,
 }
 
@@ -141,13 +162,14 @@ impl MigrationKind {
 /// Which directory a load is for — the **body-language gate**, and the noun the loader's errors use.
 ///
 /// The loader is deliberately shared between migrations and seeds so the two directories order files
-/// identically, but they do **not** accept the same bodies: `.noe` is a seed body language only. Every
-/// call names its purpose, so adding a body language can never silently widen the other directory.
+/// identically. Both accept all three bodies, but a `.noe` file means a different thing in each — see
+/// [`DirKind::Migrations`] and [`DirKind::Seeds`] — so every call names its purpose and the entry
+/// convention a program is held to is never inferred from the file alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirKind {
-    /// The migrations directory: `.sql` and `.schema` only. Tracked, checksummed history.
+    /// The migrations directory: tracked, checksummed history. A `.noe` here **describes** (`up()`).
     Migrations,
-    /// The seeds directory: `.sql`, `.schema` and `.noe`. Untracked, re-runnable data.
+    /// The seeds directory: untracked, re-runnable data. A `.noe` here **performs** (`seed(conn)`).
     Seeds,
 }
 
@@ -168,11 +190,13 @@ impl DirKind {
         }
     }
 
-    /// Whether a body language is accepted here — the whole scope fence for `.noe`.
-    fn accepts(self, kind: MigrationKind) -> bool {
-        match kind {
-            MigrationKind::Sql | MigrationKind::Schema => true,
-            MigrationKind::Program => self == DirKind::Seeds,
+    /// The entry point a `.noe` file in this directory must declare — `up` to describe a schema
+    /// change, `seed` to write rows. What the synthesized entry call names, and what an author reads
+    /// in a scaffold.
+    pub fn program_entry(self) -> &'static str {
+        match self {
+            DirKind::Migrations => "up",
+            DirKind::Seeds => crate::program::SEED_ENTRY_IDENT,
         }
     }
 }
@@ -240,11 +264,12 @@ impl Migration {
                         message,
                     })
             }
-            // A program body has no SQL to lower — it is run, not executed as a statement. Neither
-            // caller reaches this (the seed engine routes a program to its [`ProgramRunner`] first,
-            // and the migrations loader refuses `.noe` at discovery), so this arm exists to keep the
-            // match total with an honest error rather than a panic.
-            MigrationKind::Program => Err(MigrateError::ProgramMigration {
+            // An *unresolved* program body has no SQL to lower — its `up()` has not run, so nothing
+            // knows what it describes. The seed engine never reaches here (it routes a program to
+            // its [`ProgramRunner`] first) and neither does any caller that ran
+            // [`resolve_programs`], which is precisely the invariant this arm reports when it is
+            // missed rather than papering over with a skip.
+            MigrationKind::Program => Err(MigrateError::UnresolvedProgram {
                 filename: self.name.clone(),
             }),
         }
@@ -294,10 +319,15 @@ pub enum MigrateError {
     /// dialect mapping for it). Reported **before** the migration's transaction opens, so nothing was
     /// touched.
     Schema { filename: String, message: String },
-    /// A `.noe` **program body** was found in the migrations directory, where it is not a body
-    /// language. Reported at discovery, before anything is applied — the scope fence that keeps
-    /// adding a seed body language from silently widening what a migration may be.
-    ProgramMigration { filename: String },
+    /// A `.noe` migration's `up()` could not be run, or produced IR that does not parse back. The
+    /// message carries which — a missing loader (the in-process surface), a program that failed to
+    /// check or run, or a program that built something the IR grammar cannot express.
+    Emit { filename: String, message: String },
+    /// A `.noe` migration reached lowering **unresolved** — [`resolve_programs`] was not run for it.
+    /// An engine invariant rather than a user error: it means a caller assembled its own migration
+    /// list and skipped the resolution step, and it is reported instead of skipped because a
+    /// silently ignored migration is a schema that differs between two machines.
+    UnresolvedProgram { filename: String },
     /// A `.noe` seed could not be run because the caller has no way to run a program — the
     /// programmatic `Connection.seed(dir)` surface, which drives a database driver, not the CLI's
     /// loader. Carries the reason so the message names the one path that does work.
@@ -349,14 +379,16 @@ impl std::fmt::Display for MigrateError {
                 f,
                 "migration `{filename}` is not valid portable schema DSL: {message}"
             ),
-            MigrateError::ProgramMigration { filename } => write!(
+            MigrateError::Emit { filename, message } => write!(
                 f,
-                "`{filename}` is a `.noe` program, which the migrations directory does not accept \
-                 (a migration body is `.sql` or `.schema`). A program body is a SEED body language: \
-                 move it under the seeds directory and run it with `noeta migrate --seed`. \
-                 Migrations are tracked, checksummed history, and what a program's identity and \
-                 replay mean there is deliberately still open — so this is refused outright rather \
-                 than half-run.",
+                "migration `{filename}` did not produce a schema: {message}"
+            ),
+            MigrateError::UnresolvedProgram { filename } => write!(
+                f,
+                "migration `{filename}` is a Noeta program whose `up()` has not been run, so what \
+                 it describes is not known yet — `migrate::resolve_programs` has to run between \
+                 loading and applying. This is an engine invariant, not something the file did \
+                 wrong.",
             ),
             MigrateError::ProgramUnsupported { filename, message } => {
                 write!(f, "seed `{filename}` cannot run here: {message}")
@@ -401,8 +433,11 @@ impl std::error::Error for MigrateError {}
 /// That migration cannot be applied at all ([`Migration::lowered`] fails before its transaction
 /// opens), so the fallback checksum is never recorded; it exists only so discovery
 /// ([`load_dir`]) and [`plan`] stay total in the face of a malformed file.
-/// A [`MigrationKind::Program`] body hashes as its source text. It is only ever a *seed*, and a seed
-/// is not history, so nothing reads that checksum — computing it keeps discovery uniform.
+/// A [`MigrationKind::Program`] body hashes as its source text, which is right for the only case
+/// that keeps that kind past discovery: a *seed*, which is not history, so nothing reads the
+/// checksum — computing it keeps discovery uniform. A `.noe` **migration** never hashes here;
+/// [`resolve_programs`] replaces its body with the IR `up()` returned and rehashes it as a
+/// [`MigrationKind::Schema`] one, so the Noeta source is not part of its identity.
 fn identity_text(kind: MigrationKind, body: &str) -> String {
     match kind {
         MigrationKind::Sql | MigrationKind::Program => body.to_string(),
@@ -428,11 +463,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// seeds — [`seed`] reuses it for the `seeds/` dir (a seed simply ignores the computed checksum,
 /// since seeds are not tracked history).
 ///
-/// `kind` says which directory this is, and that is exactly what decides which body languages are
-/// accepted: `.sql` and `.schema` in both, `.noe` in the seeds directory alone. A `.noe` file under
-/// the migrations directory is refused here, at discovery, with [`MigrateError::ProgramMigration`] —
-/// before anything is applied, and never quietly skipped (a silently ignored migration is a schema
-/// that differs between two machines).
+/// `kind` says which directory this is, which is how the loader's errors read and — for a `.noe`
+/// body — which entry convention the file will be held to ([`DirKind::program_entry`]). All three
+/// extensions load in both directories; a `.noe` *migration* comes back unresolved
+/// ([`MigrationKind::Program`]) and must go through [`resolve_programs`] before it can be planned or
+/// applied.
 ///
 /// The extensions share **one** ordering: the sort is over the whole filename, so a raw-SQL and a DSL
 /// migration interleave by their timestamp prefixes exactly as two `.sql` files would, and the
@@ -466,18 +501,16 @@ pub fn load_dir(dir: &Path, kind: DirKind) -> Result<Vec<Migration>, MigrateErro
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let body_kind = match path.extension() {
-            Some(ext) if ext.eq_ignore_ascii_case(SQL_EXTENSION) => MigrationKind::Sql,
-            Some(ext) if ext.eq_ignore_ascii_case(SCHEMA_EXTENSION) => MigrationKind::Schema,
-            Some(ext) if ext.eq_ignore_ascii_case(PROGRAM_EXTENSION) => MigrationKind::Program,
-            // Not a body file at all (a README, a `.bak`, a `.gitkeep`) — ignored in both
-            // directories, as it always has been.
-            _ => continue,
-        };
-        // The scope fence: a body language this directory does not accept is named and refused, not
-        // skipped.
-        if !kind.accepts(body_kind) {
-            return Err(MigrateError::ProgramMigration { filename: name });
+        // A body file, or not one at all (a README, a `.bak`, a `.gitkeep`) — anything else is
+        // ignored in both directories, as it always has been. Which of the three it *is* comes from
+        // `MigrationKind::of` below, off the same filename; this only decides whether to look.
+        let is_body = path.extension().is_some_and(|ext| {
+            [SQL_EXTENSION, SCHEMA_EXTENSION, PROGRAM_EXTENSION]
+                .iter()
+                .any(|wanted| ext.eq_ignore_ascii_case(wanted))
+        });
+        if !is_body {
+            continue;
         }
         let body = std::fs::read_to_string(&path).map_err(|e| {
             MigrateError::Io(format!(
@@ -493,6 +526,74 @@ pub fn load_dir(dir: &Path, kind: DirKind) -> Result<Vec<Migration>, MigrateErro
     }
     migrations.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(migrations)
+}
+
+/// Run a `.noe` **migration** and hand back the canonical schema IR its `up()` returned.
+///
+/// The migrations-directory twin of [`ProgramRunner`], and the reason the two are separate traits:
+/// this one is handed a path and gets *a value* back, having opened no database at all, while a
+/// [`ProgramRunner`] is handed a path and a live dsn and gets only success or failure back. A caller
+/// that can run programs (the CLI) implements both; a caller that cannot implements neither, and the
+/// engine's error says which of the two it needed.
+pub trait SchemaEmitter {
+    /// Load, check and run the program at `path`, calling its `up()` and returning
+    /// [`crate::schema::render`]-canonical source for the statements it built.
+    fn emit(&mut self, path: &Path) -> Result<String, ProgramFailure>;
+}
+
+/// The [`SchemaEmitter`] for callers with no way to run a program — the programmatic
+/// `Connection.migrate(dir)` surface, which has a database but no loader. Every `.noe` migration is
+/// refused by name, so an in-process migrate never silently skips one.
+#[derive(Debug)]
+pub struct UnsupportedEmitter;
+
+impl SchemaEmitter for UnsupportedEmitter {
+    fn emit(&mut self, path: &Path) -> Result<String, ProgramFailure> {
+        Err(ProgramFailure::Unsupported(format!(
+            "`{}` is a Noeta migration, and running one needs the loader that `noeta migrate` has \
+             and a running program does not",
+            path.display()
+        )))
+    }
+}
+
+/// Resolve every unresolved `.noe` migration in `migrations` **in place**: run its `up()` through
+/// `emitter`, replace its body with the canonical IR that came back, recompute its checksum over
+/// that IR, and flip its kind to [`MigrationKind::Schema`]. Anything already resolved, and every
+/// `.sql` / `.schema` file, is left untouched.
+///
+/// Called once, right after [`load_dir`], **before** [`plan`] — because a `.noe` migration's identity
+/// is the IR it describes, so nothing can be planned, drift-checked or applied until `up()` has run.
+/// That it runs on every verb (`--status` and `--dry-run` included) is deliberate: `up()` takes no
+/// connection and has no effects, so running it is how the engine learns what the file *means*, and a
+/// status that skipped it would report on a checksum it had not computed.
+pub fn resolve_programs(
+    migrations: &mut [Migration],
+    emitter: &mut dyn SchemaEmitter,
+) -> Result<(), MigrateError> {
+    for migration in migrations.iter_mut() {
+        if migration.kind != MigrationKind::Program {
+            continue;
+        }
+        let ir = emitter.emit(&migration.path).map_err(|failure| {
+            let (ProgramFailure::Failed(message) | ProgramFailure::Unsupported(message)) = failure;
+            MigrateError::Emit {
+                filename: migration.name.clone(),
+                message,
+            }
+        })?;
+        // Parsed once here so a program that builds something the IR grammar cannot express fails
+        // against *its own* filename, at resolution, rather than as a mystery `.schema` parse error
+        // over text the author never wrote.
+        crate::schema::parse(&ir).map_err(|e| MigrateError::Emit {
+            filename: migration.name.clone(),
+            message: format!("`up()` produced schema IR that does not parse back: {e}"),
+        })?;
+        migration.checksum = sha256_hex(identity_text(MigrationKind::Schema, &ir).as_bytes());
+        migration.body = ir;
+        migration.kind = MigrationKind::Schema;
+    }
+    Ok(())
 }
 
 /// Plan the migration run against the current tracking state — a **pure** function over the sorted
@@ -840,28 +941,43 @@ pub fn scaffold_filename(
 pub const SCAFFOLD_TEMPLATE: &str = "-- Migration: write forward-only SQL below. This file's contents are checksummed once applied,\n\
      -- so edit it only before it runs; make later changes in a new migration.\n\
      --\n\
-     -- This body runs VERBATIM in the connected database's own SQL dialect. For a migration that\n\
-     -- works on every backend, scaffold the portable schema DSL instead: `migrate new <name> --schema`.\n";
+     -- This body runs VERBATIM in the connected database's own SQL dialect, which is the point of\n\
+     -- it: triggers, views, and anything else one backend spells its own way belong here. For a\n\
+     -- migration that works on every backend, scaffold a Noeta one instead: `migrate new <name>`.\n";
 
-/// The starter body written into a freshly scaffolded **portable schema-DSL** migration file — it
-/// shows the fluent shape and names the escape hatch, since the DSL deliberately covers only what
-/// lowers identically onto both backends.
-pub const SCHEMA_SCAFFOLD_TEMPLATE: &str = "// Migration (portable schema DSL): lowered to the connected driver's own DDL — SQLite gets\n\
-     // `INTEGER PRIMARY KEY AUTOINCREMENT`, Postgres `BIGSERIAL PRIMARY KEY`, and so on. Once applied,\n\
-     // what is checksummed is the SCHEMA THIS FILE DESCRIBES, not its text: reformatting it or editing\n\
-     // a comment is safe, changing what it does is edited history. Make later changes in a new one.\n\
+/// The starter body written into a freshly scaffolded **Noeta** migration — the default. It teaches
+/// the entry convention (`up()` returning statements, taking no connection), because neither the
+/// name nor the absence of a connection is guessable, and names the raw-SQL escape hatch.
+pub const MIGRATION_PROGRAM_SCAFFOLD_TEMPLATE: &str = "// Migration (Noeta): describes a schema change and returns it. `noeta migrate` runs the `up`\n\
+     // function below, lowers what it returns to the connected driver's own DDL — SQLite gets\n\
+     // `INTEGER PRIMARY KEY AUTOINCREMENT`, Postgres `BIGSERIAL PRIMARY KEY` — and applies it in a\n\
+     // transaction. One file migrates every backend.\n\
      //\n\
-     // create_table(\"todos\")\n\
-     //     .id()\n\
-     //     .text(\"title\").not_null()\n\
-     //     .bool(\"done\").default(false)\n\
-     //     .timestamps()\n\
+     // The function MUST be named `up` and take nothing: that is the entry convention, and taking no\n\
+     // connection is deliberate. A migration says what the schema should be; applying it, recording\n\
+     // it and rolling it back are the engine's job, not this file's.\n\
      //\n\
-     // create_index(\"todos\").column(\"done\")\n\
-     //\n\
-     // Statements: create_table, alter_table, drop_table, create_index, drop_index.\n\
-     // Anything dialect-specific (views, triggers, json/uuid/decimal columns, partial indexes)\n\
-     // belongs in a raw `.sql` migration beside this one — the two interleave in filename order.\n";
+     // Once applied, what is checksummed is the SCHEMA THIS FILE DESCRIBES, not its text: reformat\n\
+     // it, rename a local, pull a repeated column list into a helper — same migration. Change what\n\
+     // it builds and it is edited history, so make later changes in a new migration.\n\
+     use para.db.schema.{Statement, create_table, create_index}\n\
+     \n\
+     pub fn up(): List<Statement> {\n\
+     \x20   return [\n\
+     \x20       create_table(\"todos\")\n\
+     \x20           .id()\n\
+     \x20           .text(\"title\").not_null()\n\
+     \x20           .bool(\"done\").default(false)\n\
+     \x20           .timestamps()\n\
+     \x20           .statement(),\n\
+     \x20       create_index(\"todos\").column(\"done\").statement(),\n\
+     \x20   ]\n\
+     }\n\
+     \n\
+     // Statements: create_table, alter_table, drop_table, create_index, drop_index. The vocabulary is\n\
+     // deliberately only what lowers to equivalent DDL on both backends; anything dialect-specific\n\
+     // (views, triggers, json/uuid/decimal columns, partial indexes) belongs in a raw `.sql` migration\n\
+     // beside this one — `migrate new <name> --sql`. The two interleave in filename order.\n";
 
 /// The starter body written into a freshly scaffolded raw-SQL seed file — re-runnable dev data, so it
 /// documents the idempotent-insert idiom inline, in the spelling that works on **both** backends.
@@ -875,8 +991,8 @@ pub const SEED_SCAFFOLD_TEMPLATE: &str = "-- Seed: re-runnable development data.
      -- PostgreSQL, so a seed written that way is not portable.)\n\
      --\n\
      -- This body runs VERBATIM in the connected database's own SQL dialect. For a seed that writes\n\
-     -- its rows through the portable query builder instead, scaffold a program seed:\n\
-     -- `migrate new --seed --program <name>`.\n";
+     -- its rows through the portable query builder instead, scaffold a Noeta one — that is the\n\
+     -- default: `migrate new --seed <name>`.\n";
 
 /// The starter body written into a freshly scaffolded **program** (`.noe`) seed — the entry
 /// convention (`fn seed(conn)`) plus the portable idempotent insert, since neither is guessable.
@@ -1187,12 +1303,16 @@ mod tests {
     }
 
     #[test]
-    fn schema_scaffold_template_shows_the_shape_and_names_the_escape_hatch() {
-        assert!(SCHEMA_SCAFFOLD_TEMPLATE.contains("create_table(\"todos\")"));
-        assert!(SCHEMA_SCAFFOLD_TEMPLATE.contains(".timestamps()"));
-        assert!(SCHEMA_SCAFFOLD_TEMPLATE.contains("raw `.sql` migration"));
-        // The SQL scaffold points the other way, so either starting point mentions the other.
-        assert!(SCAFFOLD_TEMPLATE.contains("--schema"));
+    fn the_migration_scaffold_teaches_the_entry_convention_and_names_the_escape_hatch() {
+        // `up`, its return type, and the absence of a connection parameter are the convention, and
+        // none of the three is guessable from the filename.
+        assert!(MIGRATION_PROGRAM_SCAFFOLD_TEMPLATE.contains("pub fn up(): List<Statement>"));
+        assert!(MIGRATION_PROGRAM_SCAFFOLD_TEMPLATE.contains("use para.db.schema"));
+        assert!(MIGRATION_PROGRAM_SCAFFOLD_TEMPLATE.contains("create_table(\"todos\")"));
+        assert!(MIGRATION_PROGRAM_SCAFFOLD_TEMPLATE.contains(".timestamps()"));
+        // Each starting point names the other, and `--sql` is the only body flag either mentions.
+        assert!(MIGRATION_PROGRAM_SCAFFOLD_TEMPLATE.contains("--sql"));
+        assert!(SCAFFOLD_TEMPLATE.contains("migrate new <name>"));
     }
 
     #[test]
@@ -1285,34 +1405,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A [`SchemaEmitter`] that returns canned IR — the resolution seam exercised with no CLI, the
+    /// way [`RecordingRunner`] does for seeds.
+    struct CannedEmitter {
+        ir: String,
+        seen: Vec<PathBuf>,
+    }
+
+    impl SchemaEmitter for CannedEmitter {
+        fn emit(&mut self, path: &Path) -> Result<String, ProgramFailure> {
+            self.seen.push(path.to_path_buf());
+            Ok(self.ir.clone())
+        }
+    }
+
     #[test]
-    fn a_program_body_in_the_migrations_directory_is_refused_not_ignored() {
-        // The scope fence. A `.noe` migration is neither applied nor quietly skipped: skipping it
-        // would leave two machines with different schemas and no error to explain why.
+    fn a_noe_migration_resolves_to_the_ir_its_up_returned() {
+        // The whole of "written in Noeta, compiled down to the schema IR when run": the file is
+        // discovered unresolved, `up()` produces the IR, and from that point the engine is looking
+        // at an ordinary schema migration whose identity is what it describes.
         let dir = std::env::temp_dir().join(format!("noeta-noe-migration-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("0001_a.sql"), "SELECT 1;").unwrap();
-        std::fs::write(
-            dir.join("0002_b.noe"),
-            "fn seed(conn: db.Connection): void {}",
-        )
-        .unwrap();
+        std::fs::write(dir.join("0002_b.noe"), "pub fn up(): List<Statement> { }").unwrap();
 
-        let err = load_dir(&dir, DirKind::Migrations).unwrap_err();
+        let mut migrations = load_dir(&dir, DirKind::Migrations).unwrap();
+        assert_eq!(migrations[1].kind, MigrationKind::Program);
+
+        let ir = "create_table(\"todos\").id().text(\"title\").not_null()\n";
+        let mut emitter = CannedEmitter {
+            ir: ir.to_string(),
+            seen: Vec::new(),
+        };
+        resolve_programs(&mut migrations, &mut emitter).unwrap();
+
+        // The program was run from its real path, and what came back is now the body.
+        assert_eq!(emitter.seen, vec![dir.join("0002_b.noe")]);
+        assert_eq!(migrations[1].kind, MigrationKind::Schema);
+        assert_eq!(migrations[1].body, ir);
+        // The identity is the IR the program produced, never the Noeta source that produced it — so
+        // rewriting a migration's *program* without changing what it describes is not a history
+        // edit. (`Migration::new` takes a name only to pick the body language from its extension.)
+        assert_eq!(
+            migrations[1].checksum,
+            Migration::new("x.schema", ir).checksum
+        );
+        // The `.sql` file beside it is untouched by resolution.
+        assert_eq!(migrations[0].kind, MigrationKind::Sql);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unresolved_noe_migration_is_reported_not_skipped() {
+        // Skipping one would leave two machines with different schemas and no error to explain why,
+        // so the invariant is enforced where the body would have been lowered.
+        let migration = Migration::new("0001_a.noe", "pub fn up(): List<Statement> { }");
+        assert_eq!(migration.kind, MigrationKind::Program);
+        let err = migration
+            .lowered(&crate::sqlite::SqliteDriver::open_in_memory().unwrap())
+            .unwrap_err();
         assert_eq!(
             err,
-            MigrateError::ProgramMigration {
-                filename: "0002_b.noe".to_string()
+            MigrateError::UnresolvedProgram {
+                filename: "0001_a.noe".to_string()
             }
         );
+    }
+
+    #[test]
+    fn the_in_process_surface_names_the_path_that_runs_a_noe_migration() {
+        // `Connection.migrate(dir)` has a database but no loader. It refuses by name rather than
+        // skipping, and the message says which command does work.
+        let mut migrations = vec![Migration::new("0001_a.noe", "pub fn up() { }")];
+        let err = resolve_programs(&mut migrations, &mut UnsupportedEmitter).unwrap_err();
         let rendered = err.to_string();
-        assert!(rendered.contains("0002_b.noe"), "{rendered}");
-        assert!(rendered.contains("seeds directory"), "{rendered}");
-        // The same directory, loaded as seeds, takes the very same file — the gate is the purpose,
-        // not the file.
-        assert_eq!(load_dir(&dir, DirKind::Seeds).unwrap().len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(rendered.contains("0001_a.noe"), "{rendered}");
+        assert!(rendered.contains("noeta migrate"), "{rendered}");
     }
 
     #[test]
@@ -1320,8 +1490,8 @@ mod tests {
         assert!(SEED_PROGRAM_SCAFFOLD_TEMPLATE.contains("fn seed(conn: db.Connection)"));
         assert!(SEED_PROGRAM_SCAFFOLD_TEMPLATE.contains("insert_or_ignore"));
         assert!(SEED_PROGRAM_SCAFFOLD_TEMPLATE.contains("use para.db.query"));
-        // The SQL seed scaffold points at the program one, so either starting point names the other.
-        assert!(SEED_SCAFFOLD_TEMPLATE.contains("--seed --program"));
+        // The SQL seed scaffold points at the Noeta one, so either starting point names the other.
+        assert!(SEED_SCAFFOLD_TEMPLATE.contains("migrate new --seed <name>"));
     }
 }
 

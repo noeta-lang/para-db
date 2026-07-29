@@ -267,9 +267,18 @@ fn connection_method_dispatch(
             let dir = want_str(method, args, 0)?.to_string();
             // Discover + checksum the migration files before locking the driver (a filesystem read
             // over the real project directory, like the SQLite driver opening its file directly).
-            let migrations = crate::migrate::load_dir(
+            let mut migrations = crate::migrate::load_dir(
                 std::path::Path::new(&dir),
                 crate::migrate::DirKind::Migrations,
+            )
+            .map_err(migrate_error)?;
+            // A `.noe` migration's `up()` has to be loaded, checked and run, and this surface is a
+            // native call inside an already-running program — it has a database but not the loader
+            // that would take a second program from source to a value. Each one is refused by name
+            // rather than skipped, pointing at `noeta migrate`, which has both.
+            crate::migrate::resolve_programs(
+                &mut migrations,
+                &mut crate::migrate::UnsupportedEmitter,
             )
             .map_err(migrate_error)?;
             let conn = conn_of(recv)?;

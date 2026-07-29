@@ -16,7 +16,11 @@ seeds = "seeds"
 # its CLI commands (`noeta migrate`) additionally require command trust.
 [trust]
 native = ["para/db"]
-commands = ["para/db"]
+
+# Command trust binds each command to the local name it runs under, so the project decides what
+# `noeta <name>` means: `migrate = "para/db"` is this package's own `migrate`.
+[trust.commands]
+migrate = "para/db"
 
 [native]
 # A `--native` binary picks its driver at runtime; request the Postgres driver ring so the AOT build

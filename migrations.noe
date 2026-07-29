@@ -1,0 +1,53 @@
+// para.db.migrations — the Noeta half of the **`.noe` migration** convention.
+//
+// A migration is an ordinary Noeta program that declares one function:
+//
+//     use para.db.schema.{Statement, create_table}
+//
+//     pub fn up(): List<Statement> {
+//         return [
+//             create_table("todos").id().text("title").not_null().statement(),
+//         ]
+//     }
+//
+// `noeta migrate` loads and checks that file and appends one synthesized trailing statement —
+// `migrations.emit("<path>", up)` — exactly the way `noeta serve` appends `http.serve(port, fetch)`
+// and the seed runner appends `db.run_seed(dsn, seed)`. `emit` is that call: an ordinary Noeta
+// function, so the mechanism behind the command is one a program could invoke for itself.
+//
+// **Why `migrations` and not `migrate`.** This module is about migrations and only incidentally
+// about the verb; the plural also keeps it from reading as the implementation of the `noeta migrate`
+// command, which is Rust and lives in the native crate.
+//
+// **Why this lives in its own module.** It is the only thing in para/db that writes a file, and a
+// module that reaches `std.fs` is a module every consumer of it reaches `std.fs` through. The schema
+// builder is imported by apps, tests and fixtures that have no business touching a filesystem, so the
+// one function that does stays out of it. Nothing here is part of the builder's surface.
+//
+// **Why a file and not a return value.** The command runs the migration as a whole program through
+// `CommandCtx::run_file`, which yields an exit code — there is no channel for a value to come back
+// on. So the canonical rendering of the statements is written where the command asked, and the
+// command reads it back and deletes it. That text is not a lossy summary: `canonical` is byte for
+// byte what the native `schema::render` produces from the same statements, and the engine parses it
+// with the same grammar, so what it recovers is the `Statement` values `up()` built.
+//
+// **Why canonical text and not the IR itself.** The canonical rendering *is* the migration's
+// identity — it is what the checksum is taken over — so handing it across is handing across exactly
+// the thing that has to survive the trip, with no second encoding to keep in step with the first.
+
+namespace para.db.migrations
+
+use std.fs
+use para.db.schema.{Statement, canonical}
+
+// Write the canonical IR of `up()` to `out` — the entry `noeta migrate` synthesizes for a `.noe`
+// migration.
+//
+// `up` takes no connection, and that is the whole design rather than an omission: a migration
+// describes a schema change and returns it, while opening a transaction, applying the statements,
+// recording that they ran and rolling back on failure belong to the engine. A migration that could
+// open a connection could write outside that transaction and leave history nobody recorded, so the
+// signature is what makes it unrepresentable instead of a convention asking nicely.
+pub fn emit(out: string, up: () -> List<Statement>): void {
+    fs.write(out, canonical(up()))
+}

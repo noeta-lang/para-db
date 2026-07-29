@@ -20,24 +20,25 @@
 //         create_index("todos").column("done").render(),
 //     ])
 //
-// A builder describes a **`Statement`** — the same backend-neutral IR the native side parses a
-// `.schema` migration file into. `Statement`, `CreateTable`, `Column`, `DefaultValue` and the rest
-// below are the Noeta twins of the `schema.rs` types, field for field. Two spellings of that one
-// value are available:
+// A builder describes a **`Statement`** — the backend-neutral IR the whole migration story runs on.
+// `Statement`, `CreateTable`, `Column`, `DefaultValue` and the rest below are the Noeta twins of the
+// `schema.rs` types, field for field. `.statement()` hands the value over, which is what a `.noe`
+// migration's `up()` returns; two text spellings of it are also available:
 //
-//   * `.render()` — schema-DSL **source**, laid out the way a person writes a migration file: one
-//     column per indented line, modifiers beside the column they modify. `echo
-//     create_table(…).render()` prints something you can paste into `migrations/` verbatim.
+//   * `.render()` — schema **source**, laid out the way a person reads it: one column per indented
+//     line, modifiers beside the column they modify.
 //   * `.canonical()` — the **canonical** rendering, one statement per line in one fixed shape. It is
 //     byte for byte what the native `schema::render` produces from the same statement, and it is what
-//     a `.schema` migration's checksum is taken over: a migration's identity is its meaning, not its
-//     formatting.
+//     a migration's checksum is taken over: a migration's identity is its meaning, not its formatting.
 //
-// Both are functions of the `Statement` value, so the builder no longer appends text it cannot read
-// back, and there is one grammar and one lowering (both native) that the builder and the migration
-// file share. For a durable schema change, prefer a `.schema` migration (`noeta migrate new <name>
-// --schema`): it is checksummed, tracked, and applied once. `apply` is for the cases a migration does
-// not cover — a test fixture, a scratch database, a schema computed at runtime.
+// Both are functions of the `Statement` value, so the builder never appends text it cannot read back,
+// and there is one grammar and one lowering (both native) that the builder and the engine share. That
+// equality is what lets `emit` (below) hand a migration's statements back to the engine as canonical
+// text and have it parse the very same values out again.
+//
+// For a durable schema change, write a migration (`noeta migrate new <name>`): it is checksummed,
+// tracked, and applied exactly once. `apply` is for the cases a migration does not cover — a test
+// fixture, a scratch database, a schema computed at runtime.
 //
 // The vocabulary is deliberately only what lowers to equivalent DDL on both backends. Anything
 // dialect-specific (views, triggers, `jsonb`/`uuid`/exact-decimal columns, partial indexes, check
@@ -629,10 +630,14 @@ pub fn source(statements: List<string>): string {
 
 // Apply rendered statements to `conn`, lowered to that connection's own DDL. Returns the number of
 // statements applied. Not tracked and not transactional — a durable schema change belongs in a
-// `.schema` migration, which the engine checksums, records, and applies exactly once.
+// migration, which the engine checksums, records, and applies exactly once.
 pub fn apply(conn: Connection, statements: List<string>): int {
     return conn.apply_schema(source(statements))
 }
+
+// The `.noe` migration entry that writes what `up()` built lives in `para.db.migrations`, not here —
+// it is the one function in the package that touches a filesystem, and this module is imported by
+// apps and fixtures that have no business reaching `std.fs` through it.
 
 // --- Building the IR ------------------------------------------------------------------------------
 //

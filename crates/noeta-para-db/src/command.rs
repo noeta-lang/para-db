@@ -5,8 +5,9 @@
 //! database — it only scaffolds a file.
 //!
 //! Registered through [`crate::ParaDbExtension`]'s `commands()` (higher-order-abi H6), so the verb
-//! travels with the package: a consumer whose manifest depends on `para/db` and trusts its commands
-//! (`[trust] commands = ["para/db"]`) gets `noeta migrate` from the composed toolchain — nothing
+//! travels with the package: a consumer whose manifest depends on `para/db` and binds its command a
+//! local name (`[trust.commands]` / `migrate = "para/db"`) gets `noeta migrate` from the composed
+//! toolchain — nothing
 //! db-specific lives in the core CLI. Configuration reaches the command through the narrow
 //! [`CommandCtx::manifest_str`] seam (`[db] url/migrations/seeds` in the nearest `noeta.toml`).
 //!
@@ -21,11 +22,14 @@ use noeta_ext_abi::{ArgKind, ArgSpec, CommandCtx, EntryArg, EntryCall, ExtComman
 
 use crate::conn::open_driver;
 use crate::migrate::{
-    self, DirKind, MigrateError, PROGRAM_EXTENSION, ProgramFailure, ProgramRunner,
-    SCAFFOLD_TEMPLATE, SCHEMA_EXTENSION, SCHEMA_SCAFFOLD_TEMPLATE, SEED_PROGRAM_SCAFFOLD_TEMPLATE,
+    self, DirKind, MIGRATION_PROGRAM_SCAFFOLD_TEMPLATE, MigrateError, PROGRAM_EXTENSION,
+    ProgramFailure, ProgramRunner, SCAFFOLD_TEMPLATE, SEED_PROGRAM_SCAFFOLD_TEMPLATE,
     SQL_EXTENSION,
 };
-use crate::program::{SEED_ENTRY_FUNC, SEED_ENTRY_IDENT, SEED_ENTRY_MODULE};
+use crate::program::{
+    MIGRATION_ENTRY_IDENT, SCHEMA_ENTRY_FUNC, SCHEMA_ENTRY_MODULE, SEED_ENTRY_FUNC,
+    SEED_ENTRY_IDENT, SEED_ENTRY_MODULE,
+};
 
 /// The default migrations directory when none is configured or passed.
 const DEFAULT_DIR: &str = "migrations";
@@ -94,15 +98,10 @@ pub const MIGRATE_COMMAND: ExtCommand = ExtCommand {
             kind: ArgKind::Bool,
         },
         ArgSpec {
-            name: "schema",
-            help: "For `new`: scaffold a portable schema-DSL migration (`<name>.schema`, lowered \
-                   per driver) instead of a raw `<name>.sql` one",
-            kind: ArgKind::Bool,
-        },
-        ArgSpec {
-            name: "program",
-            help: "For `new --seed`: scaffold a Noeta program seed (`<name>.noe`, run through the \
-                   portable query builder) instead of a raw `<name>.sql` one",
+            name: "sql",
+            help: "For `new`: scaffold a raw-SQL body (`<name>.sql`, run verbatim in the connected \
+                   dialect) instead of the default Noeta one — for anything a backend spells its \
+                   own way",
             kind: ArgKind::Bool,
         },
         ArgSpec {
@@ -128,14 +127,16 @@ fn migrate_run(ctx: &mut dyn CommandCtx, args: &ParsedArgs) -> u8 {
 }
 
 /// A `migrate new` scaffold request: a name, an optional target directory, whether it is a seed, and
-/// which body language it is written in (raw SQL by default; the portable schema DSL for a migration
-/// with `--schema`, a Noeta program for a seed with `--program`).
+/// which body language it is written in.
+///
+/// **Noeta is the default in both directories**, and `--sql` is the one opt-out. There is no third
+/// choice to make: the schema IR a Noeta migration compiles to is still a body language the loader
+/// accepts, but it is not something a project is asked to write, so nothing scaffolds it.
 struct NewArgs {
     name: String,
     dir: Option<PathBuf>,
     seed: bool,
-    schema: bool,
-    program: bool,
+    sql: bool,
 }
 
 /// The parsed `noeta migrate` invocation.
@@ -164,43 +165,18 @@ impl Invocation {
         let name = args.get_str("name");
         let dir = args.get_path("dir").map(Path::to_path_buf);
         let seed = args.get_bool("seed").unwrap_or(false);
-        let schema = args.get_bool("schema").unwrap_or(false);
-        let program = args.get_bool("program").unwrap_or(false);
+        let sql = args.get_bool("sql").unwrap_or(false);
         let (new, seed_only) = match action {
             Some("new") => {
                 let name = name.ok_or_else(|| {
                     "`migrate new` needs a name: `noeta migrate new <name>`".to_string()
                 })?;
-                if schema && seed {
-                    // A seed is data, not schema — the DSL has no vocabulary for rows.
-                    return Err(
-                        "`--schema` and `--seed` are mutually exclusive: a seed is re-runnable \
-                         data, which the schema DSL does not describe"
-                            .to_string(),
-                    );
-                }
-                if program && schema {
-                    return Err(
-                        "`--program` and `--schema` are mutually exclusive: they are two different \
-                         body languages"
-                            .to_string(),
-                    );
-                }
-                if program && !seed {
-                    // The scope fence, at the scaffold: `.noe` is a seed body language, so there is
-                    // no such thing as a program migration to scaffold.
-                    return Err("`--program` scaffolds a SEED body, so it needs `--seed`: \
-                         `noeta migrate new --seed --program <name>`. A migration is `.sql` or \
-                         `.schema` — a program is not a migration body language"
-                        .to_string());
-                }
                 (
                     Some(NewArgs {
                         name: name.to_string(),
                         dir: dir.clone(),
                         seed,
-                        schema,
-                        program,
+                        sql,
                     }),
                     false,
                 )
@@ -277,14 +253,7 @@ fn execute(
 ) -> u8 {
     // `migrate new` is database-free: scaffold a file and return.
     if let Some(new) = &inv.new {
-        return match scaffold_new(
-            &*ctx,
-            &new.name,
-            new.dir.as_deref(),
-            new.seed,
-            new.schema,
-            new.program,
-        ) {
+        return match scaffold_new(&*ctx, &new.name, new.dir.as_deref(), new.seed, new.sql) {
             Ok(path) => {
                 let _ = writeln!(out, "Created {}", path.display());
                 0
@@ -299,11 +268,21 @@ fn execute(
         Err(message) => return usage_error(err, &message),
     };
 
-    // Discover + checksum the migration files (a missing directory is a usage error).
-    let migrations = match migrate::load_dir(&dir, DirKind::Migrations) {
+    // Discover the migration files (a missing directory is a usage error), then run every `.noe`
+    // one's `up()` to learn what it describes. Resolution happens here, before the driver is even
+    // opened: a Noeta migration takes no connection, so what it means is knowable without a
+    // database, and a program that fails to check should say so before anything is applied.
+    let mut migrations = match migrate::load_dir(&dir, DirKind::Migrations) {
         Ok(migrations) => migrations,
         Err(e) => return usage_error(err, &e.to_string()),
     };
+    {
+        let mut emitter = CtxEmitter { ctx };
+        if let Err(e) = migrate::resolve_programs(&mut migrations, &mut emitter) {
+            return run_error(err, &e.to_string());
+        }
+    }
+    let migrations = migrations;
 
     let mut driver = match open_driver(&dsn) {
         Ok(driver) => driver,
@@ -460,6 +439,83 @@ impl ProgramRunner for CtxPrograms<'_> {
     }
 }
 
+/// The command's [`SchemaEmitter`]: a `.noe` **migration** is loaded, checked and run on the real
+/// host through the driving [`CommandCtx`], with `schema.emit("<out>", up)` appended as its trailing
+/// statement — the same synthesized-entry mechanism the seed runner and `noeta serve` use.
+///
+/// **No dsn reaches it.** A migration describes a schema change and returns it; the engine is what
+/// applies it. So unlike [`CtxPrograms`], this entry passes no connection string, and `up()` has
+/// nowhere to write even if it wanted to. What comes back is the canonical IR, through a file the
+/// command names and the program writes — a value crossing a process-shaped boundary, not a
+/// side effect.
+struct CtxEmitter<'a> {
+    ctx: &'a mut dyn CommandCtx,
+}
+
+impl migrate::SchemaEmitter for CtxEmitter<'_> {
+    fn emit(&mut self, path: &Path) -> Result<String, ProgramFailure> {
+        let out = emit_target(path);
+        // A stale file from an earlier run would otherwise read as this run's output if the program
+        // failed to write one at all.
+        let _ = std::fs::remove_file(&out);
+        let entry = EntryCall {
+            module: SCHEMA_ENTRY_MODULE,
+            func: SCHEMA_ENTRY_FUNC,
+            args: vec![
+                EntryArg::Str(out.to_string_lossy().into_owned()),
+                EntryArg::Ident(MIGRATION_ENTRY_IDENT),
+            ],
+        };
+        // The program's own diagnostics reach stderr before this returns; the exit code only says
+        // which kind of failure it was — 2 for a file the driver could not read, 1 for a program
+        // that failed to check or to run.
+        let code = self.ctx.run_file(path, Some(&entry), None);
+        let read = |out: &Path| {
+            std::fs::read_to_string(out).map_err(|e| {
+                ProgramFailure::Failed(format!(
+                    "`up()` ran but no schema was written to `{}`: {e}",
+                    out.display()
+                ))
+            })
+        };
+        let result = match code {
+            0 => read(&out),
+            2 => Err(ProgramFailure::Failed(
+                "the migration program could not be read".to_string(),
+            )),
+            _ => Err(ProgramFailure::Failed(
+                "the migration program reported an error (see above)".to_string(),
+            )),
+        };
+        let _ = std::fs::remove_file(&out);
+        result
+    }
+}
+
+/// Where a `.noe` migration writes the IR its `up()` built, for this process to read back.
+///
+/// Beside the migration itself would put a generated file into the project's history; the temp
+/// directory keeps it out of the repository and out of the migrations directory the loader is
+/// walking.
+///
+/// **Unique per emit, not per file.** The pid separates two `noeta migrate` processes, but two
+/// emits *inside* one process can share a filename — two projects each with an `0001_init.noe`, and,
+/// concretely, this crate's own tests, which run in one process and collided here until the counter
+/// was added (each emit deletes the path before and after, so the loser read a file the winner had
+/// already removed). The counter makes the name unique per call, which is the actual requirement.
+fn emit_target(migration: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = migration
+        .file_name()
+        .map(|n| n.to_string_lossy().replace(['/', '\\'], "_"))
+        .unwrap_or_else(|| "migration".to_string());
+    std::env::temp_dir().join(format!(
+        "noeta-migrate-{}-{nth}-{stem}.schema",
+        std::process::id()
+    ))
+}
+
 /// Whether `dsn` names a **private in-memory** SQLite database — one that lives inside the single
 /// connection that opened it. A seed program connects for itself, so against such a dsn it would
 /// populate a second, empty database; the runner refuses it with an explanation rather than
@@ -516,50 +572,47 @@ fn report_seeds(out: &mut dyn Write, ran: &[String]) -> u8 {
 }
 
 /// Scaffold a new migration or seed file (creating the directory), returning the new path. A
-/// migration goes under the migrations directory (raw SQL by default, the portable schema DSL with
-/// `--schema`); a seed goes under the seeds directory with the idempotent-idiom template. All use the
-/// same UTC-timestamp-prefixed, slugified filename — only the extension and the starter body differ,
-/// so the ordering model is identical whichever body language is chosen.
+/// migration goes under the migrations directory, a seed under the seeds directory; all use the same
+/// UTC-timestamp-prefixed, slugified filename, so the ordering model is identical whichever body
+/// language is chosen.
 ///
-/// **Raw SQL stays the default.** A `.schema` migration cannot express everything a `.sql` one can,
-/// and every existing project's muscle memory is `migrate new <name>` → a SQL file; making the DSL
-/// opt-in keeps that unchanged and keeps the scaffold honest about which one is the general tool.
+/// **Noeta is the default in both**, and `--sql` is the one opt-out. A project writes the language it
+/// is already written in, and drops to SQL exactly where a backend spells something its own way —
+/// which is a permanent, principled place to be rather than a gap waiting to be closed. The two flags
+/// this replaced (`--schema` for a migration, `--program` for a seed) asked the author to choose a
+/// body language per directory before they knew what either meant.
 fn scaffold_new(
     ctx: &dyn CommandCtx,
     name: &str,
     dir: Option<&Path>,
     seed: bool,
-    schema: bool,
-    program: bool,
+    sql: bool,
 ) -> Result<PathBuf, String> {
-    let (dir, template, label, extension) = if seed && program {
-        (
+    let (dir, template, label, extension) = match (seed, sql) {
+        (true, false) => (
             resolve_seeds_dir(ctx, dir),
             SEED_PROGRAM_SCAFFOLD_TEMPLATE,
             "seeds",
             PROGRAM_EXTENSION,
-        )
-    } else if seed {
-        (
+        ),
+        (true, true) => (
             resolve_seeds_dir(ctx, dir),
             migrate::SEED_SCAFFOLD_TEMPLATE,
             "seeds",
             SQL_EXTENSION,
-        )
-    } else if schema {
-        (
+        ),
+        (false, false) => (
             resolve_dir(ctx, dir),
-            SCHEMA_SCAFFOLD_TEMPLATE,
+            MIGRATION_PROGRAM_SCAFFOLD_TEMPLATE,
             "migrations",
-            SCHEMA_EXTENSION,
-        )
-    } else {
-        (
+            PROGRAM_EXTENSION,
+        ),
+        (false, true) => (
             resolve_dir(ctx, dir),
             SCAFFOLD_TEMPLATE,
             "migrations",
             SQL_EXTENSION,
-        )
+        ),
     };
     let filename = migrate::scaffold_filename(&utc_timestamp(), name, extension)
         .map_err(|e: MigrateError| e.to_string())?;
@@ -688,6 +741,10 @@ mod tests {
         programs: Vec<ProgramRun>,
         /// The exit code this fake driver reports for a program (0 = it ran and succeeded).
         program_exit: u8,
+        /// The canonical schema IR this fake writes when the synthesized entry is the migration
+        /// `emit` one — standing in for a real `up()` having built those statements. `None` means
+        /// the program wrote nothing, which is how a migration that declares no `up` behaves.
+        emit_ir: Option<String>,
     }
 
     /// One recorded `run_file`: which file, and the trailing entry call rendered as source.
@@ -703,6 +760,15 @@ mod tests {
                 manifest: Vec::new(),
                 programs: Vec::new(),
                 program_exit: 0,
+                emit_ir: None,
+            }
+        }
+
+        /// A context whose migration programs "build" `ir` — the statements their `up()` returned.
+        fn emitting(ir: &str) -> TestCtx {
+            TestCtx {
+                emit_ir: Some(ir.to_string()),
+                ..TestCtx::bare()
             }
         }
 
@@ -721,6 +787,15 @@ mod tests {
             entry: Option<&noeta_ext_abi::EntryCall>,
             _banner: Option<&str>,
         ) -> u8 {
+            // A migration program's whole observable effect is the IR it writes where the command
+            // asked, so the fake writes it there — otherwise nothing downstream of the emitter seam
+            // could be exercised without a real loader.
+            if let (Some(call), Some(ir)) = (entry, self.emit_ir.as_deref())
+                && call.func == SCHEMA_ENTRY_FUNC
+                && let Some(noeta_ext_abi::EntryArg::Str(out)) = call.args.first()
+            {
+                std::fs::write(out, ir).expect("fake migration program writes its IR");
+            }
             let entry = entry
                 .map(|call| {
                     let args: Vec<String> = call
@@ -862,8 +937,7 @@ mod tests {
                 "--dry-run" => parsed.push_bool("dry-run", true),
                 "--reset" => parsed.push_bool("reset", true),
                 "--seed" => parsed.push_bool("seed", true),
-                "--schema" => parsed.push_bool("schema", true),
-                "--program" => parsed.push_bool("program", true),
+                "--sql" => parsed.push_bool("sql", true),
                 "--yes" => parsed.push_bool("yes", true),
                 positional => {
                     match positionals {
@@ -937,6 +1011,125 @@ mod tests {
         "0001_users.sql",
         "INSERT OR IGNORE INTO users (id, name) VALUES (10, 'Ada');",
     );
+
+    /// **The `.noe` migration end to end, through the real toolchain.**
+    ///
+    /// Every other test here drives [`execute`] with a fake `run_file`, which is right for the
+    /// engine's own behaviour but proves nothing about the half that lives in Noeta: that
+    /// `para.db.migrations.emit` resolves under the synthetic `use` the driver adds, that
+    /// `() -> List<Statement>` type-checks as a parameter, and that what `canonical` writes is what
+    /// [`crate::schema::parse`] reads back. Only a real `noeta migrate` over a real project
+    /// exercises that seam, so this builds one in a temp directory and runs it.
+    ///
+    /// Skipped when there is no `noeta` on PATH (the crate must build without the toolchain
+    /// installed); set `NOETA_CROSS_CHECK=1` — as CI does — to make its absence a failure instead.
+    /// This mirrors [`crate::schema::tests::the_noeta_builder_and_the_ir_render_one_canonical_text`],
+    /// which guards the other direction of the same agreement.
+    #[test]
+    fn a_real_noe_migration_applies_through_the_real_command() {
+        let bin = std::env::var("NOETA_BIN").unwrap_or_else(|_| "noeta".to_string());
+        let required = std::env::var("NOETA_CROSS_CHECK").is_ok_and(|v| !v.is_empty());
+        if std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            assert!(
+                !required,
+                "NOETA_CROSS_CHECK is set but `{bin}` is not runnable — the Noeta half of the \
+                 migration convention cannot be checked"
+            );
+            eprintln!(
+                "note: skipping the `.noe` migration end-to-end check — no `{bin}` on PATH (set \
+                 NOETA_CROSS_CHECK=1 to make this a failure)"
+            );
+            return;
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the package root is two directories above the crate");
+        let dir = std::env::temp_dir().join("noeta-para-db-noe-migration-e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("migrations")).expect("a writable temp directory");
+        std::fs::write(
+            dir.join("noeta.toml"),
+            format!(
+                "[package]\nname = \"noeta/noe_migration_e2e\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies]\npara = {{ path = {root:?} }}\n\n\
+                 [trust]\nnative = [\"para/db\"]\n\n\
+                 [trust.commands]\nmigrate = \"para/db\"\n"
+            ),
+        )
+        .expect("the generated manifest is writable");
+        // Two statements and a helper, so what is proven is that the *statements* crossed back —
+        // not that a single hardcoded line survived. The helper also makes the point that the
+        // checksum is over what `up` returns, not over how it was written.
+        std::fs::write(
+            dir.join("migrations").join("0001_notes.noe"),
+            "use para.db.schema.{Statement, create_table, create_index}\n\n\
+             fn notes(): Statement {\n\
+             \x20   return create_table(\"notes\")\n\
+             \x20       .id()\n\
+             \x20       .text(\"title\").not_null()\n\
+             \x20       .bool(\"archived\").not_null().default(false)\n\
+             \x20       .statement()\n\
+             }\n\n\
+             pub fn up(): List<Statement> {\n\
+             \x20   return [notes(), create_index(\"notes\").column(\"archived\").statement()]\n\
+             }\n",
+        )
+        .expect("the migration is writable");
+
+        let db = dsn(&dir);
+        let run = |args: &[&str]| {
+            std::process::Command::new(&bin)
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("the toolchain runs")
+        };
+
+        let applied = run(&["migrate", "--db", &db]);
+        let stderr = String::from_utf8_lossy(&applied.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(&applied.stdout).into_owned();
+        assert!(
+            applied.status.success(),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(stdout.contains("0001_notes.noe"), "{stdout}");
+
+        // The table and the index the program described are really there, with the column types the
+        // SQLite lowering picks — so the statements survived the round trip, not just the file name.
+        let mut driver = open_driver(&db).expect("the migrated database opens");
+        driver
+            .execute(
+                "INSERT INTO notes (title) VALUES (?)",
+                &[crate::driver::SqlValue::Text("hello".into())],
+            )
+            .expect("the described table exists with a nullable-free title");
+        let rows = driver
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'notes'",
+                &[],
+            )
+            .expect("indexes are listable");
+        assert!(!rows.is_empty(), "the described index was not created");
+
+        // Re-running is a clean no-op: `up()` runs again to recompute the checksum, and it matches,
+        // so nothing is applied and nothing reads as drift.
+        let again = run(&["migrate", "--db", &db]);
+        let again_out = String::from_utf8_lossy(&again.stdout).into_owned();
+        assert!(
+            again.status.success(),
+            "stdout:\n{again_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&again.stderr)
+        );
+        assert!(again_out.contains("up to date"), "{again_out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn apply_then_rerun_is_idempotent() {
@@ -1022,65 +1215,78 @@ mod tests {
         assert_eq!(outcome.code, 0, "{}", outcome.err);
         assert!(outcome.out.contains("Created"), "{}", outcome.out);
         assert!(
-            outcome.out.contains("_add_posts_table.sql"),
+            outcome.out.contains("_add_posts_table.noe"),
             "{}",
             outcome.out
         );
 
-        // Exactly one .sql file landed under migrations/.
+        // Exactly one file landed under migrations/, slugified and timestamp-prefixed.
         let created: Vec<_> = std::fs::read_dir(dir.join("migrations"))
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "sql"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "noe"))
             .collect();
         assert_eq!(created.len(), 1);
     }
 
     #[test]
-    fn new_schema_scaffolds_a_portable_dsl_migration() {
-        let dir = temp_dir("new_schema", &[]);
+    fn new_scaffolds_a_noeta_migration_by_default() {
+        // The default answer to "how do I change the schema" is a Noeta file — no flag, no third
+        // language to pick up first.
+        let dir = temp_dir("new_noe", &[]);
         let mut ctx = TestCtx::bare();
 
         let outcome = run_in(
             &dir,
-            &["new", "create todos", "--schema", "--dir", "migrations"],
+            &["new", "create todos", "--dir", "migrations"],
             &mut ctx,
             None,
         );
         assert_eq!(outcome.code, 0, "{}", outcome.err);
-        assert!(
-            outcome.out.contains("_create_todos.schema"),
-            "{}",
-            outcome.out
-        );
+        assert!(outcome.out.contains("_create_todos.noe"), "{}", outcome.out);
 
-        // Exactly one .schema file landed, carrying the DSL starter body.
         let created: Vec<_> = std::fs::read_dir(dir.join("migrations"))
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "schema"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "noe"))
             .collect();
         assert_eq!(created.len(), 1);
         let body = std::fs::read_to_string(created[0].path()).unwrap();
+        // The entry convention and the fact that it takes no connection are both spelled out.
+        assert!(body.contains("pub fn up(): List<Statement>"), "{body}");
         assert!(body.contains("create_table(\"todos\")"), "{body}");
-        assert!(body.contains("raw `.sql` migration"), "{body}");
+        assert!(body.contains("--sql"), "{body}");
     }
 
     #[test]
-    fn new_schema_and_seed_together_are_a_usage_error() {
-        let dir = temp_dir("new_schema_seed", &[]);
-        let outcome = run_in(
+    fn new_sql_scaffolds_the_escape_hatch_in_either_directory() {
+        // One flag means "raw SQL", and it means the same thing for a migration and for a seed.
+        let dir = temp_dir("new_sql_both", &[]);
+        let mut ctx = TestCtx::bare();
+
+        let migration = run_in(
             &dir,
-            &["new", "demo", "--schema", "--seed"],
-            &mut TestCtx::bare(),
+            &["new", "todos trigger", "--sql", "--dir", "migrations"],
+            &mut ctx,
             None,
         );
-        assert_eq!(outcome.code, 2);
+        assert_eq!(migration.code, 0, "{}", migration.err);
         assert!(
-            outcome.err.contains("mutually exclusive"),
+            migration.out.contains("_todos_trigger.sql"),
             "{}",
-            outcome.err
+            migration.out
         );
+
+        let seed = run_in(
+            &dir,
+            &["new", "id sequence", "--seed", "--sql", "--dir", "seeds"],
+            &mut ctx,
+            None,
+        );
+        assert_eq!(seed.code, 0, "{}", seed.err);
+        assert!(seed.out.contains("_id_sequence.sql"), "{}", seed.out);
+        // Each landed in its own directory, so "the same flag in either directory" is literal.
+        assert!(dir.join("migrations").is_dir() && dir.join("seeds").is_dir());
     }
 
     /// The end-to-end portability claim through the CLI: one `.schema` migration and one raw `.sql`
@@ -1409,7 +1615,7 @@ mod tests {
         // For a seed scaffold, `--dir` names the SEEDS directory (same as the old subcommand).
         let outcome = run_in(
             &dir,
-            &["new", "demo users", "--seed", "--dir", "seeds"],
+            &["new", "demo users", "--seed", "--sql", "--dir", "seeds"],
             &mut ctx,
             None,
         );
@@ -1556,8 +1762,10 @@ mod tests {
             vec![ProgramRun {
                 path: dir.join("seeds").join(SEED_PROGRAM.0),
                 // The dsn the command resolved, passed as a literal — nothing is smuggled through
-                // the environment — plus the program's own `seed` function by name.
-                entry: format!("db.run_seed(\"{db}\", seed)"),
+                // the environment — plus the program's own `seed` function by name. The module is
+                // the qualified `para.db`, so the driver's synthetic `use` binds `db` for a seed
+                // that never imported it.
+                entry: format!("para.db.run_seed(\"{db}\", seed)"),
             }]
         );
     }
@@ -1614,32 +1822,75 @@ mod tests {
     }
 
     #[test]
-    fn a_program_body_in_the_migrations_directory_is_a_usage_error() {
-        // The scope fence, from the command's side: `noeta migrate` refuses to run at all rather
-        // than applying the `.sql` migrations and quietly ignoring the `.noe` file beside them.
+    fn a_noe_migration_is_run_for_its_ir_and_then_applied_like_any_other() {
+        // End to end through the command: the program is run with the emit entry, the statements it
+        // returned are lowered and applied to a real database, and the file is tracked — the same
+        // path a `.schema` file takes, reached by running a program instead of parsing a file.
         let dir = project(
             "noe_migration",
-            &[M1, ("0002_b.noe", "fn seed(conn: db.Connection): void {}")],
+            &[("0001_a.noe", "pub fn up(): List<Statement> { return [] }")],
+        );
+        let mut ctx = TestCtx::emitting("create_table(\"notes\").id().text(\"title\")\n");
+        let db = dsn(&dir);
+
+        let outcome = run_in(&dir, &["--db", &db], &mut ctx, None);
+        assert_eq!(outcome.code, 0, "{}", outcome.err);
+        assert!(outcome.out.contains("0001_a.noe"), "{}", outcome.out);
+
+        // The synthesized entry named the migration convention, and passed no dsn: a migration
+        // describes, so it is handed nothing to write to.
+        assert_eq!(ctx.programs.len(), 1);
+        let entry = &ctx.programs[0].entry;
+        assert!(entry.starts_with("para.db.migrations.emit("), "{entry}");
+        assert!(entry.ends_with(", up)"), "{entry}");
+        assert!(!entry.contains(&db), "{entry}");
+
+        // The table the returned statements described actually exists.
+        let mut driver = open_driver(&db).unwrap();
+        driver
+            .execute(
+                "INSERT INTO notes (title) VALUES (?)",
+                &[crate::driver::SqlValue::Text("x".into())],
+            )
+            .unwrap();
+
+        // And a second run is a no-op: the migration was recorded, so its `up()` runs again (to
+        // recompute the checksum) but nothing is applied.
+        let again = run_in(&dir, &["--db", &db], &mut ctx, None);
+        assert_eq!(again.code, 0, "{}", again.err);
+        assert!(again.out.contains("up to date"), "{}", again.out);
+        assert_eq!(ctx.programs.len(), 2);
+    }
+
+    #[test]
+    fn a_noe_migration_that_fails_to_run_stops_the_whole_command() {
+        // Never half-run: a program that fails to check leaves nothing applied, including the
+        // `.sql` migrations that would otherwise have gone first.
+        let dir = project(
+            "noe_migration_fails",
+            &[("0001_a.noe", "pub fn up() { }"), M1],
         );
         let mut ctx = TestCtx::bare();
+        ctx.program_exit = 1;
         let db = dsn(&dir);
 
         let outcome = run_in(&dir, &["--db", &db], &mut ctx, None);
 
-        assert_eq!(outcome.code, 2, "{}", outcome.out);
-        assert!(outcome.err.contains("0002_b.noe"), "{}", outcome.err);
-        assert!(outcome.err.contains("seeds directory"), "{}", outcome.err);
-        assert!(ctx.programs.is_empty());
+        assert_eq!(outcome.code, 1, "{}", outcome.out);
+        assert!(outcome.err.contains("0001_a.noe"), "{}", outcome.err);
+        // The driver was never even opened for the `.sql` file beside it.
+        let mut driver = open_driver(&db).unwrap();
+        assert!(driver.query("SELECT 1 FROM t", &[]).is_err());
     }
 
     #[test]
-    fn new_seed_program_scaffolds_a_noe_seed_under_the_seeds_directory() {
+    fn new_seed_scaffolds_a_noe_seed_under_the_seeds_directory() {
         let dir = temp_dir("new_seed_program", &[]);
         let mut ctx = TestCtx::bare();
 
         let outcome = run_in(
             &dir,
-            &["new", "demo users", "--seed", "--program", "--dir", "seeds"],
+            &["new", "demo users", "--seed", "--dir", "seeds"],
             &mut ctx,
             None,
         );
@@ -1658,20 +1909,38 @@ mod tests {
     }
 
     #[test]
-    fn new_program_without_seed_is_a_usage_error() {
-        // There is no such thing as a program migration to scaffold — the fence again, at the one
-        // place a user would first try to cross it.
-        let dir = temp_dir("new_program_migration", &[]);
+    fn the_two_directories_scaffold_two_different_entry_points() {
+        // The same extension, the same flagless invocation, two conventions — because what the
+        // engine asks a program for is what decides whether it may touch a database at all.
+        let dir = temp_dir("entry_points", &[]);
         let mut ctx = TestCtx::bare();
 
-        let outcome = run_in(
+        // `--dir` names the directory being scaffolded into, which for `--seed` is the seeds one.
+        run_in(&dir, &["new", "a", "--dir", "migrations"], &mut ctx, None);
+        run_in(
             &dir,
-            &["new", "add posts", "--program", "--dir", "migrations"],
+            &["new", "b", "--seed", "--dir", "seeds"],
             &mut ctx,
             None,
         );
 
-        assert_eq!(outcome.code, 2, "{}", outcome.out);
-        assert!(outcome.err.contains("--seed"), "{}", outcome.err);
+        let read_only_noe = |sub: &str| {
+            let entry = std::fs::read_dir(dir.join(sub))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .find(|e| e.path().extension().is_some_and(|x| x == "noe"))
+                .unwrap();
+            std::fs::read_to_string(entry.path()).unwrap()
+        };
+
+        let migration = read_only_noe("migrations");
+        assert!(
+            migration.contains("pub fn up(): List<Statement>"),
+            "{migration}"
+        );
+        assert!(!migration.contains("Connection"), "{migration}");
+
+        let seed = read_only_noe("seeds");
+        assert!(seed.contains("fn seed(conn: db.Connection)"), "{seed}");
     }
 }

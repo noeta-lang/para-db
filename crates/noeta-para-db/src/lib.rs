@@ -75,7 +75,7 @@ impl Extension for ParaDbExtension {
         watch::DB_CAPABILITIES
     }
     /// `noeta migrate` (para-extraction) — the migration verb travels with the package: a consumer
-    /// that trusts this package's commands (`[trust] commands = ["para/db"]`) gets it from the
+    /// that binds it a local name (`[trust.commands]` / `migrate = "para/db"`) gets it from the
     /// composed toolchain; nothing db-specific stays in the core CLI.
     fn commands(&self) -> &'static [noeta_ext_abi::ExtCommand] {
         &[crate::command::MIGRATE_COMMAND]
