@@ -6,6 +6,7 @@
 //   docker run -d --rm -e POSTGRES_PASSWORD=test -e POSTGRES_DB=testdb -p 5433:5432 postgres:16-alpine
 //   noeta run examples/para-db-demo/live_repo_demo.noe
 use para.db
+use para.db.repo.Repository
 use para.db.reactive.LiveRepository
 use std.reactive.effect
 use std.json
@@ -18,7 +19,7 @@ struct User {
 }
 
 // Pump a live repository until a change is delivered (or we give up) — stands in for the serve loop.
-fn settle(users: LiveRepository): void {
+fn settle(users: LiveRepository<User>): void {
     mut woke = false
     mut tries = 0
     while !woke && tries < 100 {
@@ -31,8 +32,10 @@ conn = db.connect("postgres://postgres:test@127.0.0.1:5433/testdb")
 conn.execute("DROP TABLE IF EXISTS users", [])
 conn.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)", [])
 
-// Opt in: a LiveRepository instead of a plain Repository.
-users = LiveRepository.new(type_name::<User>(), "users", "id", conn)
+// Opt in: wrap the plain repository in a LiveRepository. The model is the type argument, recorded
+// by these annotations — the repository reads its qualified runtime identity off its own instance.
+repo: Repository<User> = Repository.new("users", "id")
+users: LiveRepository<User> = LiveRepository.new(repo, conn)
 
 // A reactive query — re-runs whenever the table changes.
 live_users = users.all()

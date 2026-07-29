@@ -13,7 +13,7 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
 - **`para.db.schema`** (pure Noeta) — a portable schema builder, the DDL peer of the query builder: `create_table("todos").id().text("title").bool("done").default(false).timestamps()`, lowered to each driver's own DDL. What a `.noe` migration's `up()` returns.
 - **`para.db.repo`** (pure Noeta) — repository + unit-of-work: stage writes during a request, flush them as one transactional batch.
 - **`para.db.sql`** (pure Noeta) — the typed `@sql { … }` block tier: `${…}` holes are always bound parameters, never spliced.
-- **`para.db.reactive`** (pure Noeta) — `LiveRepository` + `db.watch`: reactive queries that re-run when the data changes (SQLite update hooks / Postgres `LISTEN`/`NOTIFY`).
+- **`para.db.reactive`** (pure Noeta) — `LiveRepository<T>` + `db.watch`: reactive queries that re-run when the data changes (SQLite update hooks / Postgres `LISTEN`/`NOTIFY`).
 - **The `noeta migrate` command** — this package contributes a migration/seed engine to the CLI; a consumer opts in by binding it a local name under `[trust.commands]`.
 - **`editors/sql-tier.tmLanguage.json`** — a TextMate injection grammar so `@sql` bodies highlight as SQL in editors without the official extension.
 
@@ -164,7 +164,7 @@ Foreign keys are emitted on both backends, but **SQLite only enforces them when 
 
 ## Repository & unit of work — typed models, batched writes
 
-`para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and the repository is constructed with the model's runtime type **name** — `type_name::<User>()` — its table, and its primary-key column. The name is a string because generics are erased: a `Repository<T>` cannot recover `T` at run time, and the decode registry rows map through is keyed by name. `type_name::<T>()` supplies it as the **qualified** identity that registry holds, resolved at compile time — so a model under a `namespace` needs no hand-written `"app.storage.User"`, and renaming or moving the model cannot silently desynchronize it. Reads go straight to the connection — `find(conn, id)` (a `?dyn`; `none` when absent), `all(conn)`, and `where(conn, col, op, value)`, each mapped to the model; narrow a result with `.as<User>()`. Writes are the **unit of work**: `add(entity)` / `save(entity)` / `remove(id)` *stage* an insert / a by-primary-key update / a delete, and `flush(conn)` commits everything staged as one batch inside a single transaction (`BEGIN` … `COMMIT`), returning the statement count — a failure before `COMMIT` leaves the batch to the transaction to undo. `discard()` drops the staged changes without touching the database.
+`para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and **the model is the repository's type argument** — `Repository<User>` over its table and its primary-key column. The decode registry rows map through is keyed by name, and the repository reads that name off its own instantiation: an instance records its type arguments at construction, so `type_name::<T>()` inside a method answers the **qualified** identity the registry holds. A model under a `namespace` therefore needs no hand-written `"app.storage.User"`, and renaming or moving it cannot silently desynchronize the mapping. The annotation is load-bearing — `users: Repository<User> = Repository.new(…)` is what records the instantiation, and a repository built where the instantiation is not concrete aborts on its first mapped row rather than guessing. Reads go straight to the connection — `find(conn, id)` (a `?dyn`; `none` when absent), `all(conn)`, and `where(conn, col, op, value)`, each mapped to the model; narrow a result with `.as<User>()`. Writes are the **unit of work**: `add(entity)` / `save(entity)` / `remove(id)` *stage* an insert / a by-primary-key update / a delete, and `flush(conn)` commits everything staged as one batch inside a single transaction (`BEGIN` … `COMMIT`), returning the statement count — a failure before `COMMIT` leaves the batch to the transaction to undo. `discard()` drops the staged changes without touching the database.
 
 ```noeta
 use para.db
@@ -179,7 +179,7 @@ struct User {
 
 conn = db.connect("sqlite::memory:")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
-users = Repository.new("User", "users", "id")
+users: Repository<User> = Repository.new("users", "id")
 
 users.add(User { id: 1, name: "Ada", age: 36 })
 users.add(User { id: 2, name: "Bob", age: 41 })
@@ -369,11 +369,13 @@ An unrecognized `sslmode` value is a clear error before any connection is attemp
 
 ```noeta
 use para.db
+use para.db.repo.Repository
 use para.db.reactive.LiveRepository
 use std.reactive.effect
 
 conn = db.connect("sqlite::memory:")           // or postgres://…
-users = LiveRepository.new("User", "users", "id", conn)
+repo: Repository<User> = Repository.new("users", "id")
+users: LiveRepository<User> = LiveRepository.new(repo, conn)
 
 live = users.all()                             // a reactive query (a computed)
 effect(fn() {
@@ -385,7 +387,7 @@ users.flush()                                  // commit + notify
 users.pump()                                   // deliver notifications → the effect re-runs
 ```
 
-`LiveRepository` wraps a plain `Repository` with three additions: `all()` returns a reactive query, `flush()` notifies after committing, and `pump()` (called from your loop, e.g. the serve loop) delivers pending change notifications and wakes the reactive graph. Under the hood it composes `db.watch(conn, channel)` — a reactive source node over a change-notification channel — with a plain repository. The source is also usable directly: a `computed` that reads `watch.get()` and re-queries the table re-runs whenever a fired notification is pumped in with `watch.pump()` (see `watch_demo.noe`).
+`LiveRepository<T>` wraps a plain `Repository<T>` with three additions: `all()` returns a reactive query, `flush()` notifies after committing, and `pump()` (called from your loop, e.g. the serve loop) delivers pending change notifications and wakes the reactive graph. Under the hood it composes `db.watch(conn, channel)` — a reactive source node over a change-notification channel — with a plain repository. It takes that repository already constructed, which is both the layering (the plain repository keeps doing the mapping and the unit of work) and a requirement: a type argument is recorded where it is concrete, so a `Repository<T>` built inside `LiveRepository<T>.new` would carry no model for `type_name::<T>()` to read. The source is also usable directly: a `computed` that reads `watch.get()` and re-queries the table re-runs whenever a fired notification is pumped in with `watch.pump()` (see `watch_demo.noe`).
 
 **How far a change propagates depends on the driver:**
 

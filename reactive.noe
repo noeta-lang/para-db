@@ -24,23 +24,32 @@ use para.db.{Connection, Watch}
 use para.db.repo.Repository
 use std.reactive.computed
 
-// A live, reactive repository over one model + table. Opt in by constructing one instead of a plain
-// `Repository`. Reads become reactive queries; writes stage through the same unit-of-work and notify.
-pub class LiveRepository {
-    repo: Repository
+// A live, reactive repository over one model + table. Opt in by wrapping a plain `Repository<T>`.
+// Reads become reactive queries; writes stage through the same unit-of-work and notify.
+pub class LiveRepository<T> {
+    repo: Repository<T>
     conn: Connection
     watch: Watch // over the table's NOTIFY channel
     channel: string // the NOTIFY channel (the table name)
 
-    // Construct over the model's qualified runtime type name (`type_name::<Model>()`), its table,
-    // its primary-key column, and a connection. The NOTIFY channel is the table name; the watch
-    // listens on it immediately.
-    fn new(model: string, tbl: string, pk: string, conn: Connection): LiveRepository {
+    // Wrap a plain repository and a connection:
+    //
+    //   users: Repository<User> = Repository.new("users", "id")
+    //   live: LiveRepository<User> = LiveRepository.new(users, conn)
+    //
+    // The repository comes in already built because the model rides on ITS instantiation, and a
+    // type argument is recorded only where it is concrete — `Repository<T>` built here, with `T`
+    // still a parameter, would carry nothing for `type_name::<T>()` to read. Wrapping is also what
+    // the layer means: the plain repository keeps doing the mapping and the unit of work, and this
+    // adds the reactive edges around it.
+    //
+    // The NOTIFY channel is the repository's table; the watch listens on it immediately.
+    fn new(repo: Repository<T>, conn: Connection): LiveRepository<T> {
         return LiveRepository {
-            repo: Repository.new(model, tbl, pk),
+            repo: repo,
             conn: conn,
-            watch: db.watch(conn, tbl),
-            channel: tbl,
+            watch: db.watch(conn, repo.tbl),
+            channel: repo.tbl,
         }
     }
 

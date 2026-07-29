@@ -1,5 +1,5 @@
 // The para.db repository + unit-of-work (DB2), pure Noeta over the DB1 query builder and the DB0
-// native SQLite driver. A `Repository` maps rows <-> a typed model struct by reflection over JSON,
+// native SQLite driver. A `Repository<T>` maps rows <-> a typed model struct by reflection over JSON,
 // stages inserts/updates/deletes during a request, and flushes them as one batch in a transaction.
 //
 //   noeta run examples/para-db-demo/repo_demo.noe
@@ -36,11 +36,11 @@ fn describe(e: dyn): string {
 conn = db.connect("sqlite::memory:")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
 
-// Construct the repository over the model's runtime type NAME (generics are erased), its table, and
-// its primary-key column. `type_name::<User>()` yields that name as the *qualified* identity the
-// registry actually holds, so it keeps working when the model moves into a `namespace` — and it is
-// checked at compile time, unlike a hand-written string.
-users = Repository.new(type_name::<User>(), "users", "id")
+// Construct the repository over the model, its table, and its primary-key column. The model is the
+// type argument, and the annotation is what records it: an instance keeps its type arguments, so the
+// repository reads the model's *qualified* runtime identity — the key the decode registry actually
+// holds — off itself. Move the model into a `namespace` or rename it and this keeps working.
+users: Repository<User> = Repository.new("users", "id")
 
 // --- Unit of work: stage two inserts, then flush them as one batch in a single transaction. -----
 users.add(User { id: 1, name: "Ada", age: 36 })

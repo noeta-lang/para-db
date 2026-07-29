@@ -1,13 +1,15 @@
 // para.db.repo — the repository + unit-of-work layer (aether DB2), pure Noeta over the DB1 query
 // builder (`para.db.query`) and the DB0 native driver (`para.db`).
 //
-// A `Repository` maps rows (a `Map<string, dyn>` per row) to and from typed model structs by
+// A `Repository<T>` maps rows (a `Map<string, dyn>` per row) to and from typed model structs by
 // reflection over JSON:
 //   * row -> model:  `json.decode_typed(model_name, json.stringify(row))`, where the model derives
 //                    `@derive(Deserialize<Json>)`.
 //   * model -> row:  `json.parse(entity.to_json())` (a `Map<string, dyn>` whose keys are the
 //                    columns), where the model derives `@derive(Serialize<Json>)`.
-// Generics are erased, so the model's runtime type NAME is passed to the constructor as a string.
+// The decode registry is keyed by NAME, and `Repository<T>` reads that name off its own
+// instantiation: an instance records its type arguments at construction, so `type_name::<T>()`
+// inside a method resolves to the qualified identity the registry holds.
 //
 // The unit-of-work is the advanced feature: `add`/`save`/`remove` STAGE inserts/updates/deletes
 // during a request; `flush` commits them as one batch inside a single transaction (BEGIN … COMMIT),
@@ -19,31 +21,42 @@ use para.db.Connection
 use para.db.query.{table, run, exec, Query}
 use std.json
 
-// A repository over one model + table. Construct it with the model's runtime type name, its table,
-// and its primary-key column: `Repository.new(type_name::<User>(), "users", "id")`.
+// A repository over one model + table. The model is the type argument; construct it at a concrete
+// instantiation, naming its table and its primary-key column:
 //
-// The name is a `string` because generics are erased — a `Repository<T>` could not recover `T` at
-// run time, and the JSON decode registry this maps rows through is keyed by name. `type_name::<T>()`
-// supplies that name as the QUALIFIED identity the registry holds, resolved at compile time, so a
-// model declared under a `namespace` needs no hand-written `"app.storage.User"` and a rename cannot
-// silently desynchronize it.
-pub class Repository {
-    model: string // the model's qualified runtime type name — pass `type_name::<Model>()`
-    tbl: string // the backing table
-    pk: string // the primary-key column
+//   users: Repository<User> = Repository.new("users", "id")
+//
+// The annotation is what records the instantiation, and it is load-bearing: `T` rides on the
+// instance, so `type_name::<T>()` inside a method (see `model`) recovers the model's QUALIFIED
+// runtime identity — the key the JSON decode registry holds. A model declared under a `namespace`
+// therefore needs no hand-written `"app.storage.User"`, and a rename cannot desynchronize it.
+pub class Repository<T> {
+    pub tbl: string // the backing table (the reactive layer reads it for its NOTIFY channel)
+    pub pk: string // the primary-key column
+    mut model_name: string // memo of `type_name::<T>()` — empty until the first `model()`
     mut pending_new: List<dyn> // staged inserts (whole entities)
     mut pending_dirty: List<dyn> // staged updates (whole entities)
     mut pending_remove: List<dyn> // staged deletes (primary-key values)
 
-    fn new(model: string, tbl: string, pk: string): Repository {
+    fn new(tbl: string, pk: string): Repository<T> {
         return Repository {
-            model: model,
             tbl: tbl,
             pk: pk,
+            model_name: "",
             pending_new: [],
             pending_dirty: [],
             pending_remove: [],
         }
+    }
+
+    // The model's qualified runtime type name, read off this repository's own instantiation —
+    // `Repository<User>` under `namespace app.storage` answers `"app.storage.User"`. Memoized
+    // because every mapped row asks for it.
+    fn model(): string {
+        if self.model_name == "" {
+            self.model_name = type_name::<T>()
+        }
+        return self.model_name
     }
 
     // --- Reads -------------------------------------------------------------------------------
@@ -52,7 +65,7 @@ pub class Repository {
     // model by its runtime name. On a decode error the row is malformed — return it as-is (still a
     // `dyn`) rather than aborting the whole read.
     fn map_row(row: Map<string, dyn>): dyn {
-        return match json.decode_typed(self.model, json.stringify(row)) {
+        return match json.decode_typed(self.model(), json.stringify(row)) {
             Ok(v) => v,
             Err(e) => row,
         }
@@ -171,12 +184,6 @@ pub class Repository {
         self.pending_dirty = []
         self.pending_remove = []
     }
-}
-
-// Construct a repository over a model (its qualified runtime type name — `type_name::<Model>()`),
-// its table, and its primary-key column.
-pub fn repository(model: string, tbl: string, pk: string): Repository {
-    return Repository.new(model, tbl, pk)
 }
 
 // Decompose a model entity into its columns and row values by round-tripping it through JSON:

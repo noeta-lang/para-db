@@ -3,12 +3,14 @@
 //   noeta run examples/para-db-namespaced/main.noe
 //
 // A namespaced model's runtime identity is its qualified name (`demo.storage.Todo`), because that is
-// the key the `@derive(Deserialize<Json>)` registry stores it under. Passing the short `"Todo"` finds
-// nothing and every row comes back unmapped — silently, since an unmappable row is returned as-is.
+// the key the `@derive(Deserialize<Json>)` registry stores it under. A hand-written `"Todo"` would
+// find nothing and every row would come back unmapped — silently, since an unmappable row is
+// returned as-is.
 //
-// `type_name::<Todo>()` produces that qualified identity at COMPILE time from the local name the
-// `use` binds, so this file never spells `"demo.storage.Todo"`: move the model to another namespace
-// or rename it and this keeps working, whereas a hand-written string would rot.
+// Naming the model as `Repository<Todo>`'s type argument is what removes that trap. The instance
+// records the instantiation, so the repository resolves the qualified identity itself from the local
+// name the `use` binds — this file never spells `"demo.storage.Todo"`. Move the model to another
+// namespace or rename it and this keeps working.
 use para.db
 use para.db.repo.Repository
 use demo.storage.Todo
@@ -18,7 +20,7 @@ conn.execute("CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT, rank INTEG
 
 echo "model identity: ${type_name::<Todo>()}"
 
-todos = Repository.new(type_name::<Todo>(), "todos", "id")
+todos: Repository<Todo> = Repository.new("todos", "id")
 
 todos.add(Todo { id: 1, title: "write the migration", rank: 1 })
 todos.add(Todo { id: 2, title: "ship it", rank: 2 })

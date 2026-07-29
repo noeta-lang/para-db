@@ -3,6 +3,7 @@
 // through the connection wakes the watch. Writing through the LiveRepository updates the reactive UI.
 //   noeta run examples/para-db-demo/live_repo_sqlite_demo.noe
 use para.db
+use para.db.repo.Repository
 use para.db.reactive.LiveRepository
 use std.reactive.effect
 use std.json
@@ -14,7 +15,7 @@ struct User {
     age: int
 }
 
-fn settle(users: LiveRepository): void {
+fn settle(users: LiveRepository<User>): void {
     mut woke = false
     mut tries = 0
     while !woke && tries < 100 {
@@ -26,7 +27,10 @@ fn settle(users: LiveRepository): void {
 conn = db.connect("sqlite::memory:")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
 
-users = LiveRepository.new(type_name::<User>(), "users", "id", conn)
+// The model is the repository's type argument; the live wrapper takes the repository already
+// built, because the type argument is recorded where it is concrete — here.
+repo: Repository<User> = Repository.new("users", "id")
+users: LiveRepository<User> = LiveRepository.new(repo, conn)
 live_users = users.all()
 
 effect(fn() {
