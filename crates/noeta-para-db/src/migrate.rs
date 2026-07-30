@@ -693,6 +693,10 @@ fn column_text(row: &crate::driver::Row, name: &str) -> String {
             SqlValue::Int(n) => n.to_string(),
             SqlValue::Float(f) => f.to_string(),
             SqlValue::Bool(b) => b.to_string(),
+            // The migration ledger's own columns are declared TEXT, so this cannot arise from a
+            // well-formed `_noeta_migrations` table; decode it as UTF-8 rather than drop it, so a
+            // hand-built ledger still reports something recognizable.
+            SqlValue::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
             SqlValue::Null => String::new(),
         })
         .unwrap_or_default()
@@ -2055,7 +2059,9 @@ mod sqlite_e2e {
             .query("SELECT note, archived FROM todos", &[])
             .unwrap();
         assert_eq!(rows[0][0].1, SqlValue::Null);
-        assert_eq!(rows[0][1].1, SqlValue::Int(0)); // SQLite reads a boolean back as 0/1
+        // `add_bool` lowers to a `BOOLEAN` column, and the driver reads a declared boolean back as a
+        // boolean — SQLite stores it as 0/1, but that is storage, not the schema's meaning.
+        assert_eq!(rows[0][1].1, SqlValue::Bool(false));
     }
 
     #[test]

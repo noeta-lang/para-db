@@ -380,10 +380,13 @@ fn sql_value_of(value: &NativeValue) -> Result<SqlValue, StdError> {
         NativeValue::Scalar(Scalar::F32(f)) => Ok(SqlValue::Float(f64::from(*f))),
         NativeValue::Scalar(Scalar::Bool(b)) => Ok(SqlValue::Bool(*b)),
         NativeValue::Str(s) => Ok(SqlValue::Text(s.clone())),
+        // `bytes` binds as binary column data (a BLOB / `bytea`) — the write half of the read in
+        // `out_of`, so a blob round-trips without ever being reinterpreted as text.
+        NativeValue::Bytes(b) => Ok(SqlValue::Bytes(b.clone())),
         NativeValue::Unit => Ok(SqlValue::Null),
         _ => Err(type_error(
             "execute",
-            "a scalar, string, or null bind parameter",
+            "a scalar, string, bytes, or null bind parameter",
         )),
     }
 }
@@ -397,13 +400,16 @@ fn row_to_out(row: Row) -> NativeOut {
     )
 }
 
-/// A column value → its `NativeOut`. `Null` surfaces as `none`.
+/// A column value → its `NativeOut`. Each neutral kind is one Noeta value kind — a `BOOLEAN` column
+/// arrives as a real `bool` (the driver recovers it; see [`crate::sqlite::ColumnIntent`]) and a BLOB as
+/// `bytes`. `Null` surfaces as `none`.
 fn out_of(value: SqlValue) -> NativeOut {
     match value {
         SqlValue::Int(n) => NativeOut::Scalar(Scalar::Int(n)),
         SqlValue::Float(f) => NativeOut::Scalar(Scalar::Float(f)),
         SqlValue::Text(s) => NativeOut::Str(s),
         SqlValue::Bool(b) => NativeOut::Scalar(Scalar::Bool(b)),
+        SqlValue::Bytes(b) => NativeOut::Bytes(b),
         SqlValue::Null => NativeOut::None,
     }
 }

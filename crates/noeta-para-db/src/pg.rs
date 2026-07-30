@@ -388,6 +388,7 @@ fn to_pg(params: &[SqlValue]) -> Vec<PgVal> {
             SqlValue::Float(f) => PgVal::Float(*f),
             SqlValue::Text(s) => PgVal::Text(s.clone()),
             SqlValue::Bool(b) => PgVal::Bool(*b),
+            SqlValue::Bytes(b) => PgVal::Bytes(b.clone()),
             SqlValue::Null => PgVal::Null,
         })
         .collect()
@@ -395,14 +396,16 @@ fn to_pg(params: &[SqlValue]) -> Vec<PgVal> {
 
 /// A neutral bind value projected onto Postgres's typed `ToSql`. It `accepts` any target type and
 /// delegates the actual encoding to the inner Rust value (which validates the column type), so an
-/// `Int`/`Float`/`Text`/`Bool` binds to a compatible column and a `Null` binds as an untyped SQL NULL
-/// (`IsNull::Yes`) accepted for a column of any type — the one thing a fixed Rust `Option<T>` cannot do.
+/// `Int`/`Float`/`Text`/`Bool`/`Bytes` binds to a compatible column and a `Null` binds as an untyped SQL
+/// NULL (`IsNull::Yes`) accepted for a column of any type — the one thing a fixed Rust `Option<T>` cannot
+/// do.
 #[derive(Debug)]
 enum PgVal {
     Int(i64),
     Float(f64),
     Text(String),
     Bool(bool),
+    Bytes(Vec<u8>),
     Null,
 }
 
@@ -421,6 +424,7 @@ impl ToSql for PgVal {
             PgVal::Null => Ok(IsNull::Yes),
             PgVal::Bool(b) => b.to_sql_checked(ty, out),
             PgVal::Text(s) => s.to_sql_checked(ty, out),
+            PgVal::Bytes(b) => b.to_sql_checked(ty, out),
             PgVal::Int(n) => match *ty {
                 Type::INT2 => i16::try_from(*n)?.to_sql_checked(ty, out),
                 Type::INT4 => i32::try_from(*n)?.to_sql_checked(ty, out),
@@ -446,9 +450,11 @@ impl ToSql for PgVal {
 }
 
 /// Read column `i` (of Postgres type `ty`) out of a result row as a neutral [`SqlValue`]. A NULL in
-/// any column reads back as [`SqlValue::Null`]. The scalar storage types map directly; any other type
-/// is read best-effort as text (the row surface is textual in DB0), and a column that cannot even
-/// render as text is a clear error rather than a panic.
+/// any column reads back as [`SqlValue::Null`]. Postgres, unlike SQLite, has a real type per neutral
+/// kind — `bool`, the integer widths, the float widths, `bytea` — so each maps directly and no
+/// declared-type recovery is needed (contrast [`crate::sqlite::ColumnIntent`]). Any *other* type
+/// (`numeric`, `timestamptz`, `uuid`, `json`, an array, …) is read best-effort as text, and a column
+/// that cannot even render as text is a clear error rather than a panic.
 fn value_of(row: &postgres::Row, i: usize, ty: &Type) -> Result<SqlValue, String> {
     let err = |e: postgres::Error| format!("para.db (postgres): reading column {i}: {e}");
     let value = match *ty {
@@ -473,6 +479,12 @@ fn value_of(row: &postgres::Row, i: usize, ty: &Type) -> Result<SqlValue, String
             .try_get::<_, Option<bool>>(i)
             .map_err(err)?
             .map(SqlValue::Bool),
+        // `bytea` is binary by definition — it crosses as `bytes`, never through the text fallback
+        // below (which would either fail or replace every non-UTF-8 byte).
+        Type::BYTEA => row
+            .try_get::<_, Option<Vec<u8>>>(i)
+            .map_err(err)?
+            .map(SqlValue::Bytes),
         _ => row
             .try_get::<_, Option<String>>(i)
             .map_err(|e| {
@@ -674,20 +686,24 @@ mod tests {
         d.execute("DROP TABLE IF EXISTS noeta_pg_it", &[]).unwrap();
         d.execute(
             "CREATE TABLE noeta_pg_it (id INT PRIMARY KEY, name TEXT, score DOUBLE PRECISION, \
-             active BOOLEAN, note TEXT)",
+             active BOOLEAN, blob BYTEA, note TEXT)",
             &[],
         )
         .unwrap();
 
+        // Not valid UTF-8, so a text round trip would corrupt it.
+        let raw = vec![0xffu8, 0x00, 0xfe, b'h', b'i'];
         // INSERT with `?` placeholders and every value kind, including a NULL bound for `note`.
         let affected = d
             .execute(
-                "INSERT INTO noeta_pg_it (id, name, score, active, note) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO noeta_pg_it (id, name, score, active, blob, note) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
                 &[
                     SqlValue::Int(1),
                     SqlValue::Text("Ada".into()),
                     SqlValue::Float(9.5),
                     SqlValue::Bool(true),
+                    SqlValue::Bytes(raw.clone()),
                     SqlValue::Null,
                 ],
             )
@@ -695,9 +711,11 @@ mod tests {
         assert_eq!(affected, 1);
 
         // SELECT it back — a `?` bind on the WHERE, every column type mapped to its neutral value.
+        // Postgres has a real type per neutral kind, so each one maps directly: no declared-type
+        // recovery is needed here, unlike SQLite (`sqlite::ColumnIntent`).
         let rows = d
             .query(
-                "SELECT id, name, score, active, note FROM noeta_pg_it WHERE id = ?",
+                "SELECT id, name, score, active, blob, note FROM noeta_pg_it WHERE id = ?",
                 &[SqlValue::Int(1)],
             )
             .unwrap();
@@ -709,6 +727,7 @@ mod tests {
                 ("name".to_string(), SqlValue::Text("Ada".into())),
                 ("score".to_string(), SqlValue::Float(9.5)),
                 ("active".to_string(), SqlValue::Bool(true)),
+                ("blob".to_string(), SqlValue::Bytes(raw)),
                 ("note".to_string(), SqlValue::Null),
             ]
         );

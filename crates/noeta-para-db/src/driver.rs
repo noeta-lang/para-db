@@ -4,14 +4,25 @@
 //! `db.connect` dsn scheme is the only place a new driver is wired in.
 
 /// A backend-agnostic scalar crossing the driver boundary — the value kinds SQL columns and bound
-/// parameters take. Kept deliberately small (the SQLite storage classes); a richer driver maps its
-/// own types onto these. `bytes`/decimal/date land in a later slice with the columnar surface.
+/// parameters take, each one a Noeta value kind on the other side of the ABI (`int`, `float`,
+/// `string`, `bool`, `bytes`, `none`). Kept deliberately small; a richer driver maps its own types
+/// onto these. Decimal/date land in a later slice with the columnar surface.
+///
+/// **Every driver owes this surface an honest value kind**, not the one its storage happens to use:
+/// SQLite has no boolean storage class and stores one as an integer, so its driver reads the column's
+/// *declared* type and hands a [`SqlValue::Bool`] back (see [`crate::sqlite::ColumnIntent`]). A driver
+/// that leaked its storage class here would make every consumer above it — the repository's typed
+/// row→model mapping most of all — re-guess what the schema meant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
     Int(i64),
     Float(f64),
     Text(String),
     Bool(bool),
+    /// Binary column data (SQLite BLOB, Postgres `bytea`), verbatim — a Noeta `bytes` value. NOT
+    /// decoded as text: binary that is not valid UTF-8 would be silently corrupted by the
+    /// replacement character, and a driver never guesses that a blob was really a string.
+    Bytes(Vec<u8>),
     Null,
 }
 
