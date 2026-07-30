@@ -17,11 +17,9 @@
 // Either way the app `pump()`s the live repository from its loop (e.g. the serve loop, alongside
 // background tasks) to deliver them.
 
-namespace para.db.reactive
-
 use para.db
 use para.db.{Connection, Watch}
-use para.db.repo.Repository
+use db.repo.Repository
 use std.reactive.computed
 
 // A live, reactive repository over one model + table. Opt in by wrapping a plain `Repository<T>`.

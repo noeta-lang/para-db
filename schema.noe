@@ -44,8 +44,6 @@
 // dialect-specific (views, triggers, `jsonb`/`uuid`/exact-decimal columns, partial indexes, check
 // constraints) belongs in a raw `.sql` migration — see the package README.
 
-namespace para.db.schema
-
 use para.db.Connection
 
 // --- The neutral IR -------------------------------------------------------------------------------

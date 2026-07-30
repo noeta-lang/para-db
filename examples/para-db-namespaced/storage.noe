@@ -6,8 +6,6 @@
 // one back as 0/1, so a `bool` field would fail to decode from a SQLite row (`expected bool, found
 // JSON number`) and every row would come back unmapped — a driver read-back fact, unrelated to the
 // name resolution this example is about. Postgres has a real `boolean` and maps it fine.
-namespace demo.storage
-
 @derive(Serialize<Json>, Deserialize<Json>)
 pub struct Todo {
     pub id: int

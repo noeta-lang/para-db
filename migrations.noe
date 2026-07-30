@@ -35,10 +35,8 @@
 // identity — it is what the checksum is taken over — so handing it across is handing across exactly
 // the thing that has to survive the trip, with no second encoding to keep in step with the first.
 
-namespace para.db.migrations
-
 use std.fs
-use para.db.schema.{Statement, canonical}
+use db.schema.{Statement, canonical}
 
 // Write the canonical IR of `up()` to `out` — the entry `noeta migrate` synthesizes for a `.noe`
 // migration.

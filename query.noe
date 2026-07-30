@@ -4,8 +4,6 @@
 // untrusted input carries no injection risk. The repository/unit-of-work layer (DB2) builds on this;
 // it is also usable directly.
 
-namespace para.db.query
-
 use para.db.Connection
 
 // A composed SQL statement ready to run: the text (with `?` placeholders) and its bound parameters.

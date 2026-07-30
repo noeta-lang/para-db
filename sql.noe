@@ -6,8 +6,6 @@
 // injection risk by construction. Importing `sql` brings the `@sql` tier into scope (the `@tier`
 // declaration rides on the handler fn), exactly like para.html's `@html`.
 
-namespace para.db.sql
-
 use para.db.Connection
 
 // A typed SQL statement: the text (with positional `?` placeholders) and its bound parameters.

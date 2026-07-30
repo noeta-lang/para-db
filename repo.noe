@@ -15,10 +15,8 @@
 // during a request; `flush` commits them as one batch inside a single transaction (BEGIN … COMMIT),
 // then clears the pending lists. Reads (`find`/`all`/`where`) go straight to the connection.
 
-namespace para.db.repo
-
 use para.db.Connection
-use para.db.query.{table, run, exec, Query}
+use db.query.{table, run, exec, Query}
 use std.json
 
 // A repository over one model + table. The model is the type argument; construct it at a concrete
