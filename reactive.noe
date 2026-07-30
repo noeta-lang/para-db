@@ -54,6 +54,10 @@ pub class LiveRepository<T> {
     // A REACTIVE query of every row, mapped to the model — re-runs whenever the table changes (the
     // watch wakes). Read it in an `effect`, or hand it to a LiveView `view.expose(...)`. The DB read
     // itself is not a reactive dependency; the `watch` is what invalidates it.
+    //
+    // `dyn` is the reactive HANDLE's own type (what `computed` answers), not a model-typing gap. What
+    // reading it yields is whatever `Repository.all` yields — `List<dyn>` today, `List<T>` when the
+    // read surface can be typed (see the `Repository` module header), with nothing to change here.
     fn all(): dyn {
         w = self.watch
         r = self.repo
@@ -65,15 +69,19 @@ pub class LiveRepository<T> {
     }
 
     // --- Writes: stage through the unit of work, then notify on flush so dependents wake. ---------
+    //
+    // Typed as the model, exactly like the plain repository's — `T` is the same parameter, so the
+    // wrapper neither widens nor re-checks anything the wrapped repository would not.
 
-    fn add(entity: dyn): void {
+    fn add(entity: T): void {
         self.repo.add(entity)
     }
 
-    fn save(entity: dyn): void {
+    fn save(entity: T): void {
         self.repo.save(entity)
     }
 
+    // `dyn` on purpose: a primary-key VALUE, not a model. See `Repository.remove`.
     fn remove(id: dyn): void {
         self.repo.remove(id)
     }

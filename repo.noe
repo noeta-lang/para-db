@@ -14,6 +14,27 @@
 // The unit-of-work is the advanced feature: `add`/`save`/`remove` STAGE inserts/updates/deletes
 // during a request; `flush` commits them as one batch inside a single transaction (BEGIN … COMMIT),
 // then clears the pending lists. Reads (`find`/`all`/`where`) go straight to the connection.
+//
+// The WRITE surface is typed as the model: `add(entity: T)` / `save(entity: T)` and the staging lists
+// are `List<T>`, so handing a repository the wrong model is a compile error at the call site rather
+// than a malformed row at flush time. `T` substitutes from the receiver's instantiation, so
+// `Repository<User>.add(Order { … })` is an E0007 naming both types.
+//
+// The READ surface is still `dyn` (`find` -> `?dyn`, `all`/`where` -> `List<dyn>`), and callers still
+// narrow with `.as<Model>()`. That is NOT the intended shape — it is a toolchain limitation. Rows
+// arrive from `json.decode_typed`, which is keyed by NAME and answers `dyn`, so typing the reads as
+// `T` needs a `dyn` -> `T` conversion inside a method of a generic class, and today there is none:
+//   * `.as<T>()` compiles but answers `none` at RUN TIME for every value — the narrow is a
+//     head-constructor match on the type's runtime NAME, and `T` reaches it as the literal one
+//     character `T`, matching nothing. There is no diagnostic; the read simply comes back empty.
+//     `v is T` is `false` the same way.
+//   * `return v` / `some(v)` from a `dyn` into a `T`/`?T` position is E0007.
+//   * `json.parse::<T>` / `json.try_parse::<T>` is E0058: the receiver's type tag records the
+//     instantiation's NAME but no build recipe, so a call-site-typed decode cannot forward it.
+// Nothing here is a naming problem the package can route around: the value on the heap really is a
+// `T`, and only the checker's judgment of it is missing. The reads flip to `T` — and the `.as<>()`
+// at every call site goes away — the moment `.as<T>()` reads the instantiation name off the receiver
+// the way `type_name::<T>()` already does. Until then the honest signature is `dyn`.
 
 use para.db.Connection
 use db.query.{table, run, exec, Query}
@@ -32,9 +53,9 @@ pub class Repository<T> {
     pub tbl: string // the backing table (the reactive layer reads it for its NOTIFY channel)
     pub pk: string // the primary-key column
     mut model_name: string // memo of `type_name::<T>()` — empty until the first `model()`
-    mut pending_new: List<dyn> // staged inserts (whole entities)
-    mut pending_dirty: List<dyn> // staged updates (whole entities)
-    mut pending_remove: List<dyn> // staged deletes (primary-key values)
+    mut pending_new: List<T> // staged inserts (whole entities)
+    mut pending_dirty: List<T> // staged updates (whole entities)
+    mut pending_remove: List<dyn> // staged deletes (primary-key VALUES, not models)
 
     fn new(tbl: string, pk: string): Repository<T> {
         return Repository {
@@ -62,6 +83,10 @@ pub class Repository<T> {
     // Map one query row (`column -> value`) to the model: round-trip the row through JSON into the
     // model by its runtime name. On a decode error the row is malformed — return it as-is (still a
     // `dyn`) rather than aborting the whole read.
+    //
+    // Answers `dyn`, not `T`, for the reason the module header records: the decode is name-keyed and
+    // there is no `dyn` -> `T` conversion available inside a method of a generic class. The value it
+    // returns IS a `T` whenever the decode succeeded; only the static type says otherwise.
     fn map_row(row: Map<string, dyn>): dyn {
         return match json.decode_typed(self.model(), json.stringify(row)) {
             Ok(v) => v,
@@ -103,23 +128,25 @@ pub class Repository<T> {
 
     // --- Unit of work: stage changes now, flush them as one batch later. ---------------------
 
-    // Stage an INSERT of `entity` (flushed on the next `flush`).
-    fn add(entity: dyn): void {
+    // Stage an INSERT of `entity` (flushed on the next `flush`). Typed as the model, so a value of
+    // any other type is rejected here rather than at flush time.
+    fn add(entity: T): void {
         self.pending_new = self.pending_new ~ [entity]
     }
 
     // Stage an UPDATE of `entity` (matched by its primary key on flush).
-    fn save(entity: dyn): void {
+    fn save(entity: T): void {
         self.pending_dirty = self.pending_dirty ~ [entity]
     }
 
-    // Stage a DELETE of the row whose primary key is `id`.
+    // Stage a DELETE of the row whose primary key is `id`. `dyn` on purpose: this takes a primary-key
+    // VALUE, not a model, and the key's type is not the repository's type argument.
     fn remove(id: dyn): void {
         self.pending_remove = self.pending_remove ~ [id]
     }
 
     // Build the INSERT statement for one staged-new entity: all its columns/values.
-    fn build_insert(entity: dyn): Query {
+    fn build_insert(entity: T): Query {
         m = columns_of(entity)
         cols = m.keys()
         mut vals: List<dyn> = []
@@ -131,7 +158,7 @@ pub class Repository<T> {
 
     // Build the UPDATE statement for one staged-dirty entity: SET every non-pk column WHERE pk = its
     // own primary-key value.
-    fn build_update(entity: dyn): Query {
+    fn build_update(entity: T): Query {
         m = columns_of(entity)
         pk_value = m[self.pk]
         mut cols: List<string> = []

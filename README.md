@@ -164,7 +164,11 @@ Foreign keys are emitted on both backends, but **SQLite only enforces them when 
 
 ## Repository & unit of work — typed models, batched writes
 
-`para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and **the model is the repository's type argument** — `Repository<User>` over its table and its primary-key column. The decode registry rows map through is keyed by name, and the repository reads that name off its own instantiation: an instance records its type arguments at construction, so `type_name::<T>()` inside a method answers the **qualified** identity the registry holds. A model under a `namespace` therefore needs no hand-written `"app.storage.User"`, and renaming or moving it cannot silently desynchronize the mapping. The annotation is load-bearing — `users: Repository<User> = Repository.new(…)` is what records the instantiation, and a repository built where the instantiation is not concrete aborts on its first mapped row rather than guessing. Reads go straight to the connection — `find(conn, id)` (a `?dyn`; `none` when absent), `all(conn)`, and `where(conn, col, op, value)`, each mapped to the model; narrow a result with `.as<User>()`. Writes are the **unit of work**: `add(entity)` / `save(entity)` / `remove(id)` *stage* an insert / a by-primary-key update / a delete, and `flush(conn)` commits everything staged as one batch inside a single transaction (`BEGIN` … `COMMIT`), returning the statement count — a failure before `COMMIT` leaves the batch to the transaction to undo. `discard()` drops the staged changes without touching the database.
+`para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and **the model is the repository's type argument** — `Repository<User>` over its table and its primary-key column. The decode registry rows map through is keyed by name, and the repository reads that name off its own instantiation: an instance records its type arguments at construction, so `type_name::<T>()` inside a method answers the **qualified** identity the registry holds. A model under a `namespace` therefore needs no hand-written `"app.storage.User"`, and renaming or moving it cannot silently desynchronize the mapping. The annotation is load-bearing — `users: Repository<User> = Repository.new(…)` is what records the instantiation, and a repository built where the instantiation is not concrete aborts on its first mapped row rather than guessing.
+
+Writes are the **unit of work**, and they are **typed as the model**: `add(entity: T)` / `save(entity: T)` *stage* an insert / a by-primary-key update, `remove(id)` a delete, and `flush(conn)` commits everything staged as one batch inside a single transaction (`BEGIN` … `COMMIT`), returning the statement count — a failure before `COMMIT` leaves the batch to the transaction to undo. `discard()` drops the staged changes without touching the database. Because `T` substitutes from the receiver's instantiation, handing a `Repository<User>` anything but a `User` is a compile error at the call site (`argument of type 'Order' is not assignable to 'User'`) rather than a malformed row at flush time. `remove(id)` stays `dyn` deliberately: it takes a primary-key *value*, not a model.
+
+Reads go straight to the connection — `find(conn, id)` (`none` when absent), `all(conn)`, and `where(conn, col, op, value)`, each mapped to the model. They are still typed `?dyn` / `List<dyn>`, so a caller narrows a result with `.as<User>()`. That asymmetry is a **toolchain limitation, not a design choice**: rows arrive from the name-keyed `json.decode_typed`, which answers `dyn`, and inside a method of a generic class there is currently no `dyn` → `T` conversion — `.as<T>()` compiles but matches nothing at run time (the narrow keys on the type's runtime *name*, and `T` reaches it as the literal letter `T`), `some(v)` into a `?T` is `E0007`, and `json.parse::<T>` is `E0058` because the receiver's type tag carries the instantiation's name but no build recipe. The values really are `User`s on the heap; only the checker's judgment of them is missing. The reads become `?T` / `List<T>` — and the `.as<>()` at each call site disappears — as soon as `.as<T>()` reads the instantiation off the receiver the way `type_name::<T>()` already does.
 
 ```noeta
 use para.db
@@ -181,15 +185,21 @@ conn = db.connect("sqlite::memory:")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
 users: Repository<User> = Repository.new("users", "id")
 
-users.add(User { id: 1, name: "Ada", age: 36 })
+users.add(User { id: 1, name: "Ada", age: 36 })      // typed: `add(entity: User)` here
 users.add(User { id: 2, name: "Bob", age: 41 })
 n = users.flush(conn)                       // one transaction, 2 statements
 
 users.save(User { id: 2, name: "Bob", age: 42 })    // stage an UPDATE by primary key
-users.remove(1)                                     // stage a DELETE
+users.remove(1)                                     // stage a DELETE (a key value, not a model)
 users.flush(conn)
 
-adults = users.where(conn, "age", ">", 18)
+// Reads still answer `dyn` rows — narrow one to the model (see the note above on why).
+for row in users.where(conn, "age", ">", 18) {
+    match row.as<User>() {
+        some(u) => echo "${u.name}",
+        none => echo "<malformed row>",
+    }
+}
 ```
 
 ## Migrations — evolve the schema over time
