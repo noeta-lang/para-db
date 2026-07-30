@@ -1,12 +1,11 @@
-// The OPT-IN reactive ORM (aether DB5): a `LiveRepository` — reactivity you choose by wrapping a plain
-// repository. Its `all()` is a reactive query; `flush()` notifies; `pump()` delivers changes. The
-// plain `Repository` stays non-reactive. Writing through it updates the "UI" (an effect here, a
+// The OPT-IN reactive ORM (aether DB5): a `LiveRepository` — reactivity you choose by naming one in
+// place of a plain repository. Its `all()` is a reactive query; `flush()` notifies; `pump()` delivers
+// changes. The plain `Repository` stays non-reactive. Writing through it updates the "UI" (an effect here, a
 // LiveView `view.expose` in a real app) with no manual signal wiring.
 //
 //   docker run -d --rm -e POSTGRES_PASSWORD=test -e POSTGRES_DB=testdb -p 5433:5432 postgres:16-alpine
 //   noeta run examples/para-db-demo/live_repo_demo.noe
 use para.db
-use para.db.repo.Repository
 use para.db.reactive.LiveRepository
 use std.reactive.effect
 use std.json
@@ -32,10 +31,10 @@ conn = db.connect("postgres://postgres:test@127.0.0.1:5433/testdb")
 conn.execute("DROP TABLE IF EXISTS users", [])
 conn.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)", [])
 
-// Opt in: wrap the plain repository in a LiveRepository. The model is the type argument, recorded
-// by these annotations — the repository reads its qualified runtime identity off its own instance.
-repo: Repository<User> = Repository.new("users", "id")
-users: LiveRepository<User> = LiveRepository.new(repo, conn)
+// Opt in: one LiveRepository over the model, its table, its primary key and the connection. The
+// model is the type argument, recorded by this annotation — the live repository builds its own inner
+// `Repository<User>` from it, and that repository reads the qualified runtime identity off itself.
+users: LiveRepository<User> = LiveRepository.new("users", "id", conn)
 
 // A reactive query — re-runs whenever the table changes.
 live_users = users.all()

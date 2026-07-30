@@ -14,23 +14,19 @@ struct User {
     age: int
 }
 
-// Name of a `?dyn` result narrowed to `User`, or a fallback string.
-fn name_of(found: ?dyn): string {
+// Name of a `?User` result, or a fallback string. `find` answers the model, so there is nothing to
+// narrow here — the only case left is "no such row".
+fn name_of(found: ?User): string {
     return match found {
-        some(u) => match u.as<User>() {
-            some(user) => user.name,
-            none => "<malformed>",
-        },
+        some(user) => user.name,
         none => "none",
     }
 }
 
-// One-line description of a `dyn` row narrowed to `User`.
-fn describe(e: dyn): string {
-    return match e.as<User>() {
-        some(user) => "  #${user.id} ${user.name} (${user.age})",
-        none => "  <malformed>",
-    }
+// One-line description of a row. Its type is `User`, not `dyn`: the repository's type argument is
+// what `all()` hands back.
+fn describe(user: User): string {
+    return "  #${user.id} ${user.name} (${user.age})"
 }
 
 conn = db.connect("sqlite::memory:")
@@ -48,7 +44,7 @@ users.add(User { id: 2, name: "Bob", age: 41 })
 n = users.flush(conn)
 echo "flushed ${n} statements"
 
-// --- Read one back by primary key (find -> ?dyn; narrow to User). --------------------------------
+// --- Read one back by primary key (find -> ?User; `none` when there is no such row). -------------
 found = users.find(conn, 1)
 found_name = name_of(found)
 echo "find(1) -> ${found_name}"
@@ -66,10 +62,7 @@ users.save(User { id: 2, name: "Bob", age: 42 })
 users.flush(conn)
 bob = users.find(conn, 2)
 bob_age = match bob {
-    some(u) => match u.as<User>() {
-        some(user) => user.age,
-        none => 0,
-    },
+    some(user) => user.age,
     none => 0,
 }
 echo "after save, #2 age -> ${bob_age}"

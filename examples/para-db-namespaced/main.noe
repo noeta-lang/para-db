@@ -4,8 +4,8 @@
 //
 // A namespaced model's runtime identity is its qualified name (`demo.storage.Todo`), because that is
 // the key the `@derive(Deserialize<Json>)` registry stores it under. A hand-written `"Todo"` would
-// find nothing and every row would come back unmapped — silently, since an unmappable row is
-// returned as-is.
+// find nothing and every row would fail to map — silently, since a row that is not a `Todo` is
+// dropped from a typed read.
 //
 // Naming the model as `Repository<Todo>`'s type argument is what removes that trap. The instance
 // records the instantiation, so the repository resolves the qualified identity itself from the local
@@ -26,13 +26,15 @@ todos.add(Todo { id: 1, title: "write the migration", rank: 1 })
 todos.add(Todo { id: 2, title: "ship it", rank: 2 })
 echo "flushed ${todos.flush(conn)} statements"
 
-fn render(row: dyn): string {
-    return match row.as<Todo>() {
-        some(t) => "  #${t.id} ${t.title} (rank=${t.rank})",
-        none => "  <unmapped — the model name did not resolve>",
-    }
+// `all()` answers `List<Todo>` — the repository's type argument, mapped inside the repository — so
+// this renders the model directly. A row the registry could not resolve would be absent from the
+// list, which is why the count is echoed alongside it.
+fn render(t: Todo): string {
+    return "  #${t.id} ${t.title} (rank=${t.rank})"
 }
 
-for row in todos.all(conn) {
-    echo render(row)
+rows = todos.all(conn)
+echo "mapped ${rows.len()} of 2 rows"
+for t in rows {
+    echo render(t)
 }

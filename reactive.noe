@@ -1,7 +1,7 @@
 // para.db.reactive — the OPT-IN reactive layer over the repository (aether DB5).
 //
 // Reactivity is a choice, not a tax: the plain `Repository` (para.db.repo) stays non-reactive and
-// zero-overhead. When you want the UI to track the database, you wrap it in a `LiveRepository` — its
+// zero-overhead. When you want the UI to track the database, you reach for a `LiveRepository` — its
 // `all()` is a reactive `std.reactive` query that re-runs whenever the table changes, and its
 // mutations notify so dependents wake. Internally it composes `db.watch` (a node in the reactive
 // graph over the table's NOTIFY channel) with a plain repository — no new runtime, and the same
@@ -22,32 +22,32 @@ use para.db.{Connection, Watch}
 use db.repo.Repository
 use std.reactive.computed
 
-// A live, reactive repository over one model + table. Opt in by wrapping a plain `Repository<T>`.
-// Reads become reactive queries; writes stage through the same unit-of-work and notify.
+// A live, reactive repository over one model + table — a plain `Repository<T>` plus the reactive
+// edges. Reads become reactive queries; writes stage through the same unit-of-work and notify.
 pub class LiveRepository<T> {
     repo: Repository<T>
     conn: Connection
     watch: Watch // over the table's NOTIFY channel
     channel: string // the NOTIFY channel (the table name)
 
-    // Wrap a plain repository and a connection:
+    // Name the model, the table, the primary key and the connection:
     //
-    //   users: Repository<User> = Repository.new("users", "id")
-    //   live: LiveRepository<User> = LiveRepository.new(users, conn)
+    //   live: LiveRepository<User> = LiveRepository.new("users", "id", conn)
     //
-    // The repository comes in already built because the model rides on ITS instantiation, and a
-    // type argument is recorded only where it is concrete — `Repository<T>` built here, with `T`
-    // still a parameter, would carry nothing for `type_name::<T>()` to read. Wrapping is also what
-    // the layer means: the plain repository keeps doing the mapping and the unit of work, and this
-    // adds the reactive edges around it.
+    // The inner `Repository<T>` is built here, from this instance's own `T`: an instance records its
+    // type arguments at construction, and a generic type constructing another generic from its own
+    // parameter passes them along, so the repository behind a `LiveRepository<User>` is a real
+    // `Repository<User>` and resolves the model exactly as a hand-built one does. The layering is
+    // unchanged — the plain repository still does the mapping and the unit of work, and this adds the
+    // reactive edges around it — but a caller no longer assembles it in two steps.
     //
-    // The NOTIFY channel is the repository's table; the watch listens on it immediately.
-    fn new(repo: Repository<T>, conn: Connection): LiveRepository<T> {
+    // The NOTIFY channel is the table; the watch listens on it immediately.
+    fn new(tbl: string, pk: string, conn: Connection): LiveRepository<T> {
         return LiveRepository {
-            repo: repo,
+            repo: Repository.new(tbl, pk),
             conn: conn,
-            watch: db.watch(conn, repo.tbl),
-            channel: repo.tbl,
+            watch: db.watch(conn, tbl),
+            channel: tbl,
         }
     }
 
@@ -55,9 +55,8 @@ pub class LiveRepository<T> {
     // watch wakes). Read it in an `effect`, or hand it to a LiveView `view.expose(...)`. The DB read
     // itself is not a reactive dependency; the `watch` is what invalidates it.
     //
-    // `dyn` is the reactive HANDLE's own type (what `computed` answers), not a model-typing gap. What
-    // reading it yields is whatever `Repository.all` yields — `List<dyn>` today, `List<T>` when the
-    // read surface can be typed (see the `Repository` module header), with nothing to change here.
+    // `dyn` is the reactive HANDLE's own type (what `computed` answers), not a model-typing gap:
+    // reading it yields what `Repository.all` yields, a `List<T>`.
     fn all(): dyn {
         w = self.watch
         r = self.repo

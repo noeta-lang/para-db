@@ -164,11 +164,11 @@ Foreign keys are emitted on both backends, but **SQLite only enforces them when 
 
 ## Repository & unit of work — typed models, batched writes
 
-`para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and **the model is the repository's type argument** — `Repository<User>` over its table and its primary-key column. The decode registry rows map through is keyed by name, and the repository reads that name off its own instantiation: an instance records its type arguments at construction, so `type_name::<T>()` inside a method answers the **qualified** identity the registry holds. A model under a `namespace` therefore needs no hand-written `"app.storage.User"`, and renaming or moving it cannot silently desynchronize the mapping. The annotation is load-bearing — `users: Repository<User> = Repository.new(…)` is what records the instantiation, and a repository built where the instantiation is not concrete aborts on its first mapped row rather than guessing.
+`para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and **the model is the repository's type argument** — `Repository<User>` over its table and its primary-key column. The decode registry rows map through is keyed by name, and the repository reads that name off its own instantiation: an instance records its type arguments at construction, so `type_name::<T>()` inside a method answers the **qualified** identity the registry holds. A model under a `namespace` therefore needs no hand-written `"app.storage.User"`, and renaming or moving it cannot silently desynchronize the mapping. The annotation is load-bearing — `users: Repository<User> = Repository.new(…)` is what records the instantiation, and a repository built where the instantiation is not concrete aborts on its first mapped row rather than guessing. **A caller never casts**: both directions of the mapping are typed as the model.
 
 Writes are the **unit of work**, and they are **typed as the model**: `add(entity: T)` / `save(entity: T)` *stage* an insert / a by-primary-key update, `remove(id)` a delete, and `flush(conn)` commits everything staged as one batch inside a single transaction (`BEGIN` … `COMMIT`), returning the statement count — a failure before `COMMIT` leaves the batch to the transaction to undo. `discard()` drops the staged changes without touching the database. Because `T` substitutes from the receiver's instantiation, handing a `Repository<User>` anything but a `User` is a compile error at the call site (`argument of type 'Order' is not assignable to 'User'`) rather than a malformed row at flush time. `remove(id)` stays `dyn` deliberately: it takes a primary-key *value*, not a model.
 
-Reads go straight to the connection — `find(conn, id)` (`none` when absent), `all(conn)`, and `where(conn, col, op, value)`, each mapped to the model. They are still typed `?dyn` / `List<dyn>`, so a caller narrows a result with `.as<User>()`. That asymmetry is a **toolchain limitation, not a design choice**: rows arrive from the name-keyed `json.decode_typed`, which answers `dyn`, and inside a method of a generic class there is currently no `dyn` → `T` conversion — `.as<T>()` compiles but matches nothing at run time (the narrow keys on the type's runtime *name*, and `T` reaches it as the literal letter `T`), `some(v)` into a `?T` is `E0007`, and `json.parse::<T>` is `E0058` because the receiver's type tag carries the instantiation's name but no build recipe. The values really are `User`s on the heap; only the checker's judgment of them is missing. The reads become `?T` / `List<T>` — and the `.as<>()` at each call site disappears — as soon as `.as<T>()` reads the instantiation off the receiver the way `type_name::<T>()` already does.
+Reads go straight to the connection and **answer the model too**: `find(conn, id)` is a `?User` (`none` when there is no such row), `all(conn)` and `where(conn, col, op, value)` are a `List<User>`. The mapping is entirely inside the repository — the row is decoded through the name-keyed registry and narrowed back to `T` with `.as<T>()`, both read off the receiver's own instantiation — so no caller narrows a read. A row that does not decode to the model is dropped: `find` answers `none`, `all`/`where` skip it. That is the price of a typed read surface, and the alternative is worse — every caller re-narrowing every row to discover the same thing.
 
 ```noeta
 use para.db
@@ -193,12 +193,9 @@ users.save(User { id: 2, name: "Bob", age: 42 })    // stage an UPDATE by primar
 users.remove(1)                                     // stage a DELETE (a key value, not a model)
 users.flush(conn)
 
-// Reads still answer `dyn` rows — narrow one to the model (see the note above on why).
-for row in users.where(conn, "age", ">", 18) {
-    match row.as<User>() {
-        some(u) => echo "${u.name}",
-        none => echo "<malformed row>",
-    }
+// Reads answer the model — `where` is a `List<User>`, so there is nothing to narrow.
+for u in users.where(conn, "age", ">", 18) {
+    echo "${u.name}"
 }
 ```
 
@@ -379,13 +376,11 @@ An unrecognized `sslmode` value is a clear error before any connection is attemp
 
 ```noeta
 use para.db
-use para.db.repo.Repository
 use para.db.reactive.LiveRepository
 use std.reactive.effect
 
 conn = db.connect("sqlite::memory:")           // or postgres://…
-repo: Repository<User> = Repository.new("users", "id")
-users: LiveRepository<User> = LiveRepository.new(repo, conn)
+users: LiveRepository<User> = LiveRepository.new("users", "id", conn)
 
 live = users.all()                             // a reactive query (a computed)
 effect(fn() {
@@ -397,7 +392,7 @@ users.flush()                                  // commit + notify
 users.pump()                                   // deliver notifications → the effect re-runs
 ```
 
-`LiveRepository<T>` wraps a plain `Repository<T>` with three additions: `all()` returns a reactive query, `flush()` notifies after committing, and `pump()` (called from your loop, e.g. the serve loop) delivers pending change notifications and wakes the reactive graph. Under the hood it composes `db.watch(conn, channel)` — a reactive source node over a change-notification channel — with a plain repository. It takes that repository already constructed, which is both the layering (the plain repository keeps doing the mapping and the unit of work) and a requirement: a type argument is recorded where it is concrete, so a `Repository<T>` built inside `LiveRepository<T>.new` would carry no model for `type_name::<T>()` to read. The source is also usable directly: a `computed` that reads `watch.get()` and re-queries the table re-runs whenever a fired notification is pumped in with `watch.pump()` (see `watch_demo.noe`).
+`LiveRepository<T>` is a plain `Repository<T>` plus three additions: `all()` returns a reactive query, `flush()` notifies after committing, and `pump()` (called from your loop, e.g. the serve loop) delivers pending change notifications and wakes the reactive graph. Under the hood it composes `db.watch(conn, channel)` — a reactive source node over a change-notification channel — with a repository it builds itself: `LiveRepository.new(tbl, pk, conn)` takes the same table and primary key the plain constructor does, and the inner `Repository<T>` inherits this instance's `T`, so it resolves the model exactly as a hand-built one would. The layering is unchanged — the plain repository still does the mapping and the unit of work. The source is also usable directly: a `computed` that reads `watch.get()` and re-queries the table re-runs whenever a fired notification is pumped in with `watch.pump()` (see `watch_demo.noe`).
 
 **How far a change propagates depends on the driver:**
 

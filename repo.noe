@@ -3,38 +3,28 @@
 //
 // A `Repository<T>` maps rows (a `Map<string, dyn>` per row) to and from typed model structs by
 // reflection over JSON:
-//   * row -> model:  `json.decode_typed(model_name, json.stringify(row))`, where the model derives
-//                    `@derive(Deserialize<Json>)`.
+//   * row -> model:  `json.decode_typed(model_name, json.stringify(row))` narrowed back to `T`,
+//                    where the model derives `@derive(Deserialize<Json>)`.
 //   * model -> row:  `json.parse(entity.to_json())` (a `Map<string, dyn>` whose keys are the
 //                    columns), where the model derives `@derive(Serialize<Json>)`.
-// The decode registry is keyed by NAME, and `Repository<T>` reads that name off its own
-// instantiation: an instance records its type arguments at construction, so `type_name::<T>()`
-// inside a method resolves to the qualified identity the registry holds.
+// Both halves read the type argument off the instance: an instance records its type arguments at
+// construction, so `type_name::<T>()` inside a method answers the qualified identity the name-keyed
+// decode registry holds, and `.as<T>()` in the same position narrows the decoded value back to the
+// model. The entire mapping therefore lives inside the repository, and NO caller casts.
 //
 // The unit-of-work is the advanced feature: `add`/`save`/`remove` STAGE inserts/updates/deletes
 // during a request; `flush` commits them as one batch inside a single transaction (BEGIN … COMMIT),
 // then clears the pending lists. Reads (`find`/`all`/`where`) go straight to the connection.
 //
-// The WRITE surface is typed as the model: `add(entity: T)` / `save(entity: T)` and the staging lists
-// are `List<T>`, so handing a repository the wrong model is a compile error at the call site rather
-// than a malformed row at flush time. `T` substitutes from the receiver's instantiation, so
-// `Repository<User>.add(Order { … })` is an E0007 naming both types.
+// Both surfaces are typed as the model. Writes take it — `add(entity: T)` / `save(entity: T)`, staged
+// into `List<T>` — so handing a repository the wrong model is an E0007 at the call site rather than a
+// malformed row at flush time. Reads answer it: `find` -> `?T`, `all`/`where` -> `List<T>`.
+// `remove(id: dyn)` is the one `dyn` on this class, on purpose: it takes a primary-key VALUE, not a
+// model, and a key's type is not the repository's type argument.
 //
-// The READ surface is still `dyn` (`find` -> `?dyn`, `all`/`where` -> `List<dyn>`), and callers still
-// narrow with `.as<Model>()`. That is NOT the intended shape — it is a toolchain limitation. Rows
-// arrive from `json.decode_typed`, which is keyed by NAME and answers `dyn`, so typing the reads as
-// `T` needs a `dyn` -> `T` conversion inside a method of a generic class, and today there is none:
-//   * `.as<T>()` compiles but answers `none` at RUN TIME for every value — the narrow is a
-//     head-constructor match on the type's runtime NAME, and `T` reaches it as the literal one
-//     character `T`, matching nothing. There is no diagnostic; the read simply comes back empty.
-//     `v is T` is `false` the same way.
-//   * `return v` / `some(v)` from a `dyn` into a `T`/`?T` position is E0007.
-//   * `json.parse::<T>` / `json.try_parse::<T>` is E0058: the receiver's type tag records the
-//     instantiation's NAME but no build recipe, so a call-site-typed decode cannot forward it.
-// Nothing here is a naming problem the package can route around: the value on the heap really is a
-// `T`, and only the checker's judgment of it is missing. The reads flip to `T` — and the `.as<>()`
-// at every call site goes away — the moment `.as<T>()` reads the instantiation name off the receiver
-// the way `type_name::<T>()` already does. Until then the honest signature is `dyn`.
+// A row that does not decode to a `T` is DROPPED rather than handed back untyped — `find` answers
+// `none`, `all`/`where` skip it. That is what a typed read surface costs, and it is worth it: the
+// alternative makes every caller re-narrow every row to find out.
 
 use para.db.Connection
 use db.query.{table, run, exec, Query}
@@ -50,7 +40,7 @@ use std.json
 // runtime identity — the key the JSON decode registry holds. A model declared under a `namespace`
 // therefore needs no hand-written `"app.storage.User"`, and a rename cannot desynchronize it.
 pub class Repository<T> {
-    pub tbl: string // the backing table (the reactive layer reads it for its NOTIFY channel)
+    pub tbl: string // the backing table (also a NOTIFY channel name, for the reactive layer)
     pub pk: string // the primary-key column
     mut model_name: string // memo of `type_name::<T>()` — empty until the first `model()`
     mut pending_new: List<T> // staged inserts (whole entities)
@@ -80,50 +70,55 @@ pub class Repository<T> {
 
     // --- Reads -------------------------------------------------------------------------------
 
-    // Map one query row (`column -> value`) to the model: round-trip the row through JSON into the
-    // model by its runtime name. On a decode error the row is malformed — return it as-is (still a
-    // `dyn`) rather than aborting the whole read.
+    // Map one query row (`column -> value`) to the model: round-trip the row through JSON by the
+    // model's runtime name, then narrow the decoded value back to `T`. `none` means the row is not a
+    // `T` — the decode failed, or it produced something else — and the caller sees a missing row
+    // rather than an untyped one.
     //
-    // Answers `dyn`, not `T`, for the reason the module header records: the decode is name-keyed and
-    // there is no `dyn` -> `T` conversion available inside a method of a generic class. The value it
-    // returns IS a `T` whenever the decode succeeded; only the static type says otherwise.
-    fn map_row(row: Map<string, dyn>): dyn {
+    // This is where both halves of the type argument meet, and both are read off this repository's own
+    // instantiation: `type_name::<T>()` supplies the registry key, `.as<T>()` recovers the static
+    // type. Nothing above this line ever narrows a row again.
+    fn map_row(row: Map<string, dyn>): ?T {
         return match json.decode_typed(self.model(), json.stringify(row)) {
-            Ok(v) => v,
-            Err(e) => row,
+            Ok(v) => v.as<T>(),
+            Err(e) => none,
         }
     }
 
+    // Map a batch of query rows to the model, skipping any row that is not a `T` (see `map_row`).
+    fn map_rows(rows: List<Map<string, dyn>>): List<T> {
+        mut out: List<T> = []
+        for r in rows {
+            match self.map_row(r) {
+                some(v) => {
+                    out = out ~ [v]
+                },
+                none => {},
+            }
+        }
+        return out
+    }
+
     // Find one row by primary key, mapped to the model; `none` if there is no such row.
-    fn find(conn: Connection, id: dyn): ?dyn {
+    fn find(conn: Connection, id: dyn): ?T {
         q = table(self.tbl).filter(self.pk, "=", id).limit(1).select("*")
         rows = run(conn, q)
         if rows.len() == 0 {
             return none
         }
-        return some(self.map_row(rows[0]))
+        return self.map_row(rows[0])
     }
 
     // Every row in the table, mapped to the model.
-    fn all(conn: Connection): List<dyn> {
+    fn all(conn: Connection): List<T> {
         q = table(self.tbl).select("*")
-        rows = run(conn, q)
-        mut out: List<dyn> = []
-        for r in rows {
-            out = out ~ [self.map_row(r)]
-        }
-        return out
+        return self.map_rows(run(conn, q))
     }
 
     // Rows matching `col <op> value`, mapped to the model (reuses the DB1 builder's `filter`).
-    fn where(conn: Connection, col: string, op: string, value: dyn): List<dyn> {
+    fn where(conn: Connection, col: string, op: string, value: dyn): List<T> {
         q = table(self.tbl).filter(col, op, value).select("*")
-        rows = run(conn, q)
-        mut out: List<dyn> = []
-        for r in rows {
-            out = out ~ [self.map_row(r)]
-        }
-        return out
+        return self.map_rows(run(conn, q))
     }
 
     // --- Unit of work: stage changes now, flush them as one batch later. ---------------------
