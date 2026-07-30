@@ -22,9 +22,18 @@
 // `remove(id: dyn)` is the one `dyn` on this class, on purpose: it takes a primary-key VALUE, not a
 // model, and a key's type is not the repository's type argument.
 //
-// A row that does not decode to a `T` is DROPPED rather than handed back untyped — `find` answers
-// `none`, `all`/`where` skip it. That is what a typed read surface costs, and it is worth it: the
-// alternative makes every caller re-narrow every row to find out.
+// A row that does not decode to a `T` ABORTS the program, naming the model, the table, the column and
+// the types that disagree. It is never dropped and never handed back untyped. Once the driver presents
+// each column as its declared type (a `BOOLEAN` column is a `bool`, not SQLite's stored 0/1), a row
+// that still will not decode means the TABLE and the MODEL genuinely disagree — a migration that did
+// not run, or a deployment carrying a model the schema has never matched. That is a defect the
+// developer has to see, and the shortened list it used to produce (`find` answering `none`,
+// `all`/`where` quietly returning fewer rows than the table holds) is indistinguishable from a
+// correct empty answer. A plausible wrong answer travelling silently is worse than a loud stop, so
+// the read surface stays `List<T>`/`?T` — `none` means "no such row" and nothing else — and the
+// disagreement is reported where it happens. `try_map_row` is the recoverable twin, for the caller who
+// reads a table it does not own — the standard aborting/recoverable door pair, identical message on
+// both halves.
 
 use para.db.Connection
 use db.query.{table, run, exec, Query}
@@ -70,43 +79,72 @@ pub class Repository<T> {
 
     // --- Reads -------------------------------------------------------------------------------
 
-    // Map one query row (`column -> value`) to the model: round-trip the row through JSON by the
-    // model's runtime name, then narrow the decoded value back to `T`. `none` means the row is not a
-    // `T` — the decode failed, or it produced something else — and the caller sees a missing row
-    // rather than an untyped one.
+    // Map one query row (`column -> value`) to the model, **recoverably**: round-trip the row through
+    // JSON by the model's runtime name, then narrow the decoded value back to `T`. `Err(message)` is a
+    // row the model cannot account for, and the message is the whole diagnosis (see `mismatch`).
     //
-    // This is where both halves of the type argument meet, and both are read off this repository's own
-    // instantiation: `type_name::<T>()` supplies the registry key, `.as<T>()` recovers the static
+    // This is the recoverable half of the [aborting/recoverable door pair] with `map_row`, for the one
+    // caller that legitimately reads a table it does not own and wants to decide for itself. The read
+    // surface (`find`/`all`/`where`) goes through the aborting half, because for the app that owns both
+    // the model and the migrations a row that will not decode is a deployment defect, not a condition.
+    //
+    // This is also where both halves of the type argument meet, and both are read off this repository's
+    // own instantiation: `type_name::<T>()` supplies the registry key, `.as<T>()` recovers the static
     // type. Nothing above this line ever narrows a row again.
-    fn map_row(row: Map<string, dyn>): ?T {
-        return match json.decode_typed(self.model(), json.stringify(row)) {
-            Ok(v) => v.as<T>(),
-            Err(e) => none,
+    fn try_map_row(row: Map<string, dyn>): Result<T, string> {
+        text = json.stringify(row)
+        return match json.decode_typed(self.model(), text) {
+            Ok(v) => match v.as<T>() {
+                some(model) => Ok(model),
+                none => Err(
+                    self.mismatch(text, "it decoded to a `${type_of(v)}`, which is not the model"),
+                ),
+            },
+            // The decoder's own message already names the offending column and the expected-vs-found
+            // types (`done: expected bool, found JSON number`) — carry it through rather than discard
+            // it, since it is the whole diagnosis.
+            Err(e) => Err(self.mismatch(text, e.message())),
         }
     }
 
-    // Map a batch of query rows to the model, skipping any row that is not a `T` (see `map_row`).
+    // Map one query row to the model, **aborting** if it does not decode — the aborting half of the
+    // pair, and what every read goes through. Both halves report the identical message; this one just
+    // stops the program with it instead of handing it back.
+    fn map_row(row: Map<string, dyn>): T {
+        return match self.try_map_row(row) {
+            Ok(model) => model,
+            Err(message) => panic(message),
+        }
+    }
+
+    // The message for a row the model cannot account for: the table, the model, the decoder's own
+    // column-and-types detail, and the row itself — everything needed to see which side is wrong
+    // without reproducing the read.
+    fn mismatch(row_json: string, detail: string): string {
+        which = "a row of table `${self.tbl}` does not decode to the model `${self.model()}`"
+        blame = "The table and the model disagree"
+        return "para.db: ${which} — ${detail}. ${blame}; the row was ${row_json}"
+    }
+
+    // Map a batch of query rows to the model. Every row is mapped: the returned list is always as long
+    // as the query's, and a row that is not a `T` aborts rather than shortening it (see `map_row`).
     fn map_rows(rows: List<Map<string, dyn>>): List<T> {
         mut out: List<T> = []
         for r in rows {
-            match self.map_row(r) {
-                some(v) => {
-                    out = out ~ [v]
-                },
-                none => {},
-            }
+            out = out ~ [self.map_row(r)]
         }
         return out
     }
 
-    // Find one row by primary key, mapped to the model; `none` if there is no such row.
+    // Find one row by primary key, mapped to the model. `none` means there is no such row — and only
+    // that: a row that exists but does not decode aborts instead of impersonating a missing one.
     fn find(conn: Connection, id: dyn): ?T {
         q = table(self.tbl).filter(self.pk, "=", id).limit(1).select("*")
         rows = run(conn, q)
         if rows.len() == 0 {
             return none
         }
-        return self.map_row(rows[0])
+        return some(self.map_row(rows[0]))
     }
 
     // Every row in the table, mapped to the model.

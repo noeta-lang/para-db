@@ -1,0 +1,247 @@
+// Column types across the driver seam (DB0/DB2): what a `Repository<T>` gets when the table's column
+// types and the model's field types have to line up.
+//
+//   noeta run  examples/para-db-demo/types_demo.noe
+//   noeta test examples/para-db-demo/types_demo.noe
+//
+// SQLite has five storage classes — NULL, INTEGER, REAL, TEXT, BLOB — and **no boolean** among them:
+// `done BOOLEAN` stores `true` as the integer `1`. The driver reads the column's DECLARED type and
+// hands a real `bool` back, so a model with a `bool` field decodes. Without that recovery the row is
+// JSON `{"done":1}`, `done: bool` cannot decode a number, and the read answers *nothing* — which is
+// what this demo (and its tests) exist to keep from coming back.
+//
+// The second half is the other side of the same coin: when a table and a model genuinely disagree, the
+// read says so. It does not quietly return fewer rows than the table holds.
+use para.db
+use para.db.repo.Repository
+use std.base64
+use std.json
+
+// A model with a `bool` field — the shape every todo app has, and the one no other demo here had.
+@derive(Serialize<Json>, Deserialize<Json>)
+struct Todo {
+    id: int
+    title: string
+    done: bool
+}
+
+// Floats and blobs: a `DECIMAL` column keeps an integral value integral (NUMERIC affinity), so the
+// driver widens it to the `float` the declaration promised.
+@derive(Serialize<Json>, Deserialize<Json>)
+struct Priced {
+    id: int
+    price: float
+}
+
+// Open a fresh in-memory database with the todo table, seeded through the repository's own write path.
+fn open_todos(): Connection {
+    conn = db.connect("sqlite::memory:")
+    conn.execute(
+        "CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT, done BOOLEAN NOT NULL)",
+        [],
+    )
+    return conn
+}
+
+conn = open_todos()
+todos: Repository<Todo> = Repository.new("todos", "id")
+
+// --- The round trip: write booleans through the unit of work, read them back as booleans. ----------
+todos.add(Todo { id: 1, title: "write the driver", done: true })
+todos.add(Todo { id: 2, title: "read it back", done: false })
+todos.flush(conn)
+
+echo "raw row: ${json.stringify(conn.query("SELECT * FROM todos WHERE id = 1", [])[0])}"
+
+everyone = todos.all(conn)
+echo "all() -> ${everyone.len()} todos"
+for t in everyone {
+    echo "  #${t.id} ${t.title} done=${t.done}"
+}
+
+// --- A genuine disagreement is reported, not silently skipped. --------------------------------------
+// `done` is declared TEXT here and holds `'yes'`, so no honest driver can present it as a boolean —
+// the table and the model really do disagree.
+bad = db.connect("sqlite::memory:")
+bad.execute("CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT, done TEXT)", [])
+bad.execute("INSERT INTO todos VALUES (1, 'mismatched', 'yes')", [])
+bad_todos: Repository<Todo> = Repository.new("todos", "id")
+
+// `bad_todos.all(bad)` would ABORT with exactly this message. The recoverable door hands it back
+// instead, which is the only reason this demo can print it and keep going.
+row = bad.query("SELECT * FROM todos", [])[0]
+match bad_todos.try_map_row(row) {
+    Ok(t) => {
+        echo "unexpectedly decoded #${t.id}"
+    },
+    Err(message) => {
+        echo "mismatch reported: ${message}"
+    },
+}
+
+conn.close()
+bad.close()
+
+@test {
+    // --- Bug: a `bool` field made every read answer nothing (SQLite stores a boolean as 0/1) -------
+
+    fn a_boolean_column_reads_back_as_a_boolean(): void {
+        conn = open_todos()
+        conn.execute("INSERT INTO todos VALUES (1, 'ok', 1), (2, 'nope', 0)", [])
+        repo: Repository<Todo> = Repository.new("todos", "id")
+
+        // The row count is the regression: this was 0 while the table held two rows.
+        all = repo.all(conn)
+        assert(all.len() == 2, "expected both rows, got ${all.len()}")
+        assert(all[0].done, "row 1 stores 1 and must read back as `true`")
+        assert(all[1].done == false, "row 2 stores 0 and must read back as `false`")
+        conn.close()
+    }
+
+    fn a_boolean_survives_the_repositorys_own_write_path(): void {
+        // The round trip: `Serialize<Json>` -> the INSERT's bound parameter -> the column -> the row ->
+        // `Deserialize<Json>`. A gap anywhere in that chain and the value comes back wrong.
+        conn = open_todos()
+        repo: Repository<Todo> = Repository.new("todos", "id")
+        repo.add(Todo { id: 7, title: "round trip", done: true })
+        repo.add(Todo { id: 8, title: "round trip", done: false })
+        assert(repo.flush(conn) == 2)
+
+        seven = repo.find(conn, 7)
+        assert(match seven {
+            some(t) => t.done,
+            none => false,
+        }, "a `true` written through the repository must read back `true`")
+        eight = repo.find(conn, 8)
+        assert(match eight {
+            some(t) => t.done == false,
+            none => false,
+        }, "a `false` written through the repository must read back `false`")
+
+        // …and an UPDATE through the unit of work carries the flip.
+        repo.save(Todo { id: 7, title: "round trip", done: false })
+        repo.flush(conn)
+        assert(match repo.find(conn, 7) {
+            some(t) => t.done == false,
+            none => false,
+        }, "a flipped boolean must persist")
+        conn.close()
+    }
+
+    fn the_raw_row_surface_carries_a_real_boolean_too(): void {
+        // Not just the repository: `conn.query` itself hands back a `bool`, so a caller mapping rows by
+        // hand is not left inspecting SQLite's storage class either.
+        conn = open_todos()
+        conn.execute("INSERT INTO todos VALUES (1, 'ok', 1)", [])
+        row = conn.query("SELECT done FROM todos", [])[0]
+        done = row["done"]
+        assert(done is bool, "a BOOLEAN column is a `bool`, not an `int`; got ${type_of(done)}")
+        assert(json.stringify(row) == "{\"done\":true}", json.stringify(row))
+        conn.close()
+    }
+
+    fn a_declared_real_column_reads_as_a_float_even_when_it_stores_an_integer(): void {
+        // NUMERIC affinity keeps `3` an INTEGER in a DECIMAL column, so the raw surface used to hand a
+        // `float` field an `int`.
+        conn = db.connect("sqlite::memory:")
+        conn.execute("CREATE TABLE priced (id INTEGER PRIMARY KEY, price DECIMAL(10,2))", [])
+        conn.execute("INSERT INTO priced VALUES (1, 3), (2, 4.5)", [])
+        price = conn.query("SELECT price FROM priced WHERE id = 1", [])[0]["price"]
+        assert(price is float, "a DECIMAL column is a `float`; got ${type_of(price)}")
+
+        repo: Repository<Priced> = Repository.new("priced", "id")
+        rows = repo.all(conn)
+        assert(rows.len() == 2)
+        assert(rows[0].price == 3.0, "${rows[0].price}")
+        assert(rows[1].price == 4.5, "${rows[1].price}")
+        conn.close()
+    }
+
+    fn a_blob_column_crosses_as_bytes_and_is_never_decoded_as_text(): void {
+        // `ff 00 fe 68 69` — not valid UTF-8, so decoding it as text would replace the first three
+        // bytes with U+FFFD and the data would be gone. Written as a SQLite blob literal rather than a
+        // bound `bytes` value: a `bytes` bind cannot reach a native `List<dyn>` argument in this
+        // toolchain (the deep-marshal projection renders it as the summary string `<5 bytes>`), which
+        // is a toolchain gap, not this driver's — the driver's own bind path is covered by the Rust
+        // test `a_blob_crosses_as_bytes_and_is_never_decoded_as_text`.
+        expected = match base64.decode("/wD+aGk=") {
+            Ok(b) => b,
+            Err(e) => panic(e.message()),
+        }
+        conn = db.connect("sqlite::memory:")
+        conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB)", [])
+        conn.execute("INSERT INTO files VALUES (1, x'FF00FE6869')", [])
+        data = conn.query("SELECT data FROM files", [])[0]["data"]
+        assert(data is bytes, "a BLOB column is `bytes`; got ${type_of(data)}")
+        assert(data == expected, "binary column data must survive byte for byte")
+        conn.close()
+    }
+
+    // --- Bug: a row that did not decode was DROPPED, so a wrong answer travelled silently ----------
+
+    fn a_genuine_mismatch_is_reported_rather_than_dropped(): void {
+        // `done` is TEXT holding `'yes'` — no driver can honestly call that a boolean, so this is the
+        // real "the table and the model disagree" case that must be loud.
+        conn = db.connect("sqlite::memory:")
+        conn.execute("CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT, done TEXT)", [])
+        conn.execute("INSERT INTO todos VALUES (1, 'mismatched', 'yes')", [])
+        repo: Repository<Todo> = Repository.new("todos", "id")
+
+        row = conn.query("SELECT * FROM todos", [])[0]
+        message = match repo.try_map_row(row) {
+            Ok(t) => "",
+            Err(m) => m,
+        }
+        // `all()`/`find()` abort with this exact message; the recoverable door is what makes the
+        // reporting itself assertable.
+        assert(message != "", "a row the model cannot account for must be reported, not dropped")
+        assert(message.contains("todos"), "names the table: ${message}")
+        assert(message.contains("Todo"), "names the model: ${message}")
+        assert(message.contains("done"), "names the offending column: ${message}")
+        assert(message.contains("expected bool"), "names the expected type: ${message}")
+        assert(message.contains("found JSON string"), "names the found type: ${message}")
+        // The row itself rides along, so the defect is diagnosable without reproducing the read.
+        assert(message.contains("\"done\":\"yes\""), "carries the row: ${message}")
+        conn.close()
+    }
+
+    fn a_null_in_a_non_optional_field_is_reported_too(): void {
+        // The same class, one step over: the column type agrees, the NULLability does not. A `bool`
+        // field cannot hold `none`, and that used to vanish the row as well.
+        conn = db.connect("sqlite::memory:")
+        conn.execute("CREATE TABLE todos (id INTEGER PRIMARY KEY, title TEXT, done BOOLEAN)", [])
+        conn.execute("INSERT INTO todos VALUES (1, 'no value', NULL)", [])
+        repo: Repository<Todo> = Repository.new("todos", "id")
+        message = match repo.try_map_row(conn.query("SELECT * FROM todos", [])[0]) {
+            Ok(t) => "",
+            Err(m) => m,
+        }
+        assert(message.contains("done: expected bool"), message)
+        conn.close()
+    }
+
+    fn map_row_answers_the_model_and_has_no_way_to_say_missing(): void {
+        // A structural assertion, checked rather than run: `map_row` answers `T`, so it has no `none`
+        // to hand back and the silent drop is not expressible in it. Were it `?T` again, `.done` below
+        // would not check.
+        conn = open_todos()
+        conn.execute("INSERT INTO todos VALUES (1, 'ok', 1)", [])
+        repo: Repository<Todo> = Repository.new("todos", "id")
+        mapped = repo.map_row(conn.query("SELECT * FROM todos", [])[0])
+        assert(mapped.done)
+        conn.close()
+    }
+
+    fn a_missing_row_is_still_just_a_missing_row(): void {
+        // The other half of the contract: now that a decode failure aborts, `none` from `find` means
+        // "no such row" and nothing else.
+        conn = open_todos()
+        repo: Repository<Todo> = Repository.new("todos", "id")
+        assert(match repo.find(conn, 404) {
+            some(t) => false,
+            none => true,
+        }, "an absent primary key is `none`")
+        assert(repo.all(conn).len() == 0, "an empty table is an empty list")
+        conn.close()
+    }
+}
