@@ -48,7 +48,7 @@ rows = query(conn, @sql { SELECT * FROM users WHERE id > ${min_id} })
 echo rows.len()
 ```
 
-A `${…}` hole in an `@sql { … }` block is **always a bound parameter**: the block evaluates to a `Sql` value — the statement `text` with `?` placeholders plus its `params` in hole order — so a statement built from untrusted input carries no injection risk by construction. `query(conn, stmt)` runs it as a query; its sibling `execute(conn, stmt)` runs a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected. A bound parameter is a scalar — `int`, `float`, `bool`, `string`, or `none` (SQL `NULL`) — and a row comes back as a `Map<string, dyn>` keyed by column name, with `NULL` as `none`. Transactions are ordinary statements: `conn.execute("BEGIN", [])` / `"COMMIT"` / `"ROLLBACK"`.
+A `${…}` hole in an `@sql { … }` block is **always a bound parameter**: the block evaluates to a `Sql` value — the statement `text` with `?` placeholders plus its `params` in hole order — so a statement built from untrusted input carries no injection risk by construction. `query(conn, stmt)` runs it as a query; its sibling `execute(conn, stmt)` runs a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected. A bound parameter is a scalar — `int`, `float`, `bool`, `string`, `bytes`, or `none` (SQL `NULL`) — and a row comes back as a `Map<string, dyn>` keyed by column name, with `NULL` as `none` and every other column carrying the value kind its **declared type** promised (see [column types across the driver seam](#column-types-across-the-driver-seam)). Transactions are ordinary statements: `conn.execute("BEGIN", [])` / `"COMMIT"` / `"ROLLBACK"`.
 
 **Swapping drivers is the dsn.** Everything above the driver — this raw surface, the query builder, the repository, `@sql`, migrations — runs unchanged over SQLite or PostgreSQL: `postgres_demo.noe` is `demo.noe` with only the connection string changed. The neutral `?` placeholders are rewritten to Postgres's `$1, $2, …` by the driver.
 
@@ -149,7 +149,7 @@ Identifiers are **validated, never quoted**: letters, digits, and underscores, s
 
 The DSL covers what lowers to genuinely equivalent DDL on both backends. Everything else is left to a raw `.sql` migration rather than approximated — a `jsonb` column silently becoming SQLite `TEXT` would compile and then behave differently, which is worse than not offering it. Out of scope, by design:
 
-- **Types with no honest counterpart** — `uuid`, `json`/`jsonb`, `bytea`/`blob`, and exact `decimal`. (SQLite has no exact-decimal type at all; `NUMERIC(10,2)` there is an affinity hint over a float.) The neutral value surface is `int` / `float` / `bool` / `string` / `null`, and the DSL offers only column types that round-trip through it.
+- **Types with no honest counterpart** — `uuid`, `json`/`jsonb`, `bytea`/`blob`, and exact `decimal`. (SQLite has no exact-decimal type at all; `NUMERIC(10,2)` there is an affinity hint over a float.) The neutral value surface is `int` / `float` / `bool` / `string` / `bytes` / `null`, and the DSL offers only column types that round-trip through it. A blob column *reads* fine as `bytes` (below) — what the DSL will not do is pretend `bytea` and `BLOB` are one portable column type.
 - **Everything that is not a table or an index** — views, triggers, functions, sequences, extensions, schemas.
 - **Check constraints, partial and expression indexes, generated columns, `DROP … CASCADE`.**
 - **Arbitrary expression defaults.** Only literals and `CURRENT_TIMESTAMP`.
@@ -158,7 +158,7 @@ The DSL covers what lowers to genuinely equivalent DDL on both backends. Everyth
 Two portability facts the DSL surfaces rather than hides:
 
 - **`ALTER TABLE ADD COLUMN` is much narrower on SQLite than on Postgres.** Adding a `not_null` column without a `default(…)`, a `unique()` or `primary_key()` column, a column whose default is `default_now()`, or an identity column are all **rejected at parse time**, with a message naming the portable alternative (for uniqueness: add the column, then `create_index(…).unique()`). Emitting DDL that works on Postgres and fails on SQLite would make a "portable" migration backend-dependent.
-- **A `bool` column reads back differently.** SQLite has no boolean storage class, so it comes back as `0`/`1`; Postgres returns `true`/`false`. That is the existing driver value mapping, not something the schema layer can paper over. Likewise a `TIMESTAMP` column must be selected as `CAST(col AS TEXT)` on Postgres to cross the neutral row surface — the migration engine's own tracking-table read does exactly that.
+- **A `TIMESTAMP` column must be selected as `CAST(col AS TEXT)` on Postgres** to cross the neutral row surface — the migration engine's own tracking-table read does exactly that. A `bool` column, by contrast, needs no such care on either backend: see [column types across the driver seam](#column-types-across-the-driver-seam).
 
 Foreign keys are emitted on both backends, but **SQLite only enforces them when `PRAGMA foreign_keys = ON`** is set on the connection (it is off by default). The clause is still worth writing: it documents the relationship and is enforced by Postgres.
 
@@ -168,7 +168,32 @@ Foreign keys are emitted on both backends, but **SQLite only enforces them when 
 
 Writes are the **unit of work**, and they are **typed as the model**: `add(entity: T)` / `save(entity: T)` *stage* an insert / a by-primary-key update, `remove(id)` a delete, and `flush(conn)` commits everything staged as one batch inside a single transaction (`BEGIN` … `COMMIT`), returning the statement count — a failure before `COMMIT` leaves the batch to the transaction to undo. `discard()` drops the staged changes without touching the database. Because `T` substitutes from the receiver's instantiation, handing a `Repository<User>` anything but a `User` is a compile error at the call site (`argument of type 'Order' is not assignable to 'User'`) rather than a malformed row at flush time. `remove(id)` stays `dyn` deliberately: it takes a primary-key *value*, not a model.
 
-Reads go straight to the connection and **answer the model too**: `find(conn, id)` is a `?User` (`none` when there is no such row), `all(conn)` and `where(conn, col, op, value)` are a `List<User>`. The mapping is entirely inside the repository — the row is decoded through the name-keyed registry and narrowed back to `T` with `.as<T>()`, both read off the receiver's own instantiation — so no caller narrows a read. A row that does not decode to the model is dropped: `find` answers `none`, `all`/`where` skip it. That is the price of a typed read surface, and the alternative is worse — every caller re-narrowing every row to discover the same thing.
+Reads go straight to the connection and **answer the model too**: `find(conn, id)` is a `?User` (`none` when — and only when — there is no such row), `all(conn)` and `where(conn, col, op, value)` are a `List<User>`. The mapping is entirely inside the repository — the row is decoded through the name-keyed registry and narrowed back to `T` with `.as<T>()`, both read off the receiver's own instantiation — so no caller narrows a read.
+
+**A row that does not decode to the model aborts the read**, with a message naming the table, the model, the offending column and the expected-vs-found types:
+
+```
+para.db: a row of table `todos` does not decode to the model `app.Todo` — done: expected bool,
+found JSON string. The table and the model disagree; the row was {"done":"yes","id":1,…}
+```
+
+Because the driver presents each column as its declared type ([below](#column-types-across-the-driver-seam)), a row that still will not decode means the **table and the model genuinely disagree** — a migration that has not run, or a deployment carrying a model the schema never matched. That is a defect to see immediately, not to work around: the alternative (skip the row) hands back a list shorter than the table, or a `find` answering `none`, and neither is distinguishable from a correct empty answer. A plausible wrong answer travelling silently is worse than a loud stop. `try_map_row(row)` is the **recoverable twin** — a `Result<T, string>` carrying the identical message — for the caller that reads a table it does not own and wants to decide for itself.
+
+### Column types across the driver seam
+
+A column value crosses as one of `int` / `float` / `bool` / `string` / `bytes` / `none`, and **each driver owes that surface an honest value kind, not the one its storage happens to use.** Postgres has a real type per kind, so every one maps directly. SQLite has only five storage classes — NULL, INTEGER, REAL, TEXT, BLOB — and **no boolean among them**: `done BOOLEAN` stores `true` as the integer `1`, and the stored class alone cannot say whether that `1` is a boolean or a count. So the SQLite driver reads each result column's **declared type** (`sqlite3_column_decltype`) and presents the value the declaration promised:
+
+| Declared | Presented as | Note |
+| --- | --- | --- |
+| `BOOLEAN` / `BOOL` | `bool` | Stored 0/1. SQLite's own affinity rules call this numeric; the declaration is what recovers the boolean. |
+| any `…INT…` | `int` | Every width is one `int` (SQLite stores an i64 regardless). |
+| `REAL`, `FLOAT`, `DOUBLE…`, `NUMERIC`, `DECIMAL…` | `float` | A `DECIMAL` column keeps an integral value *integral*, so this is where an integer is widened. |
+| `TEXT`, `VARCHAR…`, `CHAR…`, `CLOB` | `string` | |
+| `BLOB` | `bytes` | Verbatim — never decoded as UTF-8, which would silently corrupt binary data. |
+| `DATE` / `TIME` / `DATETIME` / `TIMESTAMP` | as stored | A date has three conventional encodings (ISO-8601 text, unix-epoch integer, Julian-day real) and the declaration does not say which — only the stored class distinguishes them, so it is left alone. |
+| none (an expression column, e.g. `count(*)`) | as stored | A declaration belongs to a column, not to an expression over it — so `max(done)` is an `int`, not a `bool`. |
+
+**Only lossless recoveries are applied.** An integer `7` in a `BOOLEAN` column is not a boolean and `3.5` in an `INTEGER` column is not an integer, so both pass through as stored — and the disagreement then surfaces as the decode error above, naming the column, rather than being invented away as `true` or `3`.
 
 ```noeta
 use para.db
@@ -427,7 +452,7 @@ For **other editors** (or a custom setup), `@sql { … }` bodies highlight as SQ
 
 ## Examples
 
-[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder) + `conflict_demo.noe` (the portable `ON CONFLICT` terminals), `schema_demo.noe` (the schema DSL) + `schema_migrate_demo.noe` (`.schema` and `.sql` migrations side by side, under `schema_migrations/`), `repo_demo.noe` (repository + unit-of-work), `sql_demo.noe` (the `@sql` tier), `migrate_demo.noe` + `seed_demo.noe` (the engine; `seeds/` holds a portable `.sql` seed and a `.noe` program seed side by side, `boot_seeds/` the SQL-only directory a self-seeding app reads), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
+[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder) + `conflict_demo.noe` (the portable `ON CONFLICT` terminals), `schema_demo.noe` (the schema DSL) + `schema_migrate_demo.noe` (`.schema` and `.sql` migrations side by side, under `schema_migrations/`), `repo_demo.noe` (repository + unit-of-work) + `types_demo.noe` (column types across the seam: a `bool` model field, floats, blobs, and what a genuine model/table disagreement reports), `sql_demo.noe` (the `@sql` tier), `migrate_demo.noe` + `seed_demo.noe` (the engine; `seeds/` holds a portable `.sql` seed and a `.noe` program seed side by side, `boot_seeds/` the SQL-only directory a self-seeding app reads), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
 
 ## Requirements
 
