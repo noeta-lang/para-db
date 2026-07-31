@@ -4,14 +4,14 @@
 //
 //     use para.db.schema.{Statement, create_table}
 //
-//     pub fn up(): List<Statement> {
+//     pub fn migrate(): List<Statement> {
 //         return [
 //             create_table("todos").id().text("title").not_null().statement(),
 //         ]
 //     }
 //
 // `noeta migrate` loads and checks that file and appends one synthesized trailing statement —
-// `migrations.emit("<path>", up)` — exactly the way `noeta serve` appends `http.serve(port, fetch)`
+// `migrations.emit("<path>", migrate)` — exactly the way `noeta serve` appends `http.serve(port, fetch)`
 // and the seed runner appends `db.run_seed(dsn, seed)`. `emit` is that call: an ordinary Noeta
 // function, so the mechanism behind the command is one a program could invoke for itself.
 //
@@ -29,7 +29,7 @@
 // on. So the canonical rendering of the statements is written where the command asked, and the
 // command reads it back and deletes it. That text is not a lossy summary: `canonical` is byte for
 // byte what the native `schema::render` produces from the same statements, and the engine parses it
-// with the same grammar, so what it recovers is the `Statement` values `up()` built.
+// with the same grammar, so what it recovers is the `Statement` values `migrate()` built.
 //
 // **Why canonical text and not the IR itself.** The canonical rendering *is* the migration's
 // identity — it is what the checksum is taken over — so handing it across is handing across exactly
@@ -38,14 +38,14 @@
 use std.fs
 use db.schema.{Statement, canonical}
 
-// Write the canonical IR of `up()` to `out` — the entry `noeta migrate` synthesizes for a `.noe`
+// Write the canonical IR of `migrate()` to `out` — the entry `noeta migrate` synthesizes for a `.noe`
 // migration.
 //
-// `up` takes no connection, and that is the whole design rather than an omission: a migration
+// `migrate` takes no connection, and that is the whole design rather than an omission: a migration
 // describes a schema change and returns it, while opening a transaction, applying the statements,
 // recording that they ran and rolling back on failure belong to the engine. A migration that could
 // open a connection could write outside that transaction and leave history nobody recorded, so the
 // signature is what makes it unrepresentable instead of a convention asking nicely.
-pub fn emit(out: string, up: () -> List<Statement>): void {
-    fs.write(out, canonical(up()))
+pub fn emit(out: string, migrate: () -> List<Statement>): void {
+    fs.write(out, canonical(migrate()))
 }

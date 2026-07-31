@@ -23,7 +23,7 @@
 // A builder describes a **`Statement`** — the backend-neutral IR the whole migration story runs on.
 // `Statement`, `CreateTable`, `Column`, `DefaultValue` and the rest below are the Noeta twins of the
 // `schema.rs` types, field for field. `.statement()` hands the value over, which is what a `.noe`
-// migration's `up()` returns; two text spellings of it are also available:
+// migration's `migrate()` returns; two text spellings of it are also available:
 //
 //   * `.render()` — schema **source**, laid out the way a person reads it: one column per indented
 //     line, modifiers beside the column they modify.
@@ -633,7 +633,7 @@ pub fn apply(conn: Connection, statements: List<string>): int {
     return conn.apply_schema(source(statements))
 }
 
-// The `.noe` migration entry that writes what `up()` built lives in `para.db.migrations`, not here —
+// The `.noe` migration entry that writes what `migrate()` built lives in `para.db.migrations`, not here —
 // it is the one function in the package that touches a filesystem, and this module is imported by
 // apps and fixtures that have no business reaching `std.fs` through it.
 
