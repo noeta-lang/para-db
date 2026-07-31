@@ -384,6 +384,36 @@ fn sql_value_of(value: &NativeValue) -> Result<SqlValue, StdError> {
         // `out_of`, so a blob round-trips without ever being reinterpreted as text.
         NativeValue::Bytes(b) => Ok(SqlValue::Bytes(b.clone())),
         NativeValue::Unit => Ok(SqlValue::Null),
+        // An enum value binds as its **case name**, the only spelling a column has for a nominal
+        // case: `Status.Active` is the text `'Active'`, which is what a `status TEXT` column holds
+        // and what `out_of` reads back for it. This arm is what the toolchain's deep projection
+        // now hands us — an enum used to arrive here already flattened to a bare `Str(case)`, and
+        // reading that string was indistinguishable from reading a real one.
+        //
+        // That is exactly why the payload-carrying case is refused by name rather than accepted.
+        // Under the old flattening `Shape.Circle(3)` also arrived as `Str("Circle")`, so it bound
+        // silently and the `3` was simply gone from the row: a column that reads back `'Circle'`
+        // and a column that reads back `'Circle'` for a *different* circle are the same column.
+        // A sum with data has no column spelling; say so at the bind rather than write a lossy row.
+        NativeValue::Variant {
+            enum_name,
+            variant,
+            fields,
+            ..
+        } => {
+            if fields.is_empty() {
+                Ok(SqlValue::Text(variant.clone()))
+            } else {
+                Err(type_error(
+                    "execute",
+                    &format!(
+                        "a scalar, string, bytes, or null bind parameter (`{enum_name}.{variant}` \
+                         carries a payload, and a data-carrying enum case has no column spelling — \
+                         bind its fields)"
+                    ),
+                ))
+            }
+        }
         _ => Err(type_error(
             "execute",
             "a scalar, string, bytes, or null bind parameter",

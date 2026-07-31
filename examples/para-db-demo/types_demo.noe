@@ -33,6 +33,20 @@ struct Priced {
     price: float
 }
 
+// An enum bound straight into a statement. A case name is a column value the same way a string is —
+// a `status TEXT` column holding `'Active'` is how every schema spells a nominal state — so a
+// payload-free case binds as its name. A case that carries data does not: `Circle(3)` and
+// `Circle(4)` would both land as `'Circle'`, a row that has lost the thing it was recording.
+enum Status {
+    Active
+    Retired
+}
+
+enum Shape {
+    Empty
+    Circle(int)
+}
+
 // Open a fresh in-memory database with the todo table, seeded through the repository's own write path.
 fn open_todos(): Connection {
     conn = db.connect("sqlite::memory:")
@@ -242,6 +256,40 @@ bad.close()
             none => true,
         }, "an absent primary key is `none`")
         assert(repo.all(conn).len() == 0, "an empty table is an empty list")
+        conn.close()
+    }
+
+    // --- Bug: an enum bind parameter reached the driver as its *display* name, not as the enum -----
+
+    fn a_payload_free_enum_binds_as_its_case_name(): void {
+        // The toolchain used to flatten every enum to its case name before the driver saw it, so this
+        // worked by accident: the driver was reading a string it had no way to tell from a real one.
+        // The projection now carries the enum itself, and the driver reads the case off it — the same
+        // row, this time because the driver decided on it.
+        conn = db.connect("sqlite::memory:")
+        conn.execute("CREATE TABLE marks (id INTEGER PRIMARY KEY, status TEXT)", [])
+        conn.execute("INSERT INTO marks VALUES (1, ?), (2, ?)", [Status.Active, Status.Retired])
+        rows = conn.query("SELECT status FROM marks ORDER BY id", [])
+        assert(rows[0]["status"] == "Active", "${rows[0]["status"]}")
+        assert(rows[1]["status"] == "Retired", "${rows[1]["status"]}")
+
+        // And it is a column value like any other, so the database can select on it.
+        found = conn.query("SELECT id FROM marks WHERE status = ?", [Status.Retired])
+        assert(found.len() == 1 && found[0]["id"] == 2, "${found}")
+        conn.close()
+    }
+
+    fn a_payload_carrying_enum_is_not_a_column_value(): void {
+        // The half that used to be silent: `Shape.Circle(3)` also arrived as the bare name `'Circle'`,
+        // so the row was written and the `3` was simply gone. There is no column spelling for a sum
+        // with data, so the bind is refused — checked here as a structural fact, since the refusal
+        // aborts the program and a test cannot catch it. What *is* assertable is that the payload-free
+        // sibling of the very same enum still binds, so the refusal is about the payload and not about
+        // enums.
+        conn = db.connect("sqlite::memory:")
+        conn.execute("CREATE TABLE shapes (id INTEGER PRIMARY KEY, kind TEXT)", [])
+        conn.execute("INSERT INTO shapes VALUES (1, ?)", [Shape.Empty])
+        assert(conn.query("SELECT kind FROM shapes", [])[0]["kind"] == "Empty")
         conn.close()
     }
 }
