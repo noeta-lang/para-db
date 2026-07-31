@@ -272,7 +272,7 @@ fn connection_method_dispatch(
                 crate::migrate::DirKind::Migrations,
             )
             .map_err(migrate_error)?;
-            // A `.noe` migration's `up()` has to be loaded, checked and run, and this surface is a
+            // A `.noe` migration's `migrate()` has to be loaded, checked and run, and this surface is a
             // native call inside an already-running program — it has a database but not the loader
             // that would take a second program from source to a value. Each one is refused by name
             // rather than skipped, pointing at `noeta migrate`, which has both.

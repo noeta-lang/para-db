@@ -73,13 +73,19 @@ pub const SCHEMA_ENTRY_MODULE: &str = "para.db.migrations";
 /// mechanism behind the command is one a program could call for itself.
 pub const SCHEMA_ENTRY_FUNC: &str = "emit";
 
-/// The top-level function a `.noe` **migration** must declare: `up(): List<Statement>`.
+/// The top-level function a `.noe` **migration** must declare: `migrate(): List<Statement>`.
 ///
-/// Deliberately not [`SEED_ENTRY_IDENT`]. The two entry points are what separate describing from
-/// performing — `up()` is handed nothing and returns statements, `seed(conn)` is handed a live
-/// connection and returns nothing — so a file that wandered into the wrong directory fails to check
-/// against a name it does not declare, rather than running with the wrong powers.
-pub const MIGRATION_ENTRY_IDENT: &str = "up";
+/// Named for what the file *is*, exactly as [`SEED_ENTRY_IDENT`] is — and deliberately not `up`.
+/// Migrations here are forward-only by design (see [`crate::migrate`]), so there is no `down` for an
+/// `up` to be one half of; a name from that pair would promise a counterpart that can never exist.
+///
+/// Deliberately not [`SEED_ENTRY_IDENT`] itself, and not `run` either. The two entry points are what
+/// separate describing from performing — `migrate()` is handed nothing and returns statements,
+/// `seed(conn)` is handed a live connection and returns nothing — so a file that wandered into the
+/// wrong directory fails to check against a name it does not declare, rather than running with the
+/// wrong powers. `run` is the performing word (`run_seed`, [`RUN_SEED_FN`]) and would blur the line
+/// these two names exist to draw.
+pub const MIGRATION_ENTRY_IDENT: &str = "migrate";
 
 /// `db.run_seed(dsn, seed)` — open `dsn`, run `seed(conn)`, release the connection. A **ctx**
 /// (higher-order) function: it takes a callable and re-enters the backend to invoke it.

@@ -269,7 +269,7 @@ fn execute(
     };
 
     // Discover the migration files (a missing directory is a usage error), then run every `.noe`
-    // one's `up()` to learn what it describes. Resolution happens here, before the driver is even
+    // one's `migrate()` to learn what it describes. Resolution happens here, before the driver is even
     // opened: a Noeta migration takes no connection, so what it means is knowable without a
     // database, and a program that fails to check should say so before anything is applied.
     let mut migrations = match migrate::load_dir(&dir, DirKind::Migrations) {
@@ -444,7 +444,7 @@ impl ProgramRunner for CtxPrograms<'_> {
 /// statement — the same synthesized-entry mechanism the seed runner and `noeta serve` use.
 ///
 /// **No dsn reaches it.** A migration describes a schema change and returns it; the engine is what
-/// applies it. So unlike [`CtxPrograms`], this entry passes no connection string, and `up()` has
+/// applies it. So unlike [`CtxPrograms`], this entry passes no connection string, and `migrate()` has
 /// nowhere to write even if it wanted to. What comes back is the canonical IR, through a file the
 /// command names and the program writes — a value crossing a process-shaped boundary, not a
 /// side effect.
@@ -473,7 +473,7 @@ impl migrate::SchemaEmitter for CtxEmitter<'_> {
         let read = |out: &Path| {
             std::fs::read_to_string(out).map_err(|e| {
                 ProgramFailure::Failed(format!(
-                    "`up()` ran but no schema was written to `{}`: {e}",
+                    "`migrate()` ran but no schema was written to `{}`: {e}",
                     out.display()
                 ))
             })
@@ -492,7 +492,7 @@ impl migrate::SchemaEmitter for CtxEmitter<'_> {
     }
 }
 
-/// Where a `.noe` migration writes the IR its `up()` built, for this process to read back.
+/// Where a `.noe` migration writes the IR its `migrate()` built, for this process to read back.
 ///
 /// Beside the migration itself would put a generated file into the project's history; the temp
 /// directory keeps it out of the repository and out of the migrations directory the loader is
@@ -742,8 +742,8 @@ mod tests {
         /// The exit code this fake driver reports for a program (0 = it ran and succeeded).
         program_exit: u8,
         /// The canonical schema IR this fake writes when the synthesized entry is the migration
-        /// `emit` one — standing in for a real `up()` having built those statements. `None` means
-        /// the program wrote nothing, which is how a migration that declares no `up` behaves.
+        /// `emit` one — standing in for a real `migrate()` having built those statements. `None` means
+        /// the program wrote nothing, which is how a migration that declares no `migrate` behaves.
         emit_ir: Option<String>,
     }
 
@@ -764,7 +764,7 @@ mod tests {
             }
         }
 
-        /// A context whose migration programs "build" `ir` — the statements their `up()` returned.
+        /// A context whose migration programs "build" `ir` — the statements their `migrate()` returned.
         fn emitting(ir: &str) -> TestCtx {
             TestCtx {
                 emit_ir: Some(ir.to_string()),
@@ -1065,7 +1065,7 @@ mod tests {
         .expect("the generated manifest is writable");
         // Two statements and a helper, so what is proven is that the *statements* crossed back —
         // not that a single hardcoded line survived. The helper also makes the point that the
-        // checksum is over what `up` returns, not over how it was written.
+        // checksum is over what `migrate` returns, not over how it was written.
         std::fs::write(
             dir.join("migrations").join("0001_notes.noe"),
             "use para.db.schema.{Statement, create_table, create_index}\n\n\
@@ -1076,7 +1076,7 @@ mod tests {
              \x20       .bool(\"archived\").not_null().default(false)\n\
              \x20       .statement()\n\
              }\n\n\
-             pub fn up(): List<Statement> {\n\
+             pub fn migrate(): List<Statement> {\n\
              \x20   return [notes(), create_index(\"notes\").column(\"archived\").statement()]\n\
              }\n",
         )
@@ -1117,7 +1117,7 @@ mod tests {
             .expect("indexes are listable");
         assert!(!rows.is_empty(), "the described index was not created");
 
-        // Re-running is a clean no-op: `up()` runs again to recompute the checksum, and it matches,
+        // Re-running is a clean no-op: `migrate()` runs again to recompute the checksum, and it matches,
         // so nothing is applied and nothing reads as drift.
         let again = run(&["migrate", "--db", &db]);
         let again_out = String::from_utf8_lossy(&again.stdout).into_owned();
@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(created.len(), 1);
         let body = std::fs::read_to_string(created[0].path()).unwrap();
         // The entry convention and the fact that it takes no connection are both spelled out.
-        assert!(body.contains("pub fn up(): List<Statement>"), "{body}");
+        assert!(body.contains("pub fn migrate(): List<Statement>"), "{body}");
         assert!(body.contains("create_table(\"todos\")"), "{body}");
         assert!(body.contains("--sql"), "{body}");
     }
@@ -1828,7 +1828,7 @@ mod tests {
         // path a `.schema` file takes, reached by running a program instead of parsing a file.
         let dir = project(
             "noe_migration",
-            &[("0001_a.noe", "pub fn up(): List<Statement> { return [] }")],
+            &[("0001_a.noe", "pub fn migrate(): List<Statement> { return [] }")],
         );
         let mut ctx = TestCtx::emitting("create_table(\"notes\").id().text(\"title\")\n");
         let db = dsn(&dir);
@@ -1842,7 +1842,7 @@ mod tests {
         assert_eq!(ctx.programs.len(), 1);
         let entry = &ctx.programs[0].entry;
         assert!(entry.starts_with("para.db.migrations.emit("), "{entry}");
-        assert!(entry.ends_with(", up)"), "{entry}");
+        assert!(entry.ends_with(", migrate)"), "{entry}");
         assert!(!entry.contains(&db), "{entry}");
 
         // The table the returned statements described actually exists.
@@ -1854,7 +1854,7 @@ mod tests {
             )
             .unwrap();
 
-        // And a second run is a no-op: the migration was recorded, so its `up()` runs again (to
+        // And a second run is a no-op: the migration was recorded, so its `migrate()` runs again (to
         // recompute the checksum) but nothing is applied.
         let again = run_in(&dir, &["--db", &db], &mut ctx, None);
         assert_eq!(again.code, 0, "{}", again.err);
@@ -1868,7 +1868,7 @@ mod tests {
         // `.sql` migrations that would otherwise have gone first.
         let dir = project(
             "noe_migration_fails",
-            &[("0001_a.noe", "pub fn up() { }"), M1],
+            &[("0001_a.noe", "pub fn migrate() { }"), M1],
         );
         let mut ctx = TestCtx::bare();
         ctx.program_exit = 1;
@@ -1935,7 +1935,7 @@ mod tests {
 
         let migration = read_only_noe("migrations");
         assert!(
-            migration.contains("pub fn up(): List<Statement>"),
+            migration.contains("pub fn migrate(): List<Statement>"),
             "{migration}"
         );
         assert!(!migration.contains("Connection"), "{migration}");
