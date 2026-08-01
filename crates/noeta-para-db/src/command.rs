@@ -1828,7 +1828,10 @@ mod tests {
         // path a `.schema` file takes, reached by running a program instead of parsing a file.
         let dir = project(
             "noe_migration",
-            &[("0001_a.noe", "pub fn migrate(): List<Statement> { return [] }")],
+            &[(
+                "0001_a.noe",
+                "pub fn migrate(): List<Statement> { return [] }",
+            )],
         );
         let mut ctx = TestCtx::emitting("create_table(\"notes\").id().text(\"title\")\n");
         let db = dsn(&dir);

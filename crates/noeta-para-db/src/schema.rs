@@ -2326,8 +2326,14 @@ mod tests {
         std::fs::write(
             dir.join("noeta.toml"),
             format!(
+                // The scope ARRAY form, not a plain table: a scope array's members each get the
+                // package's own root segment appended to the key, so this package's modules derive
+                // as `para.db.*`. Bound as `para = {{ path = … }}` they would derive as `para.*`
+                // instead, and the program below — which imports `para.db.schema`, exactly as a
+                // real consumer does — would not resolve. Every `para/*` package is addressed this
+                // way; see the manifest reference on scope arrays.
                 "[package]\nname = \"noeta/schema_cross_check\"\nversion = \"0.1.0\"\n\n\
-                 [dependencies]\npara = {{ path = {root:?} }}\n\n\
+                 [dependencies]\npara = [{{ path = {root:?} }}]\n\n\
                  [trust]\nnative = [\"para/db\"]\n"
             ),
         )
