@@ -1432,7 +1432,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("0001_a.sql"), "SELECT 1;").unwrap();
-        std::fs::write(dir.join("0002_b.noe"), "pub fn migrate(): List<Statement> { }").unwrap();
+        std::fs::write(
+            dir.join("0002_b.noe"),
+            "pub fn migrate(): List<Statement> { }",
+        )
+        .unwrap();
 
         let mut migrations = load_dir(&dir, DirKind::Migrations).unwrap();
         assert_eq!(migrations[1].kind, MigrationKind::Program);
