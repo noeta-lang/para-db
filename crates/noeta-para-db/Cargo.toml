@@ -9,7 +9,7 @@ rust-version = "1.95"
 [dependencies]
 # The extension ABI (the module/type registry, ExternValue contract, error constructors).
 # Pinned to the toolchain release this package version is built against.
-noeta-ext-abi = { git = "https://github.com/noeta-lang/noeta", tag = "v0.3.0" }
+noeta-ext-abi = { git = "https://github.com/noeta-lang/noeta", tag = "v0.3.1" }
 # The reactive DB source (`db.watch`, aether DB5) is a node in the SAME reactive graph as core
 # `std.reactive`, reached through the `ReactiveSource` capability contract — never the engine
 # internals (so this crate depends on nothing of `noeta-stdlib`). `noeta-reactive` supplies the
@@ -17,9 +17,9 @@ noeta-ext-abi = { git = "https://github.com/noeta-lang/noeta", tag = "v0.3.0" }
 # uses. Light crates, always linked (the `db.watch` surface works for any driver — SQLite degrades to
 # in-process-only, Postgres adds external LISTEN/NOTIFY).
 # Pinned to the toolchain release this package version is built against.
-noeta-reactive = { git = "https://github.com/noeta-lang/noeta", tag = "v0.3.0" }
+noeta-reactive = { git = "https://github.com/noeta-lang/noeta", tag = "v0.3.1" }
 # Pinned to the toolchain release this package version is built against.
-noeta-reactive-abi = { git = "https://github.com/noeta-lang/noeta", tag = "v0.3.0" }
+noeta-reactive-abi = { git = "https://github.com/noeta-lang/noeta", tag = "v0.3.1" }
 # The migration engine checksums each migration file's contents (sha256) to detect edited history.
 # Always linked (the engine is driver-agnostic and rides no ring).
 sha2 = { version = "0.10", default-features = false }
