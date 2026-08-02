@@ -1,0 +1,184 @@
+name: Toolchain pin
+
+# A noeta release dispatches `release-published` carrying its tag. This repo's native crates pin the
+# toolchain to a tag in their `Cargo.toml`, and `ci.yml`'s consistency guard fails when that pin and
+# the org-level `NOETA_VERSION` disagree — so the release that advances the variable makes this repo
+# red until the pin follows. Rather than wait for a human to notice, bump it here and open the result
+# as a PR.
+#
+# **The PR is not the point; the build in this job is.** A `noeta` release is the moment this
+# package's native half might stop compiling — a required field added to `ExtFn`, a signature that
+# moved — and nothing else in the fleet asks that question on a schedule. So this job rewrites the
+# pins and then *builds every crate against the new toolchain*, and the PR it opens carries the
+# verdict. A release that breaks this package is visible within minutes of the tag instead of
+# whenever someone next touches the repo.
+#
+# Verification runs HERE rather than being left to the PR's own checks for a concrete reason: a pull
+# request opened with the default `GITHUB_TOKEN` does **not** trigger workflow runs (GitHub's
+# recursion guard), so the PR would arrive with no checks at all. Doing the build in this job makes
+# the signal independent of that. If a PAT is ever added for this, the PR's own CI becomes a second,
+# fuller opinion — this one is deliberately the cheap early answer, not a replacement for it.
+#
+# What it will NOT touch, because these are semantic calls with consumer consequences and belong to
+# a human: `toolchain = ">=X.Y"` in `noeta.toml` (does this package now REQUIRE the new toolchain?)
+# and the package version (is dropping older toolchains a breaking change for consumers?). The PR
+# body says so, so nobody merges it believing the release decision is made.
+#
+# A repo with no pins — every pure-Noeta para package — no-ops and exits 0, so this file is the same
+# in all of them and a package that later grows a native half gets the behaviour for free.
+
+on:
+  repository_dispatch:
+    types: [release-published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Toolchain tag to pin, e.g. v0.4.1"
+        required: true
+        type: string
+
+concurrency:
+  # One bump in flight per tag; a re-dispatch supersedes an earlier attempt at the same one.
+  group: toolchain-pin-${{ github.event.client_payload.tag || inputs.tag }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+
+jobs:
+  bump:
+    name: Pin the toolchain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rewrite the pins
+        id: bump
+        run: |
+          set -euo pipefail
+          # A dispatch carries whatever the sender put in it. Refuse anything that is not a release
+          # tag rather than rewriting manifests to a branch name or an empty string.
+          case "${TAG:-}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::refusing to pin '${TAG:-}': expected a release tag like v0.4.1"; exit 1 ;;
+          esac
+
+          mapfile -t FILES < <(grep -rl 'github\.com/noeta-lang/noeta", tag = "' --include=Cargo.toml . || true)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "no toolchain pins in this repo — nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf 'pinning %d file(s) to %s:\n' "${#FILES[@]}" "$TAG"
+          printf '  %s\n' "${FILES[@]}"
+          sed -i -E 's|(github\.com/noeta-lang/noeta", tag = ")v[0-9][^"]*(")|\1'"$TAG"'\2|g' "${FILES[@]}"
+
+          if git diff --quiet; then
+            echo "already pinned to $TAG — nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@1.97.0
+        if: steps.bump.outputs.changed == 'true'
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        if: steps.bump.outputs.changed == 'true'
+
+      - name: Build every crate against ${{ env.TAG }}
+        id: verify
+        if: steps.bump.outputs.changed == 'true'
+        # The question this job exists to answer. `clippy -D warnings` and not a bare `check`,
+        # because it is what `ci.yml` enforces — an additive ABI change that turns an existing
+        # `..DEFAULTS` tail into a no-op is a warning, and a warning is what would fail the real
+        # gate. Each crate is its own workspace root (so the composed toolchain can adopt it as a
+        # path dependency), hence the loop rather than `--workspace`.
+        run: |
+          set -uo pipefail
+          rc=0
+          {
+            echo "| crate | result |"
+            echo "| --- | --- |"
+          } > /tmp/verdict.md
+          for crate in crates/*/ native/; do
+            [ -f "${crate}Cargo.toml" ] || continue
+            # Never pipe the command whose exit code is the verdict — redirect, then read $?.
+            (cd "${crate}" && cargo clippy --all-targets -- -D warnings) > "/tmp/$(echo "$crate" | tr '/' '_').log" 2>&1
+            if [ $? -eq 0 ]; then
+              echo "| \`${crate}\` | ✅ builds |" >> /tmp/verdict.md
+            else
+              echo "| \`${crate}\` | ❌ **fails** |" >> /tmp/verdict.md
+              rc=1
+              echo "::group::${crate} failed against ${TAG}"
+              tail -60 "/tmp/$(echo "$crate" | tr '/' '_').log"
+              echo "::endgroup::"
+            fi
+          done
+          cat /tmp/verdict.md
+          { echo "verdict<<EOF"; cat /tmp/verdict.md; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          echo "ok=$([ $rc -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          # Do not exit non-zero yet: the PR below is how a FAILURE gets recorded somewhere a human
+          # will see it. The job's own status is set at the end.
+
+      - name: Open the pull request
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OK: ${{ steps.verify.outputs.ok }}
+          VERDICT: ${{ steps.verify.outputs.verdict }}
+        run: |
+          set -euo pipefail
+          BRANCH="toolchain-pin/${TAG}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -aqm "build: pin the toolchain crates to ${TAG}
+
+          Opened by the \`release-published\` dispatch from noeta ${TAG}. Only the
+          \`Cargo.toml\` tag pins moved; the \`toolchain\` floor in \`noeta.toml\` and this
+          package's own version are deliberately untouched."
+          git push -f origin "$BRANCH"
+
+          if [ "$OK" = "true" ]; then
+            TITLE="build: pin the toolchain to ${TAG}"
+            HEAD="Every crate builds against \`${TAG}\`, so this is the mechanical half of the bump."
+          else
+            TITLE="build: pin the toolchain to ${TAG} — DOES NOT BUILD"
+            HEAD="**This package does not compile against \`${TAG}\`.** The pin is bumped here so the
+          failure is reproducible, but the PR needs a fix before it can merge — see the job log for
+          the compiler output."
+          fi
+
+          BODY="$(cat <<EOB
+          ${HEAD}
+
+          ${VERDICT}
+
+          Bumped automatically because \`ci.yml\`'s consistency guard fails while the pin and the
+          org-level \`NOETA_VERSION\` disagree.
+
+          **Left for a human, on purpose:**
+          - \`toolchain = ">=X.Y"\` in \`noeta.toml\` — does this package now *require* the new
+            toolchain? Raising that floor is breaking for consumers on the old one.
+          - this package's version — a raised floor usually means a minor bump, not a patch.
+          - whether this warrants a release at all. A published package pinned to an older tag still
+            composes under a newer binary (the composer patches every toolchain crate to the running
+            binary's source), so this is often CI hygiene rather than a compatibility fix.
+          EOB
+          )"
+          gh pr create --title "$TITLE" --body "$BODY" --head "$BRANCH" --base "${{ github.event.repository.default_branch }}" \
+            || gh pr edit "$BRANCH" --title "$TITLE" --body "$BODY"
+
+      - name: Fail if the package does not build against the new toolchain
+        if: steps.bump.outputs.changed == 'true' && steps.verify.outputs.ok != 'true'
+        run: |
+          echo "::error::this package does not compile against ${TAG} — see the PR and the build log"
+          exit 1
