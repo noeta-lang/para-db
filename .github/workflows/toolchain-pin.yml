@@ -174,8 +174,31 @@ jobs:
             binary's source), so this is often CI hygiene rather than a compatibility fix.
           EOB
           )"
-          gh pr create --title "$TITLE" --body "$BODY" --head "$BRANCH" --base "${{ github.event.repository.default_branch }}" \
-            || gh pr edit "$BRANCH" --title "$TITLE" --body "$BODY"
+
+          # The verdict goes to the job summary FIRST, and unconditionally. Opening the PR is a
+          # convenience that can be switched off at the org or repo level — "Allow GitHub Actions to
+          # create and approve pull requests" is off by default — and the answer to "does this
+          # package still build against the release" must not be lost to a settings checkbox.
+          {
+            echo "## Toolchain pin → \`${TAG}\`"
+            echo
+            echo "${BODY}"
+            echo
+            echo "Branch: \`${BRANCH}\` (pushed)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if gh pr create --title "$TITLE" --body "$BODY" --head "$BRANCH" \
+               --base "${{ github.event.repository.default_branch }}" 2>/tmp/pr.err \
+             || gh pr edit "$BRANCH" --title "$TITLE" --body "$BODY" 2>>/tmp/pr.err; then
+            echo "opened/updated the PR for $BRANCH"
+          else
+            # Not fatal. The branch is pushed and the verdict is in the summary above, so the work
+            # survives; only the convenience wrapper is missing. Say exactly what to turn on.
+            cat /tmp/pr.err
+            COMPARE="${{ github.event.repository.html_url }}/compare/${BRANCH}?expand=1"
+            echo "::warning title=Branch pushed, PR not opened::${BRANCH} is pushed and every crate's verdict is in the job summary, but this repo does not allow Actions to open pull requests. Open it at ${COMPARE} — or enable Settings → Actions → General → Workflow permissions → 'Allow GitHub Actions to create and approve pull requests'."
+            echo "- Open the PR: ${COMPARE}" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Fail if the package does not build against the new toolchain
         if: steps.bump.outputs.changed == 'true' && steps.verify.outputs.ok != 'true'
