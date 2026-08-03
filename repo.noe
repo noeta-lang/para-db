@@ -16,6 +16,20 @@
 // during a request; `flush` commits them as one batch inside a single transaction (BEGIN … COMMIT),
 // then clears the pending lists. Reads (`find`/`all`/`where`) go straight to the connection.
 //
+// **The model declares which of its columns are the database's**, through two field attributes
+// declared just below and read off `field_specs_of`. A `#[Generated]` field is one the DATABASE
+// assigns — a `SERIAL`/`AUTOINCREMENT` key, a `created_at DEFAULT now()` — so it is never sent: it is
+// left out of the INSERT's column list and out of the UPDATE's SET list, and staging a whole entity is
+// therefore correct for a model whose key it does not know yet. A `#[Key]` field is the primary key,
+// which is what a repository built without an explicit key column reads. Both facts live on the field
+// they are about rather than in a string beside it, so a rename carries them along.
+//
+// A generated key has a second half, though: learning what the database chose. `add` stages a VALUE,
+// and nothing can write an assigned key back into the caller's copy of it — so the door for "insert
+// this and tell me what it became" is `insert(conn, entity)`, which runs `INSERT … RETURNING *` NOW
+// and answers the row the database actually stored, mapped to the model. The unit of work stays the
+// batch door; `insert` is the immediate one.
+//
 // Both surfaces are typed as the model. Writes take it — `add(entity: T)` / `save(entity: T)`, staged
 // into `List<T>` — so handing a repository the wrong model is an E0007 at the call site rather than a
 // malformed row at flush time. Reads answer it: `find` -> `?T`, `all`/`where` -> `List<T>`.
@@ -39,10 +53,46 @@ use para.db.Connection
 use db.query.{table, run, exec, Query}
 use std.json
 
+// --- What a model declares about its own columns --------------------------------------------------
+
+// The model's PRIMARY KEY: `#[Key] pub id: int`. A repository built without an explicit key column
+// reads it from here, so the key is named once — on the field that is it — rather than restated as a
+// string beside every repository over the model.
+//
+//   #[Key]
+//   pub id: int
+//
+// A model carrying no `#[Key]` is not an error: name the column at construction instead. Carrying
+// TWO is, and loudly — a composite key is not something this repository can express, and picking one
+// of them silently would write UPDATEs and DELETEs that match the wrong rows.
+@attribute(Field)
+pub struct Key {}
+
+// A column the DATABASE assigns, not the model: a `SERIAL`/`AUTOINCREMENT` key, a `created_at
+// DEFAULT now()`, a computed column. It is never sent — left out of the INSERT's column list, and out
+// of the UPDATE's SET list, because writing the model's copy of a value the database owns would
+// either be a no-op or would overwrite what the database just decided.
+//
+//   #[Key]
+//   #[Generated]
+//   pub id: int = 0
+//
+// Give a generated field a DEFAULT (`= 0` above) and the model literal need not mention it at all:
+// `Todo { title: "…", done: false }` is then a complete `Todo` on the way in, and the value the
+// database assigned is what comes back on the way out. The two attributes are independent facts and
+// compose freely — a UUID key the app generates is `#[Key]` alone, a `created_at` is `#[Generated]`
+// alone, and a `SERIAL` primary key is both.
+//
+// To write a generated column deliberately anyway (a seed restoring explicit ids, say), go around the
+// repository: the query builder and `@sql` both send exactly the columns you name.
+@attribute(Field)
+pub struct Generated {}
+
 // A repository over one model + table. The model is the type argument; construct it at a concrete
-// instantiation, naming its table and its primary-key column:
+// instantiation, naming its table — and its primary-key column, unless the model marks it `#[Key]`:
 //
 //   users: Repository<User> = Repository.new("users", "id")
+//   users: Repository<User> = Repository.new("users")        // `#[Key] id: int` on the model
 //
 // The annotation is what records the instantiation, and it is load-bearing: `T` rides on the
 // instance, so `type_name::<T>()` inside a method (see `model`) recovers the model's QUALIFIED
@@ -50,17 +100,22 @@ use std.json
 // therefore needs no hand-written `"app.storage.User"`, and a rename cannot desynchronize it.
 pub class Repository<T> {
     pub tbl: string // the backing table (also a NOTIFY channel name, for the reactive layer)
-    pub pk: string // the primary-key column
+    pub mut pk: string // the primary-key column — empty until read off the model's `#[Key]`
     mut model_name: string // memo of `type_name::<T>()` — empty until the first `model()`
+    mut generated: ?List<string> // memo of the `#[Generated]` columns — `none` until first read
     mut pending_new: List<T> // staged inserts (whole entities)
     mut pending_dirty: List<T> // staged updates (whole entities)
     mut pending_remove: List<dyn> // staged deletes (primary-key VALUES, not models)
 
-    fn new(tbl: string, pk: string): Repository<T> {
+    // `pk` defaults to empty, which means "the model says": it is resolved from the model's `#[Key]`
+    // field on first use (see `key`). Naming it here still works and wins — the override for a table
+    // whose key the model does not mark, or does not have a field for.
+    fn new(tbl: string, pk: string = ""): Repository<T> {
         return Repository {
             tbl: tbl,
             pk: pk,
             model_name: "",
+            generated: none,
             pending_new: [],
             pending_dirty: [],
             pending_remove: [],
@@ -75,6 +130,62 @@ pub class Repository<T> {
             self.model_name = type_name::<T>()
         }
         return self.model_name
+    }
+
+    // The primary-key column: the one named at construction, or — when none was — the model's own
+    // `#[Key]` field. Resolved once, on first use, and memoized into `pk` itself, so every statement
+    // that needs the key (`find`, `build_update`, the staged deletes) asks this and nothing reads the
+    // raw field.
+    fn key(): string {
+        if self.pk == "" {
+            self.pk = self.declared_key()
+        }
+        return self.pk
+    }
+
+    // The model's `#[Key]` field name. No key at all and two keys are both errors here rather than
+    // guesses, and they are different errors: one says how to supply the key, the other says the
+    // model claims two and a composite key is not expressible on this surface.
+    fn declared_key(): string {
+        mut keys: List<string> = []
+        for f in field_specs_of(self.model()) {
+            if carries_key(f.attrs) {
+                keys = keys ~ [f.name]
+            }
+        }
+        if keys.len() == 1 {
+            return keys[0]
+        }
+        how = "or name the column at construction: Repository.new('${self.tbl}', 'id')"
+        named = keys.join(", ")
+        if keys.len() == 0 {
+            return panic(
+                "para.db: the repository over `${self.model()}` (table `${self.tbl}`) has no primary-key column — mark the model's key field `#[Key]` (`use para.db.repo.Key`), ${how}",
+            )
+        }
+        return panic(
+            "para.db: the model `${self.model()}` marks ${keys.len()} fields `#[Key]` (${named}) — a repository has ONE primary-key column, and a composite key is not expressible here; mark one field, ${how}",
+        )
+    }
+
+    // The columns the DATABASE assigns — the model's `#[Generated]` fields. Read once off the model's
+    // declaration and memoized: every insert and every update asks.
+    fn generated_columns(): List<string> {
+        return match self.generated {
+            some(cols) => cols,
+            none => self.read_generated_columns(),
+        }
+    }
+
+    fn read_generated_columns(): List<string> {
+        mut cols: List<string> = []
+        for f in field_specs_of(self.model()) {
+            if carries_generated(f.attrs) {
+                cols = cols ~ [f.name]
+            }
+        }
+        self.generated = some(cols)
+        return cols
     }
 
     // --- Reads -------------------------------------------------------------------------------
@@ -139,7 +250,7 @@ pub class Repository<T> {
     // Find one row by primary key, mapped to the model. `none` means there is no such row — and only
     // that: a row that exists but does not decode aborts instead of impersonating a missing one.
     fn find(conn: Connection, id: dyn): ?T {
-        q = table(self.tbl).filter(self.pk, "=", id).limit(1).select("*")
+        q = table(self.tbl).filter(self.key(), "=", id).limit(1).select("*")
         rows = run(conn, q)
         if rows.len() == 0 {
             return none
@@ -157,6 +268,28 @@ pub class Repository<T> {
     fn where(conn: Connection, col: string, op: string, value: dyn): List<T> {
         q = table(self.tbl).filter(col, op, value).select("*")
         return self.map_rows(run(conn, q))
+    }
+
+    // --- The immediate write -----------------------------------------------------------------
+
+    // Insert `entity` NOW — outside the unit of work — and answer the row the database stored, mapped
+    // to the model. This is the door for a model whose key (or timestamp, or any other `#[Generated]`
+    // column) the database assigns: `RETURNING *` brings the assigned values back in the same
+    // statement, so the answer is the entity as it now exists — with no second query to race another
+    // writer, and no driver-specific last-inserted-id call.
+    //
+    // It exists BESIDE `add`/`flush` rather than replacing them because the two answer different
+    // questions. `add` stages a value, and a staged value cannot be told what it became — nothing can
+    // reach back into the caller's copy of it. Batching many rows is `add` … `flush`; needing the
+    // stored row back is this.
+    fn insert(conn: Connection, entity: T): T {
+        rows = run(conn, self.build_insert_returning(entity))
+        if rows.len() == 0 {
+            return panic(
+                "para.db: inserting into `${self.tbl}` returned no row — the statement wrote nothing back. `RETURNING` needs SQLite 3.35 or newer (2021); on an older library the insert itself may have succeeded, so re-read before retrying",
+            )
+        }
+        return self.map_row(rows[0])
     }
 
     // --- Unit of work: stage changes now, flush them as one batch later. ---------------------
@@ -178,31 +311,53 @@ pub class Repository<T> {
         self.pending_remove = self.pending_remove ~ [id]
     }
 
-    // Build the INSERT statement for one staged-new entity: all its columns/values.
-    fn build_insert(entity: T): Query {
-        m = columns_of(entity)
-        cols = m.keys()
-        mut vals: List<dyn> = []
-        for c in cols {
-            vals = vals ~ [m[c]]
+    // The columns an INSERT of this model may send: every column it carries EXCEPT the ones the
+    // database assigns. A model with no `#[Generated]` field sends all of them, exactly as before.
+    fn sendable(columns: List<string>): List<string> {
+        skip = self.generated_columns()
+        mut cols: List<string> = []
+        for c in columns {
+            if !skip.contains(c) {
+                cols = cols ~ [c]
+            }
         }
-        return table(self.tbl).insert(cols, vals)
+        return cols
     }
 
-    // Build the UPDATE statement for one staged-dirty entity: SET every non-pk column WHERE pk = its
-    // own primary-key value.
+    // Build the INSERT statement for one staged-new entity: its columns/values, minus what the
+    // database assigns.
+    fn build_insert(entity: T): Query {
+        m = columns_of(entity)
+        cols = self.sendable(m.keys())
+        return table(self.tbl).insert(cols, values_at(m, cols))
+    }
+
+    // The same INSERT, asking for the stored row back — what `insert` runs. It is a separate builder
+    // rather than a flag so the staged path and the immediate path visibly compose the same columns.
+    fn build_insert_returning(entity: T): Query {
+        m = columns_of(entity)
+        cols = self.sendable(m.keys())
+        return table(self.tbl).insert_returning(cols, values_at(m, cols))
+    }
+
+    // Build the UPDATE statement for one staged-dirty entity: SET every column the MODEL owns —
+    // neither the primary key (it is the WHERE, not a SET) nor a `#[Generated]` column (the database
+    // owns that one; assigning the model's copy of it would either change nothing or clobber what the
+    // database decided) — WHERE pk = its own primary-key value.
     fn build_update(entity: T): Query {
         m = columns_of(entity)
-        pk_value = m[self.pk]
+        pk = self.key()
+        pk_value = m[pk]
+        keep = self.sendable(m.keys())
         mut cols: List<string> = []
         mut vals: List<dyn> = []
-        for c in m.keys() {
-            if c != self.pk {
+        for c in keep {
+            if c != pk {
                 cols = cols ~ [c]
                 vals = vals ~ [m[c]]
             }
         }
-        return table(self.tbl).filter(self.pk, "=", pk_value).update(cols, vals)
+        return table(self.tbl).filter(pk, "=", pk_value).update(cols, vals)
     }
 
     // Commit every staged change as one batch inside a single transaction, then clear the pending
@@ -225,7 +380,7 @@ pub class Repository<T> {
             count = count + 1
         }
         for id in self.pending_remove {
-            q = table(self.tbl).filter(self.pk, "=", id).delete()
+            q = table(self.tbl).filter(self.key(), "=", id).delete()
             exec(conn, q)
             count = count + 1
         }
@@ -248,4 +403,38 @@ pub class Repository<T> {
 // `to_json` (from `@derive(Serialize<Json>)`) then `parse` — the keys are the columns.
 fn columns_of(entity: dyn): Map<string, dyn> {
     return json.parse(entity.to_json()).as<Map<string, dyn>>() ?? {}
+}
+
+// The values of `cols`, in the order `cols` names them — the bindings that line up positionally with
+// the column list a statement was built from. Taking the order from the LIST rather than from the map
+// is what keeps a column and its value aligned once some columns are dropped.
+fn values_at(m: Map<string, dyn>, cols: List<string>): List<dyn> {
+    mut vals: List<dyn> = []
+    for c in cols {
+        vals = vals ~ [m[c]]
+    }
+    return vals
+}
+
+// Whether a field descriptor's own attributes mark it the primary key. `FieldSpec.attrs` holds the
+// materialized `#[...]` instances, so this is a narrow over that list — the same shape `params_of`
+// hands a parameter's, and the reason neither surface has to re-join the attribute manifest by hand.
+fn carries_key(attrs: List<dyn>): bool {
+    for a in attrs {
+        if a is Key {
+            return true
+        }
+    }
+    return false
+}
+
+// Whether a field descriptor's own attributes mark it database-assigned. Twin of `carries_key`; the
+// two are independent, and a `SERIAL` primary key answers true to both.
+fn carries_generated(attrs: List<dyn>): bool {
+    for a in attrs {
+        if a is Generated {
+            return true
+        }
+    }
+    return false
 }

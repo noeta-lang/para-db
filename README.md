@@ -11,7 +11,7 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
 - **`Connection`** — `execute(sql, params) -> int` / `query(sql, params) -> List<Map<string, dyn>>` with positional `?` bind parameters (rewritten per driver; never string-spliced, so no injection risk), plus `notify(channel)` (fire a change notification: Postgres `NOTIFY`, an in-process bus publish on SQLite), `migrate(dir)`, `seed(dir)`, `close()`.
 - **`para.db.query`** (pure Noeta) — a fluent query builder: `table("users").filter("age", ">", 18).order("name", "asc").limit(20)`.
 - **`para.db.schema`** (pure Noeta) — a portable schema builder, the DDL peer of the query builder: `create_table("todos").id().text("title").bool("done").default(false).timestamps()`, lowered to each driver's own DDL. What a `.noe` migration's `migrate()` returns.
-- **`para.db.repo`** (pure Noeta) — repository + unit-of-work: stage writes during a request, flush them as one transactional batch.
+- **`para.db.repo`** (pure Noeta) — repository + unit-of-work: stage writes during a request, flush them as one transactional batch. The model declares its own key and its database-assigned columns with `#[Key]` / `#[Generated]`.
 - **`para.db.sql`** (pure Noeta) — the typed `@sql { … }` block tier: `${…}` holes are always bound parameters, never spliced.
 - **`para.db.reactive`** (pure Noeta) — `LiveRepository<T>` + `db.watch`: reactive queries that re-run when the data changes (SQLite update hooks / Postgres `LISTEN`/`NOTIFY`).
 - **The `noeta migrate` command** — this package contributes a migration/seed engine to the CLI; a consumer opts in by binding it a local name under `[trust.commands]`.
@@ -21,7 +21,7 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
 
 ```toml
 [dependencies]
-para = { version = "^0.1", package = "para/db" }
+para = { version = "^0.3", package = "para/db" }
 
 [trust]
 native = ["para/db"]      # authorizes the package's native driver crate
@@ -85,6 +85,21 @@ exec(conn, table("users").upsert(["id", "name"], [1, "Ada Lovelace"], ["id"]))
 `insert_or_ignore` inserts the row unless it would violate a unique/primary-key constraint, in which case the statement affects 0 rows instead of failing. `upsert(columns, values, conflict)` names the columns of the constraint that decides "already exists" and refreshes every *other* column from the incoming row; when `conflict` covers every column there is nothing left to assign and it emits `ON CONFLICT DO NOTHING` (an empty `SET` is a syntax error, and overwriting a row with what it already holds is a no-op anyway).
 
 Both spellings are accepted **verbatim by SQLite and by PostgreSQL** — unlike SQLite's `INSERT OR IGNORE`, which fails on PostgreSQL with `syntax error at or near "OR"` — so neither needs a per-dialect lowering and neither costs the builder a placeholder.
+
+**Learning what the database assigned — `insert_returning`.** An insert that answers the row it wrote, which is how a caller reads back a `SERIAL` key or a `DEFAULT now()` timestamp without a second query to race and without a driver-specific last-inserted-id call:
+
+```noeta
+// INSERT INTO todos (title, done) VALUES (?, ?) RETURNING *
+rows = run(conn, table("todos").insert_returning(["title", "done"], ["write it", false]))
+echo rows[0]["id"]
+
+// A narrower answer: RETURNING id
+rows = run(conn, table("todos").insert_returning(["title"], ["write it"], "id"))
+```
+
+Run it with `run`, not `exec` — it answers rows, which is the point. `RETURNING` is portable on the same terms as the conflict clauses: PostgreSQL has always had it, SQLite since 3.35 (2021). The repository's `insert` ([below](#repository--unit-of-work--typed-models-batched-writes)) is built on this.
+
+Naming **no** column — every column of the table is one the database assigns — composes `INSERT INTO <table> DEFAULT VALUES`, which both backends accept; the `(…) VALUES (…)` form with two empty lists is a syntax error on both. A conflict clause is refused on that row rather than composed, since SQLite's grammar takes no upsert clause after `DEFAULT VALUES`.
 
 ## Schema DSL — portable DDL, lowered per driver
 
@@ -164,9 +179,43 @@ Foreign keys are emitted on both backends, but **SQLite only enforces them when 
 
 ## Repository & unit of work — typed models, batched writes
 
-`para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and **the model is the repository's type argument** — `Repository<User>` over its table and its primary-key column. The decode registry rows map through is keyed by name, and the repository reads that name off its own instantiation: an instance records its type arguments at construction, so `type_name::<T>()` inside a method answers the **qualified** identity the registry holds. A model under a `namespace` therefore needs no hand-written `"app.storage.User"`, and renaming or moving it cannot silently desynchronize the mapping. The annotation is load-bearing — `users: Repository<User> = Repository.new(…)` is what records the instantiation, and a repository built where the instantiation is not concrete aborts on its first mapped row rather than guessing. **A caller never casts**: both directions of the mapping are typed as the model.
+`para.db.repo` maps rows to and from a typed model struct by reflection over JSON: the model derives both `Serialize<Json>` (model → columns) and `Deserialize<Json>` (row → model), and **the model is the repository's type argument** — `Repository<User>` over its table and its primary-key column (which the model itself can declare, [below](#the-model-declares-which-columns-are-the-databases)). The decode registry rows map through is keyed by name, and the repository reads that name off its own instantiation: an instance records its type arguments at construction, so `type_name::<T>()` inside a method answers the **qualified** identity the registry holds. A model under a `namespace` therefore needs no hand-written `"app.storage.User"`, and renaming or moving it cannot silently desynchronize the mapping. The annotation is load-bearing — `users: Repository<User> = Repository.new(…)` is what records the instantiation, and a repository built where the instantiation is not concrete aborts on its first mapped row rather than guessing. **A caller never casts**: both directions of the mapping are typed as the model.
 
 Writes are the **unit of work**, and they are **typed as the model**: `add(entity: T)` / `save(entity: T)` *stage* an insert / a by-primary-key update, `remove(id)` a delete, and `flush(conn)` commits everything staged as one batch inside a single transaction (`BEGIN` … `COMMIT`), returning the statement count — a failure before `COMMIT` leaves the batch to the transaction to undo. `discard()` drops the staged changes without touching the database. Because `T` substitutes from the receiver's instantiation, handing a `Repository<User>` anything but a `User` is a compile error at the call site (`argument of type 'Order' is not assignable to 'User'`) rather than a malformed row at flush time. `remove(id)` stays `dyn` deliberately: it takes a primary-key *value*, not a model.
+
+### The model declares which columns are the database's
+
+Two field attributes say what a repository cannot infer, and they are ordinary `@attribute` structs read off `field_specs_of`, so each fact lives on the field it is about and survives a rename:
+
+- **`#[Key]`** — this field is the primary key. A repository built without an explicit key column reads it from here, so the key is named once rather than restated beside every repository over the model.
+- **`#[Generated]`** — the **database** assigns this column: a `SERIAL`/`AUTOINCREMENT` key, a `created_at DEFAULT now()`, a computed column. It is never sent — left out of the INSERT's column list, and out of the UPDATE's `SET` list (assigning the model's copy of a value the database owns either changes nothing or clobbers what it just decided).
+
+```noeta
+use para.db.repo.{Repository, Key, Generated}
+
+@derive(Serialize<Json>, Deserialize<Json>)
+struct Todo {
+    #[Key]
+    #[Generated]
+    id: int = 0
+    title: string
+    done: bool = false
+}
+
+todos: Repository<Todo> = Repository.new("todos")      // no key column: the model marks it
+
+// The database assigns the id, so the INSERT names `title` and `done` only.
+todos.add(Todo { title: "read the docs" })
+todos.flush(conn)
+
+// …and the door that hands the assigned key back: INSERT … RETURNING *, mapped to the model.
+stored = todos.insert(conn, Todo { title: "write the post" })
+echo stored.id                                          // what the database chose
+```
+
+The two attributes are **independent** and compose: a `SERIAL` primary key is both, a UUID key the app picks is `#[Key]` alone, a `created_at` is `#[Generated]` alone. Giving a generated field a default (`= 0`) is what lets the literal omit it entirely, so `Todo { title: "…" }` is a complete `Todo` on the way in. A model that marks nothing behaves exactly as before — every column it carries is sent, and the key is the one named at construction. Marking two fields `#[Key]` is an error naming both: a composite key is not expressible here, and silently picking one would write UPDATEs and DELETEs that match the wrong rows. To write a generated column deliberately anyway (a seed restoring explicit ids), go around the repository — the query builder and `@sql` send exactly the columns you name.
+
+**`insert(conn, entity)` is the immediate write**, beside — not instead of — the unit of work, because the two answer different questions. `add` stages a *value*, and a staged value cannot be told what it became: nothing can reach back into the caller's copy of it. So batching many rows is `add` … `flush`; needing the stored row back is `insert`, which runs `INSERT … RETURNING *` now and answers the entity as the database actually stored it, mapped through the same decoder every read uses.
 
 Reads go straight to the connection and **answer the model too**: `find(conn, id)` is a `?User` (`none` when — and only when — there is no such row), `all(conn)` and `where(conn, col, op, value)` are a `List<User>`. The mapping is entirely inside the repository — the row is decoded through the name-keyed registry and narrowed back to `T` with `.as<T>()`, both read off the receiver's own instantiation — so no caller narrows a read.
 
@@ -405,7 +454,7 @@ use para.db.reactive.LiveRepository
 use std.reactive.effect
 
 conn = db.connect("sqlite::memory:")           // or postgres://…
-users: LiveRepository<User> = LiveRepository.new("users", "id", conn)
+users: LiveRepository<User> = LiveRepository.new("users", conn, "id")
 
 live = users.all()                             // a reactive query (a computed)
 effect(fn() {
@@ -417,7 +466,7 @@ users.flush()                                  // commit + notify
 users.pump()                                   // deliver notifications → the effect re-runs
 ```
 
-`LiveRepository<T>` is a plain `Repository<T>` plus three additions: `all()` returns a reactive query, `flush()` notifies after committing, and `pump()` (called from your loop, e.g. the serve loop) delivers pending change notifications and wakes the reactive graph. Under the hood it composes `db.watch(conn, channel)` — a reactive source node over a change-notification channel — with a repository it builds itself: `LiveRepository.new(tbl, pk, conn)` takes the same table and primary key the plain constructor does, and the inner `Repository<T>` inherits this instance's `T`, so it resolves the model exactly as a hand-built one would. The layering is unchanged — the plain repository still does the mapping and the unit of work. The source is also usable directly: a `computed` that reads `watch.get()` and re-queries the table re-runs whenever a fired notification is pumped in with `watch.pump()` (see `watch_demo.noe`).
+`LiveRepository<T>` is a plain `Repository<T>` plus four additions: `all()` returns a reactive query, `flush()` notifies after committing, `insert(entity)` writes immediately and notifies (it is not staged, so there is no `flush` after it to do that), and `pump()` (called from your loop, e.g. the serve loop) delivers pending change notifications and wakes the reactive graph. Under the hood it composes `db.watch(conn, channel)` — a reactive source node over a change-notification channel — with a repository it builds itself: `LiveRepository.new(tbl, conn, pk)` takes the same table and primary key the plain constructor does, with `pk` optional for the same reason (the model's `#[Key]`), and the inner `Repository<T>` inherits this instance's `T`, so it resolves the model exactly as a hand-built one would. The connection comes second, before the optional key column, because an argument carrying a default has to come last. The layering is unchanged — the plain repository still does the mapping and the unit of work. The source is also usable directly: a `computed` that reads `watch.get()` and re-queries the table re-runs whenever a fired notification is pumped in with `watch.pump()` (see `watch_demo.noe`).
 
 **How far a change propagates depends on the driver:**
 
@@ -456,7 +505,7 @@ For **other editors** (or a custom setup), `@sql { … }` bodies highlight as SQ
 
 ## Requirements
 
-Consumers compile this package's native driver crate locally: `cargo` and a Rust toolchain (1.95+) must be on `PATH`. The Noeta toolchain composes and builds it automatically on first use. SQLite is bundled (compiled from source — no system libsqlite3 needed); the Postgres driver rides the opt-in `ring-postgres` feature — the composed toolchain auto-enables it (no flags needed), and a `--native` (AOT) build requests it in the manifest with `[native] rings = ["ring-postgres"]`.
+Noeta 0.4 or newer (`toolchain = ">=0.4"`). Consumers compile this package's native driver crate locally: `cargo` and a Rust toolchain (1.95+) must be on `PATH`. The Noeta toolchain composes and builds it automatically on first use. SQLite is bundled (compiled from source — no system libsqlite3 needed); the Postgres driver rides the opt-in `ring-postgres` feature — the composed toolchain auto-enables it (no flags needed), and a `--native` (AOT) build requests it in the manifest with `[native] rings = ["ring-postgres"]`.
 
 ## Development
 

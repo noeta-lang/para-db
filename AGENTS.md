@@ -9,7 +9,7 @@ Guidance for coding agents working in this repo — the standalone repo of the *
 - `crates/noeta-para-db/` — the impl crate: the `db` module + `Connection` extern type, the `SqlDriver` seam (SQLite behind default-on `ring-sqlite`, PostgreSQL behind opt-in `ring-postgres`), the portable schema DSL (`schema.rs`: parser, neutral IR, per-`Dialect` lowering — wired in at `SqlDriver::lower_schema`, the same seam as the `?`→`$N` rewrite), the migration/seed engine, and the `noeta migrate` contributed command. `program.rs` holds the `.noe` seed entry convention (`db.run_seed(dsn, seed)`); the engine reaches it through the injected `migrate::ProgramRunner`, since only the CLI can run a program. `migrate::DirKind` is the gate that keeps `.noe` a **seeds-only** body language — a `.noe` file in the migrations directory is a hard error, never a silent skip.
 - `native/` — the thin entry crate the manifest's `native` key points at; re-exports `NOETA_EXTENSIONS`.
 - `editors/` — the `@sql` TextMate injection grammar.
-- `examples/para-db-demo/` — one standalone package, many entry demos, with its committed `noeta.lock`.
+- `examples/para-db-demo/` — one standalone package, many entry demos. CI checks + tests the hermetic (SQLite/in-memory) ones by name, so a **new demo has to be added to that list in `ci.yml`** or it is never run.
 - `.github/workflows/` — CI (`ci.yml`) and the tag-triggered registry publish (`release.yml`).
 
 ## Build & test
@@ -22,7 +22,8 @@ Guidance for coding agents working in this repo — the standalone repo of the *
 
 ## Conventions
 
-- `noeta.lock` files under `examples/` **are committed** — leave resolved locks in place.
+- `noeta.lock` files under `examples/` are **gitignored** — an example is a demo, not a package root, and its lock regenerates on every run. (This package, a library, carries no root lock either: it resolves at the consumer.)
+- A demo's assertions belong in an `@test` block. CI runs `noeta check` + `noeta test` and **nothing else** — an `echo` that "shows" the behavior is not a gate, and a demo with no `@test` reports "no tests found" while passing.
 - Rust: default `rustfmt` style (no `rustfmt.toml`), `cargo clippy --all-targets -- -D warnings` clean, zero compiler warnings; the CI toolchain is pinned at 1.97.0 — lint against it locally (a floating `@stable` surfaces lints CI doesn't have yet, and vice versa). `clippy::needless_update` is allowed in `crates/noeta-para-db/Cargo.toml`: the ABI's documented `..ExtFn::DEFAULTS` additive-evolution convention trips it whenever `ExtFn` happens to have no optional fields.
 - Rust naming: `snake_case` files/functions, `PascalCase` types, `SCREAMING_SNAKE_CASE` constants; prefer enums and constants over magic strings.
 - Markdown never hard-wraps lines.

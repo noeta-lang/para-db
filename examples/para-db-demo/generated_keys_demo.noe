@@ -1,0 +1,243 @@
+// A model whose key the DATABASE assigns — `SERIAL` on Postgres, `INTEGER PRIMARY KEY AUTOINCREMENT`
+// on SQLite — and the two attributes that let the repository write it correctly (DB2).
+//
+//   noeta run examples/para-db-demo/generated_keys_demo.noe
+//   noeta test examples/para-db-demo/generated_keys_demo.noe
+//
+// The problem this closes: a repository stages WHOLE entities, so an insert used to send every column
+// the model carries, `id` included — and a `Todo { id: 0, … }` on the way in inserted a row whose id
+// really was 0. The fix is not a special case in the repository but a fact the MODEL states: `#[Key]`
+// marks the primary key, `#[Generated]` marks a column the database assigns. A generated column is
+// left out of the INSERT and out of the UPDATE's SET list, so staging a whole entity is right even
+// when the model does not know its key yet.
+//
+// Learning the assigned key is the other half, and it is a separate door on purpose: `add` stages a
+// VALUE, and nothing can write the key back into the caller's copy of it. `insert(conn, entity)` runs
+// `INSERT … RETURNING *` immediately and answers the row the database stored.
+use para.db
+use para.db.Connection
+use para.db.repo.{Repository, Key, Generated}
+
+// The model. `id` is both facts at once: it is the primary key AND the database assigns it. They are
+// independent attributes that happen to coincide on a `SERIAL` — `created_at` below is generated but
+// is not a key, and a UUID the app picks would be a key that is not generated.
+//
+// The `= 0` default is what lets the literal leave it out entirely: `Todo { title: "…" }` is a
+// complete `Todo`, and the id it comes back with is the one the database chose.
+@derive(Serialize<Json>, Deserialize<Json>)
+struct Todo {
+    #[Key]
+    #[Generated]
+    id: int = 0
+    title: string
+    done: bool = false
+}
+
+// A second model to show the two attributes are orthogonal: `created_at` is filled by the column's
+// own `DEFAULT`, so it is `#[Generated]` without being the key.
+@derive(Serialize<Json>, Deserialize<Json>)
+struct Note {
+    #[Key]
+    #[Generated]
+    id: int = 0
+    body: string
+    #[Generated]
+    created_at: string = ""
+}
+
+fn open_todos(): Connection {
+    conn = db.connect("sqlite::memory:")
+    conn.execute(
+        "CREATE TABLE todos (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, done BOOLEAN NOT NULL DEFAULT 0)",
+        [],
+    )
+    return conn
+}
+
+fn open_notes(): Connection {
+    conn = db.connect("sqlite::memory:")
+    conn.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        [],
+    )
+    return conn
+}
+
+conn = open_todos()
+
+// No primary-key column named here: the model marks it `#[Key]`, so the repository reads it.
+todos: Repository<Todo> = Repository.new("todos")
+
+// The immediate door — insert now, and be told what the row became.
+first = todos.insert(conn, Todo { title: "write the post" })
+echo "insert  -> #${first.id} ${first.title}"
+
+// The batch door — stage whole entities and flush them in one transaction. Each INSERT names `title`
+// and `done` only, so the database assigns every id.
+todos.add(Todo { title: "read the docs" })
+todos.add(Todo { title: "ship it", done: true })
+echo "flushed ${todos.flush(conn)} statements"
+
+for t in todos.all(conn) {
+    echo "  #${t.id} ${t.title} (done=${t.done})"
+}
+
+// The SQL the two doors compose, side by side.
+echo "insert sql: ${todos.build_insert(Todo { title: "x" }).sql}"
+echo "update sql: ${todos.build_update(Todo { id: 1, title: "x", done: true }).sql}"
+
+conn.close()
+
+@test {
+    // --- What the model declares -----------------------------------------------------------------
+
+    fn the_key_comes_off_the_models_own_field(): void {
+        todos: Repository<Todo> = Repository.new("todos")
+        assert(todos.key() == "id", "expected the `#[Key]` field, got `${todos.key()}`")
+    }
+
+    fn a_column_named_at_construction_still_wins(): void {
+        // The override for a table whose key the model does not mark — and proof the attribute is a
+        // default, not a takeover.
+        todos: Repository<Todo> = Repository.new("todos", "title")
+        assert(todos.key() == "title", "an explicit key column must win, got `${todos.key()}`")
+    }
+
+    fn generated_columns_are_the_models_generated_fields(): void {
+        notes: Repository<Note> = Repository.new("notes")
+        cols = notes.generated_columns()
+        assert(cols.len() == 2, "expected both generated columns, got ${cols}")
+        assert(cols.contains("id") && cols.contains("created_at"), "${cols}")
+    }
+
+    // --- What the statements send ----------------------------------------------------------------
+
+    fn an_insert_leaves_a_generated_column_to_the_database(): void {
+        todos: Repository<Todo> = Repository.new("todos")
+        q = todos.build_insert(Todo { title: "write it" })
+        // `id` is absent: this is the whole defect the attributes close.
+        assert(
+            q.sql == "INSERT INTO todos (done, title) VALUES (?, ?)",
+            q.sql,
+        )
+        assert(q.params.len() == 2, "one binding per named column, got ${q.params.len()}")
+    }
+
+    fn an_insert_that_asks_for_the_row_back_names_the_same_columns(): void {
+        todos: Repository<Todo> = Repository.new("todos")
+        q = todos.build_insert_returning(Todo { title: "write it" })
+        assert(
+            q.sql == "INSERT INTO todos (done, title) VALUES (?, ?) RETURNING *",
+            q.sql,
+        )
+    }
+
+    fn an_update_sets_neither_the_key_nor_a_generated_column(): void {
+        // `created_at` is generated but is not the key, so it is skipped for the OTHER reason: the
+        // database owns the value, and writing the model's copy back would clobber what it decided.
+        notes: Repository<Note> = Repository.new("notes")
+        q = notes.build_update(Note { id: 3, body: "edited", created_at: "1999-01-01" })
+        assert(
+            q.sql == "UPDATE notes SET body = ? WHERE id = ?",
+            q.sql,
+        )
+        assert(q.params.len() == 2, "the new body and the key, got ${q.params.len()}")
+    }
+
+    fn a_model_that_marks_nothing_still_sends_every_column(): void {
+        // The unannotated model is unchanged: every column it carries goes in the INSERT, and the key
+        // column is the one named at construction. No existing repository changes behavior.
+        conn = db.connect("sqlite::memory:")
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+        users: Repository<User> = Repository.new("users", "id")
+        q = users.build_insert(User { id: 4, name: "Ada" })
+        assert(q.sql == "INSERT INTO users (id, name) VALUES (?, ?)", q.sql)
+        users.add(User { id: 4, name: "Ada" })
+        assert(users.flush(conn) == 1)
+        assert(users.all(conn)[0].id == 4, "the model's own id must still be written")
+        conn.close()
+    }
+
+    // --- What the database does with them --------------------------------------------------------
+
+    fn insert_answers_the_row_the_database_stored(): void {
+        conn = open_todos()
+        todos: Repository<Todo> = Repository.new("todos")
+
+        first = todos.insert(conn, Todo { title: "write the post" })
+        second = todos.insert(conn, Todo { title: "ship it", done: true })
+
+        // The keys are the database's, handed back in the same statement that wrote them.
+        assert(first.id > 0, "the assigned key must come back, got ${first.id}")
+        assert(second.id == first.id + 1, "${first.id} then ${second.id}")
+        // …and the rest of the row is the row, not the argument echoed back.
+        assert(first.title == "write the post" && first.done == false, "${first.title}")
+        assert(second.done, "the written `done` must survive the round trip")
+        conn.close()
+    }
+
+    fn a_generated_column_that_is_not_a_key_comes_back_too(): void {
+        conn = open_notes()
+        notes: Repository<Note> = Repository.new("notes")
+        stored = notes.insert(conn, Note { body: "from the column default" })
+        assert(stored.id > 0, "the key is generated, got ${stored.id}")
+        assert(stored.created_at != "", "`created_at` is the column's DEFAULT, not the model's")
+        conn.close()
+    }
+
+    fn a_staged_insert_lets_the_database_assign_the_key(): void {
+        // The batch door, which is where the old defect showed: two staged todos both carrying the
+        // default `id: 0` used to insert a row whose id was 0 (and the second collided with it).
+        conn = open_todos()
+        todos: Repository<Todo> = Repository.new("todos")
+        todos.add(Todo { title: "read the docs" })
+        todos.add(Todo { title: "ship it", done: true })
+        assert(todos.flush(conn) == 2)
+
+        rows = todos.all(conn)
+        assert(rows.len() == 2, "expected both rows, got ${rows.len()}")
+        assert(rows[0].id > 0 && rows[1].id > 0, "neither key may be the model's `0`")
+        assert(rows[0].id != rows[1].id, "the database assigns each row its own key")
+        conn.close()
+    }
+
+    fn the_declared_key_is_what_find_and_remove_match_on(): void {
+        conn = open_todos()
+        todos: Repository<Todo> = Repository.new("todos")
+        stored = todos.insert(conn, Todo { title: "find me" })
+
+        found = todos.find(conn, stored.id)
+        assert(match found {
+            some(t) => t.title == "find me",
+            none => false,
+        }, "find must match on the model's `#[Key]` column")
+
+        todos.remove(stored.id)
+        assert(todos.flush(conn) == 1)
+        assert(todos.all(conn).len() == 0, "the delete must have matched the same column")
+        conn.close()
+    }
+
+    fn an_update_through_the_unit_of_work_keeps_the_assigned_key(): void {
+        conn = open_todos()
+        todos: Repository<Todo> = Repository.new("todos")
+        stored = todos.insert(conn, Todo { title: "toggle me" })
+
+        todos.save(Todo { id: stored.id, title: stored.title, done: true })
+        assert(todos.flush(conn) == 1)
+
+        after = todos.all(conn)
+        assert(after.len() == 1, "an UPDATE must not have inserted a second row")
+        assert(after[0].id == stored.id, "the key is the WHERE, so it must not move")
+        assert(after[0].done, "the flip must have been written")
+        conn.close()
+    }
+}
+
+// The unannotated counterpart used by the regression test above — deliberately plain: no attributes,
+// a key the app assigns, every column sent.
+@derive(Serialize<Json>, Deserialize<Json>)
+struct User {
+    id: int
+    name: string
+}
