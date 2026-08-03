@@ -73,12 +73,33 @@ pub class Q {
 
     // Build an `INSERT INTO <table> (cols) VALUES (?, …)`. `columns` names the columns; `values` are
     // the bound row values, positionally aligned.
+    //
+    // Naming NO column is a row made entirely of what the database assigns — every column of the
+    // table is a `SERIAL` key, or carries a `DEFAULT`. That is `INSERT INTO <table> DEFAULT VALUES`,
+    // accepted verbatim by SQLite and PostgreSQL, rather than the `(…) VALUES (…)` form with two
+    // empty lists, which is a syntax error on both.
     fn insert(columns: List<string>, values: List<dyn>): Query {
+        if columns.len() == 0 {
+            return Query { sql: "INSERT INTO ${self.tbl} DEFAULT VALUES", params: [] }
+        }
         placeholders = values.map(fn(v) => "?")
         col_list = columns.join(", ")
         value_list = placeholders.join(", ")
         sql = "INSERT INTO ${self.tbl} (${col_list}) VALUES (${value_list})"
         return Query { sql: sql, params: values }
+    }
+
+    // Build an `INSERT … RETURNING <returning>` — an insert that **answers the row it wrote**. It is
+    // how a caller learns what the database assigned (a `SERIAL`/`AUTOINCREMENT` key, a
+    // `DEFAULT now()` timestamp) without a second round trip and without a driver-specific
+    // last-inserted-id call, so it stays one statement even under concurrent writers.
+    //
+    // Portable with no per-dialect lowering, like the conflict clauses above: PostgreSQL has had
+    // `RETURNING` throughout, SQLite since 3.35 (2021). Run it with `run`, not `exec` — it answers
+    // ROWS, which is the whole point.
+    fn insert_returning(columns: List<string>, values: List<dyn>, returning: string = "*"): Query {
+        base = self.insert(columns, values)
+        return Query { sql: base.sql ~ " RETURNING ${returning}", params: base.params }
     }
 
     // Build an idempotent `INSERT … ON CONFLICT DO NOTHING`: the row is inserted unless it would
@@ -89,6 +110,7 @@ pub class Q {
     // both accept the untargeted `ON CONFLICT DO NOTHING`. (The SQLite-only `INSERT OR IGNORE`
     // spelling of the same idea is a hard syntax error on PostgreSQL — this builder never emits it.)
     fn insert_or_ignore(columns: List<string>, values: List<dyn>): Query {
+        guard_conflict_columns(columns)
         base = self.insert(columns, values)
         return Query { sql: base.sql ~ " ON CONFLICT DO NOTHING", params: base.params }
     }
@@ -108,6 +130,7 @@ pub class Q {
         if conflict.len() == 0 {
             panic("para.db.query: upsert needs at least one conflict column (the unique/primary-key columns that decide whether the row already exists); use insert_or_ignore for an untargeted skip")
         }
+        guard_conflict_columns(columns)
         base = self.insert(columns, values)
         mut assignments: List<string> = []
         for c in columns {
@@ -132,6 +155,16 @@ pub class Q {
         clause = self.tail()
         sql = "UPDATE ${self.tbl} SET ${set_list}${clause}"
         return Query { sql: sql, params: values ~ self.bindings }
+    }
+}
+
+// A conflict clause needs a row to conflict about. The all-defaults insert (`DEFAULT VALUES`, the
+// empty-`columns` form above) takes no `ON CONFLICT` on SQLite at all — its grammar allows an upsert
+// clause only after `VALUES`/`SELECT` — so the two are refused together here rather than composed
+// into a statement that runs on one backend and is a syntax error on the other.
+fn guard_conflict_columns(columns: List<string>): void {
+    if columns.len() == 0 {
+        panic("para.db.query: a conflict clause needs at least one inserted column — a row made entirely of database-assigned columns has nothing to conflict about; use insert(...) for the `DEFAULT VALUES` form")
     }
 }
 

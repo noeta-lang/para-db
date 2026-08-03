@@ -7,7 +7,7 @@
 //
 // No database is opened here: what this demo is about is the SQL the builder composes, so the
 // assertions below are the portability contract in executable form.
-use para.db.query.{table}
+use para.db.query.table
 
 skip = table("users").insert_or_ignore(["id", "name"], [1, "Ada"])
 echo "insert_or_ignore: ${skip.sql}"
@@ -18,7 +18,7 @@ echo "upsert:           ${up.sql}"
 composite = table("memberships").upsert(
     ["team", "person", "role"],
     ["core", "ada", "lead"],
-    ["team", "person"]
+    ["team", "person"],
 )
 echo "composite upsert: ${composite.sql}"
 
@@ -33,7 +33,7 @@ echo "composite upsert: ${composite.sql}"
         q = table("users").insert_or_ignore(["id", "name"], [1, "Ada"])
         assert(
             q.sql == "INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
-            q.sql
+            q.sql,
         )
         // Values stay bound — the conflict clause adds no placeholders of its own.
         assert(q.params.len() == 2)
@@ -43,7 +43,7 @@ echo "composite upsert: ${composite.sql}"
         q = table("users").upsert(["id", "name", "age"], [1, "Ada", 36], ["id"])
         assert(
             q.sql == "INSERT INTO users (id, name, age) VALUES (?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, age = excluded.age",
-            q.sql
+            q.sql,
         )
         assert(q.params.len() == 3)
     }
@@ -52,11 +52,11 @@ echo "composite upsert: ${composite.sql}"
         q = table("memberships").upsert(
             ["team", "person", "role"],
             ["core", "ada", "lead"],
-            ["team", "person"]
+            ["team", "person"],
         )
         assert(
             q.sql == "INSERT INTO memberships (team, person, role) VALUES (?, ?, ?) ON CONFLICT (team, person) DO UPDATE SET role = excluded.role",
-            q.sql
+            q.sql,
         )
     }
 
@@ -66,5 +66,36 @@ echo "composite upsert: ${composite.sql}"
         // and "do nothing" are the same thing, so it emits the legal one.
         q = table("tags").upsert(["a", "b"], [1, 2], ["a", "b"])
         assert(q.sql == "INSERT INTO tags (a, b) VALUES (?, ?) ON CONFLICT DO NOTHING", q.sql)
+    }
+
+    // --- The other two portable terminals --------------------------------------------------------
+
+    fn insert_returning_asks_for_the_row_it_wrote(): void {
+        // How a caller learns what the database assigned — a `SERIAL` key, a `DEFAULT` timestamp —
+        // in the SAME statement, rather than through a driver-specific last-inserted-id call. It is
+        // verbatim-portable too: PostgreSQL has always had `RETURNING`, SQLite since 3.35.
+        q = table("todos").insert_returning(["title", "done"], ["write it", false])
+        assert(
+            q.sql == "INSERT INTO todos (title, done) VALUES (?, ?) RETURNING *",
+            q.sql,
+        )
+        assert(q.params.len() == 2, "RETURNING binds nothing of its own")
+    }
+
+    fn insert_returning_takes_a_narrower_column_list(): void {
+        q = table("todos").insert_returning(["title"], ["write it"], "id")
+        assert(q.sql == "INSERT INTO todos (title) VALUES (?) RETURNING id", q.sql)
+    }
+
+    fn a_row_of_nothing_but_defaults_is_the_default_values_form(): void {
+        // Naming no column at all — every column of the table is one the database assigns — is
+        // `DEFAULT VALUES` on both backends. The `(…) VALUES (…)` form with two empty lists, which
+        // is what that row used to compose to, is a syntax error on both.
+        q = table("pings").insert([], [])
+        assert(q.sql == "INSERT INTO pings DEFAULT VALUES", q.sql)
+        assert(q.params.len() == 0)
+
+        back = table("pings").insert_returning([], [])
+        assert(back.sql == "INSERT INTO pings DEFAULT VALUES RETURNING *", back.sql)
     }
 }

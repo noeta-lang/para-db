@@ -30,9 +30,14 @@ pub class LiveRepository<T> {
     watch: Watch // over the table's NOTIFY channel
     channel: string // the NOTIFY channel (the table name)
 
-    // Name the model, the table, the primary key and the connection:
+    // Name the model, the table and the connection — plus the primary-key column, unless the model
+    // marks it `#[Key]` (`para.db.repo.Key`), which is where the inner repository reads it from:
     //
-    //   live: LiveRepository<User> = LiveRepository.new("users", "id", conn)
+    //   live: LiveRepository<User> = LiveRepository.new("users", conn)
+    //   live: LiveRepository<User> = LiveRepository.new("users", conn, "id")
+    //
+    // The connection comes SECOND — before the optional key column — because an argument with a
+    // default has to come last, and the connection is the one this never works without.
     //
     // The inner `Repository<T>` is built here, from this instance's own `T`: an instance records its
     // type arguments at construction, and a generic type constructing another generic from its own
@@ -42,7 +47,7 @@ pub class LiveRepository<T> {
     // reactive edges around it — but a caller no longer assembles it in two steps.
     //
     // The NOTIFY channel is the table; the watch listens on it immediately.
-    fn new(tbl: string, pk: string, conn: Connection): LiveRepository<T> {
+    fn new(tbl: string, conn: Connection, pk: string = ""): LiveRepository<T> {
         return LiveRepository {
             repo: Repository.new(tbl, pk),
             conn: conn,
@@ -74,6 +79,15 @@ pub class LiveRepository<T> {
 
     fn add(entity: T): void {
         self.repo.add(entity)
+    }
+
+    // Insert NOW and answer the stored row (see `Repository.insert` — the door for a model whose key
+    // the database assigns), then notify so watchers wake. It notifies on its own because it is not
+    // staged: there is no `flush` after it to do it.
+    fn insert(entity: T): T {
+        stored = self.repo.insert(self.conn, entity)
+        self.conn.notify(self.channel)
+        return stored
     }
 
     fn save(entity: T): void {
