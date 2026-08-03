@@ -1056,8 +1056,13 @@ mod tests {
         std::fs::write(
             dir.join("noeta.toml"),
             format!(
+                // The scope ARRAY form, for the reason spelled out at the schema cross-check
+                // fixture: a scope array's members each get the package's own root segment
+                // appended, so this package's modules derive as `para.db.*`. Bound as a plain
+                // table they derive as `para.*`, and the migration below — which imports
+                // `para.db.schema` exactly as a real consumer does — does not resolve.
                 "[package]\nname = \"noeta/noe_migration_e2e\"\nversion = \"0.1.0\"\n\n\
-                 [dependencies]\npara = {{ path = {root:?} }}\n\n\
+                 [dependencies]\npara = [{{ path = {root:?} }}]\n\n\
                  [trust]\nnative = [\"para/db\"]\n\n\
                  [trust.commands]\nmigrate = \"para/db\"\n"
             ),
