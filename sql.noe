@@ -3,8 +3,13 @@
 // `@sql { SELECT * FROM users WHERE id = ${id} }` evaluates to a `Sql` value — the statement text
 // with `?` placeholders plus the ordered bound parameters. A `${…}` hole is ALWAYS a bound
 // parameter, never string-spliced into the SQL, so a statement built from untrusted input carries no
-// injection risk by construction. Importing `sql` brings the `@sql` tier into scope (the `@tier`
-// declaration rides on the handler fn), exactly like para.html's `@html`.
+// injection risk by construction.
+//
+// The tier is enabled by the consuming project's manifest, NOT by importing `sql` — a file that
+// imports nothing at all still type-checks and runs an `@sql { … }` block. Importing the handler
+// only binds its name for a direct `sql(statics, holes)` call, which no caller needs; the demos
+// import it out of habit, and it is harmless. What a caller does need from this module is
+// `query`/`execute` (or the same pair as methods on the `Sql` the block returns).
 
 use para.db.Connection
 
