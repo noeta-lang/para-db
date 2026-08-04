@@ -79,6 +79,13 @@ rows = table("users").filter("age", ">", 30).select("name, age").run(conn)
 
 Neither spelling is the canonical one. They are the same operation and both land on `Connection.query`/`Connection.execute`; which reads better depends on whether you already hold the statement.
 
+`para.db.query.execute` and `para.db.sql.execute` deliberately share a name — they are the same operation over the two kinds of statement. Importing both unqualified is a compile error (`[E0020] … collides with another top-level name`), so a file that needs the builder *and* raw `@sql` gives one an alias, or imports the module and qualifies:
+
+```noeta
+use para.db.query.{table, execute}
+use para.db.sql.{sql, execute as sql_exec}   // or: use para.db.sql → sql.execute(conn, stmt)
+```
+
 In an `update(columns, values)`, the SET bindings come first and the builder's filter bindings follow; `delete()` binds this builder's filters. Filter values become bound parameters, so a query built from untrusted input carries no injection risk.
 
 **Conflict handling — `insert_or_ignore` and `upsert`.** Two more terminals turn an insert into a *re-runnable* one, which is what a seed needs:
