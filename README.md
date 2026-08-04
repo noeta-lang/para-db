@@ -21,7 +21,7 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
 
 ```toml
 [dependencies]
-para = { version = "^0.3", package = "para/db" }
+para = { version = "^0.4", package = "para/db" }
 
 [trust]
 native = ["para/db"]      # authorizes the package's native driver crate
@@ -48,27 +48,36 @@ rows = query(conn, @sql { SELECT * FROM users WHERE id > ${min_id} })
 echo rows.len()
 ```
 
-A `${…}` hole in an `@sql { … }` block is **always a bound parameter**: the block evaluates to a `Sql` value — the statement `text` with `?` placeholders plus its `params` in hole order — so a statement built from untrusted input carries no injection risk by construction. `query(conn, stmt)` runs it as a query; its sibling `execute(conn, stmt)` runs a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected. A bound parameter is a scalar — `int`, `float`, `bool`, `string`, `bytes`, or `none` (SQL `NULL`) — and a row comes back as a `Map<string, dyn>` keyed by column name, with `NULL` as `none` and every other column carrying the value kind its **declared type** promised (see [column types across the driver seam](#column-types-across-the-driver-seam)). Transactions are ordinary statements: `conn.execute("BEGIN", [])` / `"COMMIT"` / `"ROLLBACK"`.
+A `${…}` hole in an `@sql { … }` block is **always a bound parameter**: the block evaluates to a `Sql` value — the statement `text` with `?` placeholders plus its `params` in hole order — so a statement built from untrusted input carries no injection risk by construction. `query(conn, stmt)` runs it as a query; its sibling `execute(conn, stmt)` runs a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected. A `Sql` also carries both as methods — `stmt.query(conn)`, `stmt.execute(conn)` — though a tier block is not a method receiver on its own, so bind it first or parenthesize it: `(@sql { … }).execute(conn)`. A bound parameter is a scalar — `int`, `float`, `bool`, `string`, `bytes`, or `none` (SQL `NULL`) — and a row comes back as a `Map<string, dyn>` keyed by column name, with `NULL` as `none` and every other column carrying the value kind its **declared type** promised (see [column types across the driver seam](#column-types-across-the-driver-seam)). Transactions are ordinary statements: `conn.execute("BEGIN", [])` / `"COMMIT"` / `"ROLLBACK"`.
 
 **Swapping drivers is the dsn.** Everything above the driver — this raw surface, the query builder, the repository, `@sql`, migrations — runs unchanged over SQLite or PostgreSQL: `postgres_demo.noe` is `demo.noe` with only the connection string changed. The neutral `?` placeholders are rewritten to Postgres's `$1, $2, …` by the driver.
 
 ## Query builder — compose statements fluently
 
-`para.db.query` composes a `Query` — statement text with `?` placeholders plus its ordered bound parameters. `table(name)` starts a builder; `filter(col, op, value)` (ANDed with the others), `order(col, dir)` (`"asc"`/`"desc"`), and `limit(n)` chain; a terminal `select(cols)`, `insert(columns, values)`, `update(columns, values)`, or `delete()` builds the `Query`. `run(conn, q)` executes a query, returning its rows; `exec(conn, q)` executes a write, returning rows affected.
+`para.db.query` composes a `Query` — statement text with `?` placeholders plus its ordered bound parameters. `table(name)` starts a builder; `filter(col, op, value)` (ANDed with the others), `order(col, dir)` (`"asc"`/`"desc"`), and `limit(n)` chain; a terminal `select(cols)`, `insert(columns, values)`, `update(columns, values)`, or `delete()` builds the `Query`. `run(conn, q)` executes a query, returning its rows; `execute(conn, q)` executes a write, returning rows affected.
 
 ```noeta
 use para.db
-use para.db.query.{table, run, exec}
+use para.db.query.{table, run, execute}
 
 conn = db.connect("sqlite::memory:")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
 
 ins = table("users").insert(["name", "age"], ["Ada", 36])
-exec(conn, ins)
+execute(conn, ins)
 
 q = table("users").filter("age", ">", 30).order("age", "asc").limit(10).select("name, age")
 rows = run(conn, q)        // List<Map<string, dyn>>
 ```
+
+A `Query` carries the same two terminals as **methods** — `q.run(conn)` and `q.execute(conn)` — so a statement can run where it is built, without being named first:
+
+```noeta
+table("users").insert(["name", "age"], ["Ada", 36]).execute(conn)
+rows = table("users").filter("age", ">", 30).select("name, age").run(conn)
+```
+
+Neither spelling is the canonical one. They are the same operation and both land on `Connection.query`/`Connection.execute`; which reads better depends on whether you already hold the statement.
 
 In an `update(columns, values)`, the SET bindings come first and the builder's filter bindings follow; `delete()` binds this builder's filters. Filter values become bound parameters, so a query built from untrusted input carries no injection risk.
 
@@ -76,10 +85,10 @@ In an `update(columns, values)`, the SET bindings come first and the builder's f
 
 ```noeta
 // INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT DO NOTHING
-exec(conn, table("users").insert_or_ignore(["id", "name"], [1, "Ada"]))
+execute(conn, table("users").insert_or_ignore(["id", "name"], [1, "Ada"]))
 
 // INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name
-exec(conn, table("users").upsert(["id", "name"], [1, "Ada Lovelace"], ["id"]))
+execute(conn, table("users").upsert(["id", "name"], [1, "Ada Lovelace"], ["id"]))
 ```
 
 `insert_or_ignore` inserts the row unless it would violate a unique/primary-key constraint, in which case the statement affects 0 rows instead of failing. `upsert(columns, values, conflict)` names the columns of the constraint that decides "already exists" and refreshes every *other* column from the incoming row; when `conflict` covers every column there is nothing left to assign and it emits `ON CONFLICT DO NOTHING` (an empty `SET` is a syntax error, and overwriting a row with what it already holds is a no-op anyway).
@@ -97,7 +106,7 @@ echo rows[0]["id"]
 rows = run(conn, table("todos").insert_returning(["title"], ["write it"], "id"))
 ```
 
-Run it with `run`, not `exec` — it answers rows, which is the point. `RETURNING` is portable on the same terms as the conflict clauses: PostgreSQL has always had it, SQLite since 3.35 (2021). The repository's `insert` ([below](#repository--unit-of-work--typed-models-batched-writes)) is built on this.
+Run it with `run`, not `execute` — it answers rows, which is the point. `RETURNING` is portable on the same terms as the conflict clauses: PostgreSQL has always had it, SQLite since 3.35 (2021). The repository's `insert` ([below](#repository--unit-of-work--typed-models-batched-writes)) is built on this.
 
 Naming **no** column — every column of the table is one the database assigns — composes `INSERT INTO <table> DEFAULT VALUES`, which both backends accept; the `(…) VALUES (…)` form with two empty lists is a syntax error on both. A conflict clause is refused on that row rather than composed, since SQLite's grammar takes no upsert clause after `DEFAULT VALUES`.
 
@@ -368,11 +377,11 @@ For anything beyond a literal row, write the seed in Noeta and let the query bui
 ```noeta
 // seeds/20260719000002_more_users.noe
 use para.db
-use para.db.query.{table, exec}
+use para.db.query.{table, execute}
 
 fn seed(conn: db.Connection): void {
-    exec(conn, table("users").insert_or_ignore(["id", "name"], [102, "Katherine"]))
-    exec(conn, table("users").upsert(["id", "name"], [103, "Radia"], ["id"]))
+    execute(conn, table("users").insert_or_ignore(["id", "name"], [102, "Katherine"]))
+    execute(conn, table("users").upsert(["id", "name"], [103, "Radia"], ["id"]))
 }
 ```
 
@@ -501,7 +510,7 @@ For **other editors** (or a custom setup), `@sql { … }` bodies highlight as SQ
 
 ## Examples
 
-[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder) + `conflict_demo.noe` (the portable `ON CONFLICT` terminals), `schema_demo.noe` (the schema DSL) + `schema_migrate_demo.noe` (`.schema` and `.sql` migrations side by side, under `schema_migrations/`), `repo_demo.noe` (repository + unit-of-work) + `types_demo.noe` (column types across the seam: a `bool` model field, floats, blobs, and what a genuine model/table disagreement reports), `sql_demo.noe` (the `@sql` tier), `migrate_demo.noe` + `seed_demo.noe` (the engine; `seeds/` holds a portable `.sql` seed and a `.noe` program seed side by side, `boot_seeds/` the SQL-only directory a self-seeding app reads), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
+[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder) + `conflict_demo.noe` (the portable `ON CONFLICT` terminals), `schema_demo.noe` (the schema DSL) + `schema_migrate_demo.noe` (`.schema` and `.sql` migrations side by side, under `schema_migrations/`), `repo_demo.noe` (repository + unit-of-work) + `types_demo.noe` (column types across the seam: a `bool` model field, floats, blobs, and what a genuine model/table disagreement reports), `sql_demo.noe` (the `@sql` tier) + `fluent_demo.noe` (the terminals as methods), `migrate_demo.noe` + `seed_demo.noe` (the engine; `seeds/` holds a portable `.sql` seed and a `.noe` program seed side by side, `boot_seeds/` the SQL-only directory a self-seeding app reads), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
 
 ## Requirements
 

@@ -9,9 +9,22 @@
 use para.db.Connection
 
 // A typed SQL statement: the text (with positional `?` placeholders) and its bound parameters.
+//
+// The two terminals are methods as well as the module-level functions below, so a statement can be
+// run where it is written. `Query` carries the same pair for the same reason.
 pub struct Sql {
     text: string
     params: List<dyn>
+
+    // Run this statement as a query, returning its rows.
+    fn query(conn: Connection): List<Map<string, dyn>> {
+        return conn.query(self.text, self.params)
+    }
+
+    // Run this statement as a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected.
+    fn execute(conn: Connection): int {
+        return conn.execute(self.text, self.params)
+    }
 }
 
 // The `@sql` expression tier handler. The block's verbatim SQL arrives as `statics` (one more than
@@ -36,10 +49,10 @@ pub fn sql(statics: List<string>, holes: List<() -> dyn>): Sql {
 
 // Run a `@sql` statement as a query, returning its rows (`List<Map<string, dyn>>`).
 pub fn query(conn: Connection, stmt: Sql): List<Map<string, dyn>> {
-    return conn.query(stmt.text, stmt.params)
+    return stmt.query(conn)
 }
 
 // Run a `@sql` statement as a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected.
 pub fn execute(conn: Connection, stmt: Sql): int {
-    return conn.execute(stmt.text, stmt.params)
+    return stmt.execute(conn)
 }

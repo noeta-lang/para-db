@@ -109,7 +109,7 @@ jobs:
       - name: noeta check + test the hermetic demos
         working-directory: examples/para-db-demo
         run: |
-          for f in demo.noe query_demo.noe conflict_demo.noe repo_demo.noe generated_keys_demo.noe types_demo.noe sql_demo.noe migrate_demo.noe seed_demo.noe reactive_demo.noe live_repo_sqlite_demo.noe; do
+          for f in demo.noe query_demo.noe conflict_demo.noe repo_demo.noe generated_keys_demo.noe types_demo.noe sql_demo.noe fluent_demo.noe migrate_demo.noe seed_demo.noe reactive_demo.noe live_repo_sqlite_demo.noe; do
             echo "== ${f}"
             noeta check "${f}"
             noeta test "${f}"

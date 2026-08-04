@@ -1,0 +1,76 @@
+// The fluent terminals (0.4): a composed statement runs where it is built.
+//
+// `run`/`execute` exist twice on purpose, and neither spelling is the "real" one — they are the same
+// two operations, and which reads better depends on where the statement came from. Built inline, the
+// method keeps the call in reading order; held in a variable already, the module-level function puts
+// the verb first. Both land on `Connection.query`/`Connection.execute`.
+//
+// One syntax note for `@sql`: a tier block is not a method receiver on its own, so
+// `@sql { … }.execute(conn)` is a parse error. Bind it (`stmt = @sql { … }` then `stmt.execute(conn)`)
+// or parenthesize it — both are below. The builder has no such limitation.
+use para.db
+use para.db.query.{table, run, execute}
+use para.db.sql.sql
+
+conn = db.connect("sqlite::memory:")
+
+ddl = @sql { CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER) }
+ddl.execute(conn)
+
+// Writes through the builder's terminal: no name for the statement, no wrapper call.
+table("users").insert(["name", "age"], ["Ada", 36]).execute(conn)
+table("users").insert(["name", "age"], ["Bob", 41]).execute(conn)
+
+// Reads the same way.
+rows = table("users").filter("age", ">", 30).order("age", "asc").select("name, age").run(conn)
+for r in rows {
+    name = r["name"]
+    age = r["age"]
+    echo "${name} is ${age}"
+}
+
+// A fresh in-memory database per test. It lives outside `@test` deliberately: a no-argument
+// function *inside* the block is collected as a test and would report as one.
+fn fresh(): db.Connection {
+    c = db.connect("sqlite::memory:")
+    (@sql { CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT) }).execute(c)
+    return c
+}
+
+@test {
+    // The two spellings are one operation: same rows affected, same rows back.
+    fn the_method_and_the_function_are_the_same_operation(): void {
+        c = fresh()
+
+        via_method = table("t").insert(["n"], ["a"]).execute(c)
+        q = table("t").insert(["n"], ["b"])
+        via_function = execute(c, q)
+        assert(via_method == via_function, "both report one row affected")
+
+        both = table("t").select("n").run(c)
+        assert(both.len() == 2, "both writes landed: ${both.len()}")
+        assert(run(c, table("t").select("n")).len() == 2, "and `run` agrees with `.run`")
+    }
+
+    // A `@sql` statement carries the same pair, so a raw statement needs no wrapper either.
+    fn a_sql_statement_runs_from_itself(): void {
+        c = fresh()
+        ins = @sql { INSERT INTO t (n) VALUES (${"only"}) }
+        ins.execute(c)
+
+        rows = (@sql { SELECT n FROM t }).query(c)
+        assert(rows.len() == 1, "one row: ${rows.len()}")
+        assert(rows[0]["n"] == "only", "the hole was bound, not spliced")
+    }
+
+    // The terminal does not consume the statement — a `Query` is a value, so it can run twice.
+    fn a_built_statement_is_a_value_not_a_cursor(): void {
+        c = fresh()
+
+        ins = table("t").insert(["n"], ["twice"])
+        ins.execute(c)
+        ins.execute(c)
+
+        assert(table("t").select("n").run(c).len() == 2, "the same statement ran twice")
+    }
+}

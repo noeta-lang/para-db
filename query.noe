@@ -7,9 +7,23 @@
 use para.db.Connection
 
 // A composed SQL statement ready to run: the text (with `?` placeholders) and its bound parameters.
+//
+// The two terminals are methods so a built statement can be run where it is built —
+// `table("todos").insert(cols, vals).execute(conn)` — and the module-level `run`/`execute` below
+// are the same two operations spelled the other way round, for code that already holds a `Query`.
 pub struct Query {
     sql: string
     params: List<dyn>
+
+    // Run this query, returning its rows.
+    fn run(conn: Connection): List<Map<string, dyn>> {
+        return conn.query(self.sql, self.params)
+    }
+
+    // Run this statement as a non-query (INSERT/UPDATE/DELETE), returning rows affected.
+    fn execute(conn: Connection): int {
+        return conn.execute(self.sql, self.params)
+    }
 }
 
 // A fluent query builder over a single table. Each method returns the builder, so calls chain:
@@ -95,7 +109,7 @@ pub class Q {
     // last-inserted-id call, so it stays one statement even under concurrent writers.
     //
     // Portable with no per-dialect lowering, like the conflict clauses above: PostgreSQL has had
-    // `RETURNING` throughout, SQLite since 3.35 (2021). Run it with `run`, not `exec` — it answers
+    // `RETURNING` throughout, SQLite since 3.35 (2021). Run it with `run`, not `execute` — it answers
     // ROWS, which is the whole point.
     fn insert_returning(columns: List<string>, values: List<dyn>, returning: string = "*"): Query {
         base = self.insert(columns, values)
@@ -175,10 +189,13 @@ pub fn table(name: string): Q {
 
 // Run a composed query on a connection, returning its rows (a `List<Map<string, dyn>>`).
 pub fn run(conn: Connection, q: Query): List<Map<string, dyn>> {
-    return conn.query(q.sql, q.params)
+    return q.run(conn)
 }
 
 // Execute a composed non-query statement (INSERT/UPDATE/DELETE), returning rows affected.
-pub fn exec(conn: Connection, q: Query): int {
-    return conn.execute(q.sql, q.params)
+//
+// Named for what `Connection.execute` is named — `para.db.sql.execute` is the same operation over a
+// `@sql` statement, so the two doors into the driver read the same. It was `exec` through 0.3.
+pub fn execute(conn: Connection, q: Query): int {
+    return q.execute(conn)
 }

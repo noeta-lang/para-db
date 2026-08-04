@@ -1,18 +1,18 @@
 // The para.db query builder (DB1) over the native SQLite driver: compose typed SELECT/INSERT with
 // bound parameters (no string-splicing), then run them on a connection.
 use para.db
-use para.db.query.{table, run, exec}
+use para.db.query.{table, run, execute}
 
 conn = db.connect("sqlite::memory:")
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", [])
 
 // INSERT via the builder.
 ins = table("users").insert(["name", "age"], ["Ada", 36])
-exec(conn, ins)
+execute(conn, ins)
 ins2 = table("users").insert(["name", "age"], ["Bob", 41])
-exec(conn, ins2)
+execute(conn, ins2)
 ins3 = table("users").insert(["name", "age"], ["Cy", 24])
-exec(conn, ins3)
+execute(conn, ins3)
 
 // SELECT with filter + order + limit via the builder.
 q = table("users").filter("age", ">", 30).order("age", "asc").limit(10).select("name, age")
@@ -28,11 +28,11 @@ for r in rows {
 // verbatim by SQLite and PostgreSQL, so neither needs per-dialect lowering.
 skip = table("users").insert_or_ignore(["id", "name", "age"], [1, "Ada", 36])
 echo "skip: ${skip.sql}"
-exec(conn, skip) // the row is already there: 0 rows affected, no error
+execute(conn, skip) // the row is already there: 0 rows affected, no error
 
 up = table("users").upsert(["id", "name", "age"], [1, "Ada Lovelace", 37], ["id"])
 echo "upsert: ${up.sql}"
-exec(conn, up)
+execute(conn, up)
 after = run(conn, table("users").filter("id", "=", 1).select("name, age"))
 for r in after {
     name = r["name"]
