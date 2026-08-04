@@ -9,7 +9,7 @@
 //   noeta run examples/para-db-demo/schema_demo.noe
 use para.db
 use para.db.schema.{create_table, create_index, alter_table, drop_table, apply, source}
-use para.db.query.{table, run, exec}
+use para.db.query.{table, run, execute}
 
 conn = db.connect("sqlite::memory:") // swap for "postgres://…" — nothing below changes
 
@@ -41,8 +41,8 @@ apply(conn, [
 //    declared default, and `id` is auto-assigned by whichever mechanism the driver used. (A boolean
 //    reads back as 0/1 on SQLite and true/false on Postgres: that is the driver's value mapping, not
 //    something the schema layer can hide — see the README.)
-exec(conn, table("owners").insert(["email"], ["ada@example.com"]))
-exec(conn, table("todos").insert(["title", "owner_id"], ["write a migration", 1]))
+execute(conn, table("owners").insert(["email"], ["ada@example.com"]))
+execute(conn, table("todos").insert(["title", "owner_id"], ["write a migration", 1]))
 
 rows = run(conn, table("todos").select("id, title, done, owner_id"))
 for row in rows {

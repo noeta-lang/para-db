@@ -50,7 +50,7 @@
 // both halves.
 
 use para.db.Connection
-use db.query.{table, run, exec, Query}
+use db.query.{table, run, execute, Query}
 use std.json
 
 // --- What a model declares about its own columns --------------------------------------------------
@@ -371,17 +371,17 @@ pub class Repository<T> {
         conn.execute("BEGIN", [])
         for entity in self.pending_new {
             q = self.build_insert(entity)
-            exec(conn, q)
+            execute(conn, q)
             count = count + 1
         }
         for entity in self.pending_dirty {
             q = self.build_update(entity)
-            exec(conn, q)
+            execute(conn, q)
             count = count + 1
         }
         for id in self.pending_remove {
             q = table(self.tbl).filter(self.key(), "=", id).delete()
-            exec(conn, q)
+            execute(conn, q)
             count = count + 1
         }
         conn.execute("COMMIT", [])

@@ -12,15 +12,15 @@
 // parameter and emits conflict handling both backends accept. The same file seeds SQLite and
 // PostgreSQL, with no dialect SQL to keep in sync.
 use para.db
-use para.db.query.{table, exec}
+use para.db.query.{table, execute}
 
 fn seed(conn: db.Connection): void {
     // `insert_or_ignore` emits `INSERT INTO users (id, name) VALUES (?, ?) ON CONFLICT DO NOTHING`:
     // insert the row, and if it is already there, leave it exactly as it is.
-    exec(conn, table("users").insert_or_ignore(["id", "name"], [102, "Katherine"]))
+    execute(conn, table("users").insert_or_ignore(["id", "name"], [102, "Katherine"]))
 
     // `upsert` emits `... ON CONFLICT (id) DO UPDATE SET name = excluded.name`: insert the row, or
     // refresh the columns that are not part of the conflict target if it exists. A seed that must
     // keep its data current across re-runs wants this rather than "do nothing".
-    exec(conn, table("users").upsert(["id", "name"], [103, "Radia"], ["id"]))
+    execute(conn, table("users").upsert(["id", "name"], [103, "Radia"], ["id"]))
 }
