@@ -8,7 +8,7 @@
 // name resolution this example is about. Postgres has a real `boolean` and maps it fine.
 @derive(Serialize<Json>, Deserialize<Json>)
 pub struct Todo {
-    pub id: int
-    pub title: string
-    pub rank: int
+    id: int
+    title: string
+    rank: int
 }

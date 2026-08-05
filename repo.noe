@@ -136,7 +136,7 @@ pub class Repository<T> {
     // `#[Key]` field. Resolved once, on first use, and memoized into `pk` itself, so every statement
     // that needs the key (`find`, `build_update`, the staged deletes) asks this and nothing reads the
     // raw field.
-    fn key(): string {
+    pub fn key(): string {
         if self.pk == "" {
             self.pk = self.declared_key()
         }
@@ -170,7 +170,7 @@ pub class Repository<T> {
 
     // The columns the DATABASE assigns — the model's `#[Generated]` fields. Read once off the model's
     // declaration and memoized: every insert and every update asks.
-    fn generated_columns(): List<string> {
+    pub fn generated_columns(): List<string> {
         return match self.generated {
             some(cols) => cols,
             none => self.read_generated_columns(),
@@ -221,7 +221,7 @@ pub class Repository<T> {
     // Map one query row to the model, **aborting** if it does not decode — the aborting half of the
     // pair, and what every read goes through. Both halves report the identical message; this one just
     // stops the program with it instead of handing it back.
-    fn map_row(row: Map<string, dyn>): T {
+    pub fn map_row(row: Map<string, dyn>): T {
         return match self.try_map_row(row) {
             Ok(model) => model,
             Err(message) => panic(message),
@@ -265,7 +265,7 @@ pub class Repository<T> {
     }
 
     // Rows matching `col <op> value`, mapped to the model (reuses the DB1 builder's `filter`).
-    fn where(conn: Connection, col: string, op: string, value: dyn): List<T> {
+    pub fn where(conn: Connection, col: string, op: string, value: dyn): List<T> {
         q = table(self.tbl).filter(col, op, value).select("*")
         return self.map_rows(run(conn, q))
     }
@@ -334,7 +334,7 @@ pub class Repository<T> {
 
     // The same INSERT, asking for the stored row back — what `insert` runs. It is a separate builder
     // rather than a flag so the staged path and the immediate path visibly compose the same columns.
-    fn build_insert_returning(entity: T): Query {
+    pub fn build_insert_returning(entity: T): Query {
         m = columns_of(entity)
         cols = self.sendable(m.keys())
         return table(self.tbl).insert_returning(cols, values_at(m, cols))
@@ -392,7 +392,7 @@ pub class Repository<T> {
     }
 
     // Roll back every staged change without touching the database (drop the pending lists).
-    fn discard(): void {
+    pub fn discard(): void {
         self.pending_new = []
         self.pending_dirty = []
         self.pending_remove = []
