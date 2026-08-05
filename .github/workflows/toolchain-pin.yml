@@ -1,10 +1,14 @@
 name: Toolchain pin
 
-# A noeta release dispatches `release-published` carrying its tag. This repo's native crates pin the
-# toolchain to a tag in their `Cargo.toml`, and `ci.yml`'s consistency guard fails when that pin and
-# the org-level `NOETA_VERSION` disagree — so the release that advances the variable makes this repo
-# red until the pin follows. Rather than wait for a human to notice, bump it here and open the result
-# as a PR.
+# A noeta release dispatches `release-published` carrying its tag. This job answers two questions for
+# this repo: does anything need to move, and does the package still compile.
+#
+# What may need to move is now of two kinds. The **contract crates** (`noeta-ext-abi`,
+# `noeta-reactive-abi`) come from crates.io by RANGE, so a patch release is absorbed and needs no
+# edit at all — a minor is not, and `"0.5"` has to become `"0.6"`. The **internal crates** a package
+# reaches past the contract for (`noeta-loader`, `noeta-stdlib`, `noeta-conformance`) are unpublished
+# and pinned by git tag, so they move on every release. Both are rewritten below, and the result is
+# opened as a PR.
 #
 # **The PR is not the point; the build in this job is.** A `noeta` release is the moment this
 # package's native half might stop compiling — a required field added to `ExtFn`, a signature that
@@ -24,8 +28,10 @@ name: Toolchain pin
 # and the package version (is dropping older toolchains a breaking change for consumers?). The PR
 # body says so, so nobody merges it believing the release decision is made.
 #
-# A repo with no pins — every pure-Noeta para package — no-ops and exits 0, so this file is the same
-# in all of them and a package that later grows a native half gets the behaviour for free.
+# A repo with nothing to rewrite — a pure-Noeta package, or a native one whose deps are all ranges on
+# a patch release — still BUILDS. "Nothing to rewrite" is not "nothing to check", and gating the
+# build on a manifest diff is how this job would quietly stop doing its job as the fleet moved to
+# crates.io. Only the PR is conditional. This file is identical in all nine para repos.
 
 on:
   repository_dispatch:
@@ -68,34 +74,48 @@ jobs:
             *) echo "::error::refusing to pin '${TAG:-}': expected a release tag like v0.4.1"; exit 1 ;;
           esac
 
-          mapfile -t FILES < <(grep -rl 'github\.com/noeta-lang/noeta", tag = "' --include=Cargo.toml . || true)
-          if [ "${#FILES[@]}" -eq 0 ]; then
-            echo "no toolchain pins in this repo — nothing to do"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          # (a) GIT TAG PINS on the toolchain repo. These are the UNPUBLISHED internal crates —
+          # `noeta-loader`, `noeta-stdlib`, `noeta-conformance` and friends — which carry no
+          # stability promise and must move in lockstep with the toolchain. A package that reaches
+          # past the contract has no other way to name them.
+          mapfile -t PINNED < <(grep -rl 'github\.com/noeta-lang/noeta", tag = "' --include=Cargo.toml . || true)
+          if [ "${#PINNED[@]}" -gt 0 ]; then
+            printf 'repinning %d file(s) to %s:\n' "${#PINNED[@]}" "$TAG"
+            printf '  %s\n' "${PINNED[@]}"
+            sed -i -E 's|(github\.com/noeta-lang/noeta", tag = ")v[0-9][^"]*(")|\1'"$TAG"'\2|g' "${PINNED[@]}"
           fi
 
-          printf 'pinning %d file(s) to %s:\n' "${#FILES[@]}" "$TAG"
-          printf '  %s\n' "${FILES[@]}"
-          sed -i -E 's|(github\.com/noeta-lang/noeta", tag = ")v[0-9][^"]*(")|\1'"$TAG"'\2|g' "${FILES[@]}"
+          # (b) CRATES.IO RANGES for the two contract crates. `noeta-ext-abi = "0.5"` admits every
+          # 0.5.x, so a PATCH release needs no edit — that is the whole point of publishing them. A
+          # MINOR release is a different matter: "0.5" does not admit 0.6.0, so the range has to
+          # move, and nothing else in the fleet would notice until a human tried to build.
+          MINOR="$(printf '%s' "${TAG#v}" | cut -d. -f1,2)"
+          mapfile -t RANGED < <(grep -rlE '^noeta-(ext|reactive)-abi = "[0-9]' --include=Cargo.toml . || true)
+          for f in "${RANGED[@]:-}"; do
+            [ -n "$f" ] || continue
+            # Only rewrite a range the new toolchain falls OUTSIDE of — a matching minor is left
+            # exactly as written, so a patch release produces no diff and no PR.
+            sed -i -E '/^noeta-(ext|reactive)-abi = "/ s|"[0-9]+\.[0-9]+"|"'"$MINOR"'"|' "$f"
+          done
 
           if git diff --quiet; then
-            echo "already pinned to $TAG — nothing to do"
+            echo "already current for $TAG — nothing to rewrite (the build below still runs)"
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          else
+            git --no-pager diff --stat
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@1.97.0
-        if: steps.bump.outputs.changed == 'true'
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-        if: steps.bump.outputs.changed == 'true'
 
+      # UNCONDITIONAL, and that is the point: "nothing to rewrite" is not "nothing to check". A
+      # package whose deps are all crates.io ranges needs no edit for a patch release and would
+      # otherwise skip the one job that asks whether the release broke it.
       - name: Build every crate against ${{ env.TAG }}
         id: verify
-        if: steps.bump.outputs.changed == 'true'
         # The question this job exists to answer. `clippy -D warnings` and not a bare `check`,
         # because it is what `ci.yml` enforces — an additive ABI change that turns an existing
         # `..DEFAULTS` tail into a no-op is a warning, and a warning is what would fail the real
@@ -200,8 +220,14 @@ jobs:
             echo "- Open the PR: ${COMPARE}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Not gated on `changed`: a package needing no rewrite can still be broken by the release, and
+      # that is the case with no PR to carry the verdict — so the job's own red is the only signal.
       - name: Fail if the package does not build against the new toolchain
-        if: steps.bump.outputs.changed == 'true' && steps.verify.outputs.ok != 'true'
+        if: steps.verify.outputs.ok != 'true'
         run: |
-          echo "::error::this package does not compile against ${TAG} — see the PR and the build log"
+          if [ "${{ steps.bump.outputs.changed }}" = 'true' ]; then
+            echo "::error::this package does not compile against ${TAG} — see the PR and the build log"
+          else
+            echo "::error::this package does not compile against ${TAG}, and needed no manifest change — so there is no PR; see the build log above"
+          fi
           exit 1
