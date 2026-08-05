@@ -30,8 +30,7 @@ use noeta_ext_abi::{
     Cap, CtxError, CtxOut, CtxResult, ExternBox, ExternValue, NativeCtx, NativeValue, Retained,
     Slot, capability, ctx_arity, no_function_error, no_method_error, type_error,
 };
-use noeta_reactive::NodeId;
-use noeta_reactive_abi::{ReactiveSource, ViewSource, ViewSourceExtract};
+use noeta_reactive_abi::{NodeId, ReactiveSource, ViewSource, ViewSourceExtract};
 
 use crate::conn::{CONNECTION_TYPE_NAME, ConnectionBox};
 use crate::driver::SqlDriver;

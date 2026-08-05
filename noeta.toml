@@ -1,8 +1,8 @@
 [package]
 name = "para/db"
-version = "0.4.0"
+version = "0.5.0"
 # The minimum noeta this package works with; enforced at resolve time from noeta 0.2.1 on.
-toolchain = ">=0.4"
+toolchain = ">=0.5"
 license = "MIT OR Apache-2.0"
 description = "Database access with swappable drivers — SQLite and Postgres, bound parameters, migrations, and reactive queries."
 keywords = ["database", "sqlite", "postgres", "sql", "migrations"]

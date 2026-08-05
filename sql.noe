@@ -5,11 +5,14 @@
 // parameter, never string-spliced into the SQL, so a statement built from untrusted input carries no
 // injection risk by construction.
 //
-// The tier is enabled by the consuming project's manifest, NOT by importing `sql` — a file that
-// imports nothing at all still type-checks and runs an `@sql { … }` block. Importing the handler
-// only binds its name for a direct `sql(statics, holes)` call, which no caller needs; the demos
-// import it out of habit, and it is harmless. What a caller does need from this module is
-// `query`/`execute` (or the same pair as methods on the `Sql` the block returns).
+// **The tier is enabled by the consumer's `[directives]` binding** (`sql = "para/db"`), not by importing
+// anything — the binding is what pulls this handler into their program. Importing `sql` binds its
+// name for a direct `sql(statics, holes)` call, which no caller makes. What a caller wants from this
+// module is `query`/`execute`, or the same pair as methods on the `Sql` a block returns.
+//
+// Before the `[directives]` table, a consumer's binding could not link a pure-Noeta handler, so the only
+// thing that worked was importing this module — and because linking is program-wide, one file's
+// import silently enabled `@sql` in every other file of the package. It read as ambient and was not.
 
 use para.db.Connection
 
@@ -22,12 +25,12 @@ pub struct Sql {
     params: List<dyn>
 
     // Run this statement as a query, returning its rows.
-    fn query(conn: Connection): List<Map<string, dyn>> {
+    pub fn query(conn: Connection): List<Map<string, dyn>> {
         return conn.query(self.text, self.params)
     }
 
     // Run this statement as a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected.
-    fn execute(conn: Connection): int {
+    pub fn execute(conn: Connection): int {
         return conn.execute(self.text, self.params)
     }
 }

@@ -7,19 +7,23 @@ repository = "https://github.com/noeta-lang/para-db"
 rust-version = "1.95"
 
 [dependencies]
-# The extension ABI (the module/type registry, ExternValue contract, error constructors).
-# Pinned to the toolchain release this package version is built against.
-noeta-ext-abi = { git = "https://github.com/noeta-lang/noeta", tag = "v0.4.5" }
+# The two CONTRACT crates, from crates.io — the whole surface the toolchain promises an extension.
+# A range, not an exact version: a patch toolchain release does not change the contract, so it must
+# not cost this manifest an edit. Composition redirects both onto the consumer's own toolchain
+# whatever is written here (`[patch.crates-io]`), so the range governs this repo's CI, not consumers.
+#
+# The extension ABI: the module/type registry, the ExternValue contract, the error constructors.
+noeta-ext-abi = "0.5"
 # The reactive DB source (`db.watch`, aether DB5) is a node in the SAME reactive graph as core
 # `std.reactive`, reached through the `ReactiveSource` capability contract — never the engine
-# internals (so this crate depends on nothing of `noeta-stdlib`). `noeta-reactive` supplies the
-# `NodeId` handle; `noeta-reactive-abi` the capability + view-source contract. Same seam para.synced
-# uses. Light crates, always linked (the `db.watch` surface works for any driver — SQLite degrades to
-# in-process-only, Postgres adds external LISTEN/NOTIFY).
-# Pinned to the toolchain release this package version is built against.
-noeta-reactive = { git = "https://github.com/noeta-lang/noeta", tag = "v0.4.5" }
-# Pinned to the toolchain release this package version is built against.
-noeta-reactive-abi = { git = "https://github.com/noeta-lang/noeta", tag = "v0.4.5" }
+# internals (so this crate depends on nothing of `noeta-stdlib`). Same seam para.synced uses. Light,
+# always linked (the `db.watch` surface works for any driver — SQLite degrades to in-process-only,
+# Postgres adds external LISTEN/NOTIFY).
+#
+# `noeta-reactive` is gone from this list as of noeta 0.5: `NodeId` moved into the contract crate
+# where the `ReactiveSource` signatures that name it live, so this package no longer reaches into an
+# internal crate to spell one type.
+noeta-reactive-abi = "0.5"
 # The migration engine checksums each migration file's contents (sha256) to detect edited history.
 # Always linked (the engine is driver-agnostic and rides no ring).
 sha2 = { version = "0.10", default-features = false }
