@@ -174,7 +174,7 @@ pub class Table {
     // `timestamps`/`if_not_exists`/`primary_key(…)`/`unique(…)` are table-level, and anything else
     // modifies the column declared before it. Every method below routes through here, and it is also
     // the escape hatch for a DSL call this surface has not wrapped.
-    fn link(name: string, args: List<dyn>): Table {
+    pub fn link(name: string, args: List<dyn>): Table {
         match column_type(name) {
             some(ty) => { return self.declare(ty, args) },
             none => {},
@@ -363,7 +363,7 @@ pub class Alter {
     // Apply one DSL call to the statement under construction — the Noeta twin of the native parser's
     // `alter_table` loop: `add_<type>` adds a column, `drop_column`/`rename_column`/`rename_to` are
     // actions of their own, and anything else modifies the column the preceding `add_*` introduced.
-    fn link(name: string, args: List<dyn>): Alter {
+    pub fn link(name: string, args: List<dyn>): Alter {
         if name.starts_with("add_") {
             match column_type(name.slice(4)) {
                 some(ty) => {
@@ -501,7 +501,7 @@ pub class Index {
 
     // Apply one DSL call to the statement under construction — the Noeta twin of the native parser's
     // `create_index` loop.
-    fn link(name: string, args: List<dyn>): Index {
+    pub fn link(name: string, args: List<dyn>): Index {
         if name == "column" {
             self.stmt = CreateIndex {
                 ...self.stmt,

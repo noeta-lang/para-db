@@ -84,18 +84,18 @@ pub class LiveRepository<T> {
     // Insert NOW and answer the stored row (see `Repository.insert` — the door for a model whose key
     // the database assigns), then notify so watchers wake. It notifies on its own because it is not
     // staged: there is no `flush` after it to do it.
-    fn insert(entity: T): T {
+    pub fn insert(entity: T): T {
         stored = self.repo.insert(self.conn, entity)
         self.conn.notify(self.channel)
         return stored
     }
 
-    fn save(entity: T): void {
+    pub fn save(entity: T): void {
         self.repo.save(entity)
     }
 
     // `dyn` on purpose: a primary-key VALUE, not a model. See `Repository.remove`.
-    fn remove(id: dyn): void {
+    pub fn remove(id: dyn): void {
         self.repo.remove(id)
     }
 
