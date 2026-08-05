@@ -241,70 +241,70 @@ pub class Table {
     // --- Columns ---------------------------------------------------------------------------------
 
     // The table's identity column: a driver-appropriate auto-assigned integer primary key.
-    fn id(name: string = "id"): Table {
+    pub fn id(name: string = "id"): Table {
         if name == "id" {
             return self.link("id", [])
         }
         return self.link("id", [name])
     }
 
-    fn text(name: string): Table {
+    pub fn text(name: string): Table {
         return self.link("text", [name])
     }
 
-    fn int(name: string): Table {
+    pub fn int(name: string): Table {
         return self.link("int", [name])
     }
 
     // A 64-bit integer — the type that matches an `id()` primary key in a foreign key.
-    fn bigint(name: string): Table {
+    pub fn bigint(name: string): Table {
         return self.link("bigint", [name])
     }
 
-    fn float(name: string): Table {
+    pub fn float(name: string): Table {
         return self.link("float", [name])
     }
 
-    fn bool(name: string): Table {
+    pub fn bool(name: string): Table {
         return self.link("bool", [name])
     }
 
-    fn timestamp(name: string): Table {
+    pub fn timestamp(name: string): Table {
         return self.link("timestamp", [name])
     }
 
     // `created_at` + `updated_at`, both NOT NULL defaulting to the current time.
-    fn timestamps(): Table {
+    pub fn timestamps(): Table {
         return self.link("timestamps", [])
     }
 
     // --- Column modifiers (they apply to the column declared just before) --------------------------
 
-    fn not_null(): Table {
+    pub fn not_null(): Table {
         return self.modifier("not_null", [])
     }
 
     // A literal default — a string, int, float, or bool.
-    fn default(value: dyn): Table {
+    pub fn default(value: dyn): Table {
         return self.modifier("default", [value])
     }
 
     // `DEFAULT CURRENT_TIMESTAMP`.
-    fn default_now(): Table {
+    pub fn default_now(): Table {
         return self.modifier("default_now", [])
     }
 
     // A foreign key on the preceding column. Follow it with `on_delete`/`on_update` to add a
     // referential action ("cascade", "restrict", "set_null", "set_default", "no_action").
-    fn references(table: string, column: string = "id"): Table {
+    pub fn references(table: string, column: string = "id"): Table {
         return self.modifier("references", [table, column])
     }
 
-    fn on_delete(action: string): Table {
+    pub fn on_delete(action: string): Table {
         return self.modifier("on_delete", [action])
     }
 
-    fn on_update(action: string): Table {
+    pub fn on_update(action: string): Table {
         return self.modifier("on_update", [action])
     }
 
@@ -312,7 +312,7 @@ pub class Table {
 
     // With no columns: mark the preceding column the primary key. With columns: a composite
     // table-level `PRIMARY KEY (…)`. A table has one or the other, never both.
-    fn primary_key(columns: List<string> = []): Table {
+    pub fn primary_key(columns: List<string> = []): Table {
         if columns.len() == 0 {
             return self.modifier("primary_key", [])
         }
@@ -320,32 +320,32 @@ pub class Table {
     }
 
     // With no columns: mark the preceding column UNIQUE. With columns: a composite `UNIQUE (…)`.
-    fn unique(columns: List<string> = []): Table {
+    pub fn unique(columns: List<string> = []): Table {
         if columns.len() == 0 {
             return self.modifier("unique", [])
         }
         return self.link("unique", widen(columns))
     }
 
-    fn if_not_exists(): Table {
+    pub fn if_not_exists(): Table {
         return self.link("if_not_exists", [])
     }
 
     // --- The value, and its two spellings ---------------------------------------------------------
 
     // The backend-neutral statement this builder describes.
-    fn statement(): Statement {
+    pub fn statement(): Statement {
         return Statement.CreateTable(self.stmt)
     }
 
     // The schema-DSL source for this statement — paste it into a `.schema` migration, or hand it to
     // `apply`.
-    fn render(): string {
+    pub fn render(): string {
         return render_statement(self.statement())
     }
 
     // The canonical rendering of this statement — what its checksum is taken over.
-    fn canonical(): string {
+    pub fn canonical(): string {
         return canonical([self.statement()])
     }
 }
@@ -416,76 +416,76 @@ pub class Alter {
         return self
     }
 
-    fn add_text(name: string): Alter {
+    pub fn add_text(name: string): Alter {
         return self.link("add_text", [name])
     }
 
-    fn add_int(name: string): Alter {
+    pub fn add_int(name: string): Alter {
         return self.link("add_int", [name])
     }
 
-    fn add_bigint(name: string): Alter {
+    pub fn add_bigint(name: string): Alter {
         return self.link("add_bigint", [name])
     }
 
-    fn add_float(name: string): Alter {
+    pub fn add_float(name: string): Alter {
         return self.link("add_float", [name])
     }
 
-    fn add_bool(name: string): Alter {
+    pub fn add_bool(name: string): Alter {
         return self.link("add_bool", [name])
     }
 
-    fn add_timestamp(name: string): Alter {
+    pub fn add_timestamp(name: string): Alter {
         return self.link("add_timestamp", [name])
     }
 
     // An added column may be `not_null` only with a `default` — SQLite cannot add a NOT NULL column
     // without one, so the DSL refuses the combination rather than emitting Postgres-only DDL.
-    fn not_null(): Alter {
+    pub fn not_null(): Alter {
         return self.modifier("not_null", [])
     }
 
-    fn default(value: dyn): Alter {
+    pub fn default(value: dyn): Alter {
         return self.modifier("default", [value])
     }
 
-    fn references(table: string, column: string = "id"): Alter {
+    pub fn references(table: string, column: string = "id"): Alter {
         return self.modifier("references", [table, column])
     }
 
-    fn on_delete(action: string): Alter {
+    pub fn on_delete(action: string): Alter {
         return self.modifier("on_delete", [action])
     }
 
-    fn on_update(action: string): Alter {
+    pub fn on_update(action: string): Alter {
         return self.modifier("on_update", [action])
     }
 
-    fn drop_column(name: string): Alter {
+    pub fn drop_column(name: string): Alter {
         return self.link("drop_column", [name])
     }
 
-    fn rename_column(from: string, to: string): Alter {
+    pub fn rename_column(from: string, to: string): Alter {
         return self.link("rename_column", [from, to])
     }
 
     // Rename the table. It must be the only change in its chain — a later action would name a table
     // that no longer exists.
-    fn rename_to(name: string): Alter {
+    pub fn rename_to(name: string): Alter {
         return self.link("rename_to", [name])
     }
 
     // The backend-neutral statement this builder describes.
-    fn statement(): Statement {
+    pub fn statement(): Statement {
         return Statement.AlterTable(self.stmt)
     }
 
-    fn render(): string {
+    pub fn render(): string {
         return render_statement(self.statement())
     }
 
-    fn canonical(): string {
+    pub fn canonical(): string {
         return canonical([self.statement()])
     }
 }
@@ -528,36 +528,36 @@ pub class Index {
         panic("para.db.schema: unknown `create_index` modifier `.${name}(…)` (expected one of: column, columns, name, unique, if_not_exists)")
     }
 
-    fn column(name: string): Index {
+    pub fn column(name: string): Index {
         return self.link("column", [name])
     }
 
-    fn columns(names: List<string>): Index {
+    pub fn columns(names: List<string>): Index {
         return self.link("columns", widen(names))
     }
 
-    fn name(index: string): Index {
+    pub fn name(index: string): Index {
         return self.link("name", [index])
     }
 
-    fn unique(): Index {
+    pub fn unique(): Index {
         return self.link("unique", [])
     }
 
-    fn if_not_exists(): Index {
+    pub fn if_not_exists(): Index {
         return self.link("if_not_exists", [])
     }
 
     // The backend-neutral statement this builder describes.
-    fn statement(): Statement {
+    pub fn statement(): Statement {
         return Statement.CreateIndex(self.stmt)
     }
 
-    fn render(): string {
+    pub fn render(): string {
         return render_statement(self.statement())
     }
 
-    fn canonical(): string {
+    pub fn canonical(): string {
         return canonical([self.statement()])
     }
 }
@@ -572,24 +572,24 @@ pub class Drop {
         return Drop { is_index: is_index, obj: obj, guard: false }
     }
 
-    fn if_exists(): Drop {
+    pub fn if_exists(): Drop {
         self.guard = true
         return self
     }
 
     // The backend-neutral statement this builder describes.
-    fn statement(): Statement {
+    pub fn statement(): Statement {
         if self.is_index {
             return Statement.DropIndex(self.obj, self.guard)
         }
         return Statement.DropTable(self.obj, self.guard)
     }
 
-    fn render(): string {
+    pub fn render(): string {
         return render_statement(self.statement())
     }
 
-    fn canonical(): string {
+    pub fn canonical(): string {
         return canonical([self.statement()])
     }
 }
