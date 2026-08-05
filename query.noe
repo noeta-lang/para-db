@@ -16,12 +16,12 @@ pub struct Query {
     params: List<dyn>
 
     // Run this query, returning its rows.
-    fn run(conn: Connection): List<Map<string, dyn>> {
+    pub fn run(conn: Connection): List<Map<string, dyn>> {
         return conn.query(self.sql, self.params)
     }
 
     // Run this statement as a non-query (INSERT/UPDATE/DELETE), returning rows affected.
-    fn execute(conn: Connection): int {
+    pub fn execute(conn: Connection): int {
         return conn.execute(self.sql, self.params)
     }
 }
@@ -35,25 +35,25 @@ pub class Q {
     mut orderings: List<string>
     mut lim: int
 
-    fn new(name: string): Q {
+    pub fn new(name: string): Q {
         return Q { tbl: name, conditions: [], bindings: [], orderings: [], lim: 0 }
     }
 
     // Add a `WHERE col <op> ?` clause (ANDed with the others); `value` becomes a bound parameter.
-    fn filter(col: string, op: string, value: dyn): Q {
+    pub fn filter(col: string, op: string, value: dyn): Q {
         self.conditions = self.conditions ~ ["${col} ${op} ?"]
         self.bindings = self.bindings ~ [value]
         return self
     }
 
     // Add an `ORDER BY col <dir>` term (`dir` is "asc"/"desc").
-    fn order(col: string, dir: string): Q {
+    pub fn order(col: string, dir: string): Q {
         self.orderings = self.orderings ~ ["${col} ${dir}"]
         return self
     }
 
     // Limit the result set.
-    fn limit(n: int): Q {
+    pub fn limit(n: int): Q {
         self.lim = n
         return self
     }
@@ -74,13 +74,13 @@ pub class Q {
     }
 
     // Build a `SELECT <cols> FROM <table> …`.
-    fn select(cols: string): Query {
+    pub fn select(cols: string): Query {
         sql = "SELECT ${cols} FROM ${self.tbl}${self.tail()}"
         return Query { sql: sql, params: self.bindings }
     }
 
     // Build a `DELETE FROM <table> WHERE …` (its bindings are this builder's filters).
-    fn delete(): Query {
+    pub fn delete(): Query {
         sql = "DELETE FROM ${self.tbl}${self.tail()}"
         return Query { sql: sql, params: self.bindings }
     }
@@ -92,7 +92,7 @@ pub class Q {
     // table is a `SERIAL` key, or carries a `DEFAULT`. That is `INSERT INTO <table> DEFAULT VALUES`,
     // accepted verbatim by SQLite and PostgreSQL, rather than the `(…) VALUES (…)` form with two
     // empty lists, which is a syntax error on both.
-    fn insert(columns: List<string>, values: List<dyn>): Query {
+    pub fn insert(columns: List<string>, values: List<dyn>): Query {
         if columns.len() == 0 {
             return Query { sql: "INSERT INTO ${self.tbl} DEFAULT VALUES", params: [] }
         }
@@ -111,7 +111,7 @@ pub class Q {
     // Portable with no per-dialect lowering, like the conflict clauses above: PostgreSQL has had
     // `RETURNING` throughout, SQLite since 3.35 (2021). Run it with `run`, not `execute` — it answers
     // ROWS, which is the whole point.
-    fn insert_returning(columns: List<string>, values: List<dyn>, returning: string = "*"): Query {
+    pub fn insert_returning(columns: List<string>, values: List<dyn>, returning: string = "*"): Query {
         base = self.insert(columns, values)
         return Query { sql: base.sql ~ " RETURNING ${returning}", params: base.params }
     }
@@ -123,7 +123,7 @@ pub class Q {
     // The emitted conflict clause is portable with no per-dialect lowering: SQLite and PostgreSQL
     // both accept the untargeted `ON CONFLICT DO NOTHING`. (The SQLite-only `INSERT OR IGNORE`
     // spelling of the same idea is a hard syntax error on PostgreSQL — this builder never emits it.)
-    fn insert_or_ignore(columns: List<string>, values: List<dyn>): Query {
+    pub fn insert_or_ignore(columns: List<string>, values: List<dyn>): Query {
         guard_conflict_columns(columns)
         base = self.insert(columns, values)
         return Query { sql: base.sql ~ " ON CONFLICT DO NOTHING", params: base.params }
@@ -140,7 +140,7 @@ pub class Q {
     // to assign, and the statement degrades to `ON CONFLICT DO NOTHING` — the same meaning, since
     // overwriting a row with the values it already has is a no-op, and an empty `SET` is a syntax
     // error on both backends.
-    fn upsert(columns: List<string>, values: List<dyn>, conflict: List<string>): Query {
+    pub fn upsert(columns: List<string>, values: List<dyn>, conflict: List<string>): Query {
         if conflict.len() == 0 {
             panic("para.db.query: upsert needs at least one conflict column (the unique/primary-key columns that decide whether the row already exists); use insert_or_ignore for an untargeted skip")
         }
@@ -163,7 +163,7 @@ pub class Q {
 
     // Build an `UPDATE <table> SET col = ?, … WHERE …`. `columns`/`values` are the SET assignments;
     // the WHERE bindings (this builder's filters) follow the SET bindings in order.
-    fn update(columns: List<string>, values: List<dyn>): Query {
+    pub fn update(columns: List<string>, values: List<dyn>): Query {
         assignments = columns.map(fn(c) => "${c} = ?")
         set_list = assignments.join(", ")
         clause = self.tail()

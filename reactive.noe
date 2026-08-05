@@ -47,7 +47,7 @@ pub class LiveRepository<T> {
     // reactive edges around it — but a caller no longer assembles it in two steps.
     //
     // The NOTIFY channel is the table; the watch listens on it immediately.
-    fn new(tbl: string, conn: Connection, pk: string = ""): LiveRepository<T> {
+    pub fn new(tbl: string, conn: Connection, pk: string = ""): LiveRepository<T> {
         return LiveRepository {
             repo: Repository.new(tbl, pk),
             conn: conn,
@@ -62,7 +62,7 @@ pub class LiveRepository<T> {
     //
     // `dyn` is the reactive HANDLE's own type (what `computed` answers), not a model-typing gap:
     // reading it yields what `Repository.all` yields, a `List<T>`.
-    fn all(): dyn {
+    pub fn all(): dyn {
         w = self.watch
         r = self.repo
         c = self.conn
@@ -77,7 +77,7 @@ pub class LiveRepository<T> {
     // Typed as the model, exactly like the plain repository's — `T` is the same parameter, so the
     // wrapper neither widens nor re-checks anything the wrapped repository would not.
 
-    fn add(entity: T): void {
+    pub fn add(entity: T): void {
         self.repo.add(entity)
     }
 
@@ -101,7 +101,7 @@ pub class LiveRepository<T> {
 
     // Commit the staged writes as one batch, then fire a notification so watchers (this app's live
     // queries, and — with a trigger — any external listener) wake. Returns the statement count.
-    fn flush(): int {
+    pub fn flush(): int {
         n = self.repo.flush(self.conn)
         self.conn.notify(self.channel)
         return n
@@ -109,7 +109,7 @@ pub class LiveRepository<T> {
 
     // Pump the watch — deliver pending change notifications and wake the reactive queries if any
     // fired. Call it from the app's loop (the serve loop drives it alongside background tasks).
-    fn pump(): bool {
+    pub fn pump(): bool {
         return self.watch.pump()
     }
 }

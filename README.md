@@ -21,7 +21,10 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
 
 ```toml
 [dependencies]
-para = { version = "^0.4", package = "para/db" }
+para = { version = "^0.5", package = "para/db" }
+
+[directives]
+sql = "para/db"           # lets your source write `@sql { … }` blocks
 
 [trust]
 native = ["para/db"]      # authorizes the package's native driver crate
@@ -48,7 +51,9 @@ rows = query(conn, @sql { SELECT * FROM users WHERE id > ${min_id} })
 echo rows.len()
 ```
 
-A `${…}` hole in an `@sql { … }` block is **always a bound parameter**: the block evaluates to a `Sql` value — the statement `text` with `?` placeholders plus its `params` in hole order — so a statement built from untrusted input carries no injection risk by construction. `query(conn, stmt)` runs it as a query; its sibling `execute(conn, stmt)` runs a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected. A `Sql` also carries both as methods — `stmt.query(conn)`, `stmt.execute(conn)` — though a tier block is not a method receiver on its own, so bind it first or parenthesize it: `(@sql { … }).execute(conn)`. A bound parameter is a scalar — `int`, `float`, `bool`, `string`, `bytes`, or `none` (SQL `NULL`) — and a row comes back as a `Map<string, dyn>` keyed by column name, with `NULL` as `none` and every other column carrying the value kind its **declared type** promised (see [column types across the driver seam](#column-types-across-the-driver-seam)). Transactions are ordinary statements: `conn.execute("BEGIN", [])` / `"COMMIT"` / `"ROLLBACK"`.
+A `${…}` hole in an `@sql { … }` block is **always a bound parameter**: the block evaluates to a `Sql` value — the statement `text` with `?` placeholders plus its `params` in hole order — so a statement built from untrusted input carries no injection risk by construction. `query(conn, stmt)` runs it as a query; its sibling `execute(conn, stmt)` runs a non-query (INSERT/UPDATE/DELETE/DDL), returning rows affected. A `Sql` also carries both as methods — `stmt.query(conn)`, `stmt.execute(conn)` — though a tier block is not a method receiver on its own, so bind it to a name first or parenthesize it: `(@sql { … }).execute(conn)`.
+
+**`@sql` comes from the `[directives]` binding, not from an import.** `sql = "para/db"` in your manifest is what makes `@sql { … }` an expression; no `use` enables it, and none is needed. That is the same rule every `@name` follows, whichever package and whichever kind. A bound parameter is a scalar — `int`, `float`, `bool`, `string`, `bytes`, or `none` (SQL `NULL`) — and a row comes back as a `Map<string, dyn>` keyed by column name, with `NULL` as `none` and every other column carrying the value kind its **declared type** promised (see [column types across the driver seam](#column-types-across-the-driver-seam)). Transactions are ordinary statements: `conn.execute("BEGIN", [])` / `"COMMIT"` / `"ROLLBACK"`.
 
 **Swapping drivers is the dsn.** Everything above the driver — this raw surface, the query builder, the repository, `@sql`, migrations — runs unchanged over SQLite or PostgreSQL: `postgres_demo.noe` is `demo.noe` with only the connection string changed. The neutral `?` placeholders are rewritten to Postgres's `$1, $2, …` by the driver.
 

@@ -95,43 +95,43 @@ pub enum RefAction {
 
 // A foreign-key reference from one column to another table's column.
 pub struct ForeignKey {
-    pub table: string
-    pub column: string
-    pub on_delete: ?RefAction = none
-    pub on_update: ?RefAction = none
+    table: string
+    column: string
+    on_delete: ?RefAction = none
+    on_update: ?RefAction = none
 }
 
 // One column: its name, type, and the constraints that are portable per-column. The defaults are
 // SQL's own, so what the DSL leaves unsaid is what SQL leaves unsaid.
 pub struct Column {
-    pub name: string
-    pub ty: ColumnType
-    pub not_null: bool = false
-    pub unique: bool = false
-    pub primary_key: bool = false
-    pub default: ?DefaultValue = none
-    pub references: ?ForeignKey = none
+    name: string
+    ty: ColumnType
+    not_null: bool = false
+    unique: bool = false
+    primary_key: bool = false
+    default: ?DefaultValue = none
+    references: ?ForeignKey = none
 }
 
 // A `create_table` statement.
 pub struct CreateTable {
-    pub name: string
-    pub if_not_exists: bool = false
-    pub columns: List<Column> = []
+    name: string
+    if_not_exists: bool = false
+    columns: List<Column> = []
     // A composite primary key (`primary_key(["a", "b"])`); empty when the key is a column's own.
-    pub primary_key: List<string> = []
+    primary_key: List<string> = []
     // Composite `UNIQUE (…)` constraints (`unique(["a", "b"])`).
-    pub uniques: List<List<string>> = []
+    uniques: List<List<string>> = []
 }
 
 // A `create_index` statement. Without an explicit `name`, the index is named `idx_<table>_<columns>`
 // on both backends (the native lowering derives it), so a later `drop_index` can spell it.
 pub struct CreateIndex {
-    pub table: string
-    pub name: ?string = none
-    pub columns: List<string> = []
-    pub unique: bool = false
-    pub if_not_exists: bool = false
+    table: string
+    name: ?string = none
+    columns: List<string> = []
+    unique: bool = false
+    if_not_exists: bool = false
 }
 
 // One action inside an `alter_table` chain. Each lowers to its own `ALTER TABLE` statement: SQLite
@@ -145,8 +145,8 @@ pub enum AlterAction {
 
 // An `alter_table` statement: a table and the actions to apply to it, in order.
 pub struct AlterTable {
-    pub name: string
-    pub actions: List<AlterAction> = []
+    name: string
+    actions: List<AlterAction> = []
 }
 
 // One schema change, backend-neutral — the value a builder builds and both renderings render.
@@ -165,7 +165,7 @@ pub enum Statement {
 pub class Table {
     mut stmt: CreateTable
 
-    fn new(name: string): Table {
+    pub fn new(name: string): Table {
         return Table { stmt: CreateTable { name: name } }
     }
 
@@ -356,7 +356,7 @@ pub class Table {
 pub class Alter {
     mut stmt: AlterTable
 
-    fn new(name: string): Alter {
+    pub fn new(name: string): Alter {
         return Alter { stmt: AlterTable { name: name } }
     }
 
@@ -495,7 +495,7 @@ pub class Alter {
 pub class Index {
     mut stmt: CreateIndex
 
-    fn new(table: string): Index {
+    pub fn new(table: string): Index {
         return Index { stmt: CreateIndex { table: table } }
     }
 
@@ -568,7 +568,7 @@ pub class Drop {
     obj: string
     mut guard: bool
 
-    fn new(is_index: bool, obj: string): Drop {
+    pub fn new(is_index: bool, obj: string): Drop {
         return Drop { is_index: is_index, obj: obj, guard: false }
     }
 
@@ -824,9 +824,9 @@ fn widen(values: List<string>): List<dyn> {
 // table-level constraint, or an alter action starts its own indented line; a modifier stays beside
 // the column it modifies.
 struct Link {
-    pub name: string
-    pub args: List<string>
-    pub own_line: bool
+    name: string
+    args: List<string>
+    own_line: bool
 }
 
 fn inline(name: string, args: List<string>): Link {

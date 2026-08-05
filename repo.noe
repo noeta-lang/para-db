@@ -110,7 +110,7 @@ pub class Repository<T> {
     // `pk` defaults to empty, which means "the model says": it is resolved from the model's `#[Key]`
     // field on first use (see `key`). Naming it here still works and wins — the override for a table
     // whose key the model does not mark, or does not have a field for.
-    fn new(tbl: string, pk: string = ""): Repository<T> {
+    pub fn new(tbl: string, pk: string = ""): Repository<T> {
         return Repository {
             tbl: tbl,
             pk: pk,
@@ -202,7 +202,7 @@ pub class Repository<T> {
     // This is also where both halves of the type argument meet, and both are read off this repository's
     // own instantiation: `type_name::<T>()` supplies the registry key, `.as<T>()` recovers the static
     // type. Nothing above this line ever narrows a row again.
-    fn try_map_row(row: Map<string, dyn>): Result<T, string> {
+    pub fn try_map_row(row: Map<string, dyn>): Result<T, string> {
         text = json.stringify(row)
         return match json.decode_typed(self.model(), text) {
             Ok(v) => match v.as<T>() {
@@ -249,7 +249,7 @@ pub class Repository<T> {
 
     // Find one row by primary key, mapped to the model. `none` means there is no such row — and only
     // that: a row that exists but does not decode aborts instead of impersonating a missing one.
-    fn find(conn: Connection, id: dyn): ?T {
+    pub fn find(conn: Connection, id: dyn): ?T {
         q = table(self.tbl).filter(self.key(), "=", id).limit(1).select("*")
         rows = run(conn, q)
         if rows.len() == 0 {
@@ -259,7 +259,7 @@ pub class Repository<T> {
     }
 
     // Every row in the table, mapped to the model.
-    fn all(conn: Connection): List<T> {
+    pub fn all(conn: Connection): List<T> {
         q = table(self.tbl).select("*")
         return self.map_rows(run(conn, q))
     }
@@ -282,7 +282,7 @@ pub class Repository<T> {
     // questions. `add` stages a value, and a staged value cannot be told what it became — nothing can
     // reach back into the caller's copy of it. Batching many rows is `add` … `flush`; needing the
     // stored row back is this.
-    fn insert(conn: Connection, entity: T): T {
+    pub fn insert(conn: Connection, entity: T): T {
         rows = run(conn, self.build_insert_returning(entity))
         if rows.len() == 0 {
             return panic(
@@ -296,18 +296,18 @@ pub class Repository<T> {
 
     // Stage an INSERT of `entity` (flushed on the next `flush`). Typed as the model, so a value of
     // any other type is rejected here rather than at flush time.
-    fn add(entity: T): void {
+    pub fn add(entity: T): void {
         self.pending_new = self.pending_new ~ [entity]
     }
 
     // Stage an UPDATE of `entity` (matched by its primary key on flush).
-    fn save(entity: T): void {
+    pub fn save(entity: T): void {
         self.pending_dirty = self.pending_dirty ~ [entity]
     }
 
     // Stage a DELETE of the row whose primary key is `id`. `dyn` on purpose: this takes a primary-key
     // VALUE, not a model, and the key's type is not the repository's type argument.
-    fn remove(id: dyn): void {
+    pub fn remove(id: dyn): void {
         self.pending_remove = self.pending_remove ~ [id]
     }
 
@@ -326,7 +326,7 @@ pub class Repository<T> {
 
     // Build the INSERT statement for one staged-new entity: its columns/values, minus what the
     // database assigns.
-    fn build_insert(entity: T): Query {
+    pub fn build_insert(entity: T): Query {
         m = columns_of(entity)
         cols = self.sendable(m.keys())
         return table(self.tbl).insert(cols, values_at(m, cols))
@@ -344,7 +344,7 @@ pub class Repository<T> {
     // neither the primary key (it is the WHERE, not a SET) nor a `#[Generated]` column (the database
     // owns that one; assigning the model's copy of it would either change nothing or clobber what the
     // database decided) — WHERE pk = its own primary-key value.
-    fn build_update(entity: T): Query {
+    pub fn build_update(entity: T): Query {
         m = columns_of(entity)
         pk = self.key()
         pk_value = m[pk]
@@ -366,7 +366,7 @@ pub class Repository<T> {
     // Error handling is structured with `if`/early-return in statement position (match arms are
     // expression-only): the driver surfaces a failed statement as a native error, so the happy path
     // runs BEGIN … COMMIT; a partial batch is undone by the transaction if COMMIT is never reached.
-    fn flush(conn: Connection): int {
+    pub fn flush(conn: Connection): int {
         mut count = 0
         conn.execute("BEGIN", [])
         for entity in self.pending_new {
