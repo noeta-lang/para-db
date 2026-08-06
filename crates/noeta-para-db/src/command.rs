@@ -53,49 +53,58 @@ pub const MIGRATE_COMMAND: ExtCommand = ExtCommand {
                    the seed files only. When omitted, the flags select apply / status / dry-run / \
                    reset (optionally with --seed)",
             kind: ArgKind::Word,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "name",
             help: "For `new`: a short description, slugified into the filename (e.g. \"add users \
                    table\")",
             kind: ArgKind::Word,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "db",
             help: "The database connection string (overrides `DATABASE_URL` and `[db] url`)",
             kind: ArgKind::OptStr,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "dir",
             help: "The migrations directory (overrides `[db] migrations`; default `migrations`)",
             kind: ArgKind::OptPath,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "seeds-dir",
             help: "The seeds directory (overrides `[db] seeds`; default `seeds`)",
             kind: ArgKind::OptPath,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "status",
             help: "Show which migrations are applied and which are pending, then exit",
             kind: ArgKind::Bool,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "dry-run",
             help: "List the migrations that would be applied without touching the database",
             kind: ArgKind::Bool,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "reset",
             help: "DESTRUCTIVE: drop the whole schema and re-apply every migration from zero. \
                    Requires `--yes` (or an interactive confirmation)",
             kind: ArgKind::Bool,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "seed",
             help: "After applying migrations (or after `--reset`), run the project's seed files — \
                    re-runnable development data under the seeds directory",
             kind: ArgKind::Bool,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "sql",
@@ -103,11 +112,13 @@ pub const MIGRATE_COMMAND: ExtCommand = ExtCommand {
                    dialect) instead of the default Noeta one — for anything a backend spells its \
                    own way",
             kind: ArgKind::Bool,
+            ..ArgSpec::DEFAULTS
         },
         ArgSpec {
             name: "yes",
             help: "Skip the interactive confirmation for `--reset` (for scripts/CI)",
             kind: ArgKind::Bool,
+            ..ArgSpec::DEFAULTS
         },
     ],
     run: migrate_run,
