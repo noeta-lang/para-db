@@ -1,37 +1,32 @@
 # AGENTS.md
 
-Guidance for coding agents working in this repo — the standalone repo of the **para/db** Noeta package (the first-party database layer: native swappable driver + pure-Noeta query/repo/@sql/reactive layers), extracted from the noeta monorepo. Toolchain issues (the language, the `noeta` binary, `std.*`, the extension ABI) belong in the monorepo at github.com/noeta-lang/noeta, not here.
+Guidance for coding agents working in this repo — the standalone repo of the **para/db** Noeta package (native swappable driver + pure-Noeta query/schema/repo/`@sql`/reactive layers), extracted from the noeta monorepo. Toolchain issues (the language, the `noeta` binary, `std.*`, the extension ABI) belong in the monorepo at github.com/noeta-lang/noeta, not here.
 
-## Repo layout
+## Versions & pins
 
-- `noeta.toml` — the package manifest (`name = "para/db"`, `native = "native"` declares the Rust extension entry crate).
-- `query.noe` / `schema.noe` / `repo.noe` / `sql.noe` / `reactive.noe` — the pure-Noeta layers over the native driver. `schema.noe` builds the portable schema DSL's neutral `Statement` IR — the Noeta twin of `schema.rs`'s, field for field — and renders it two ways: `.render()` lays it out as migration-file source, `.canonical()` reproduces the native canonical text byte for byte. The grammar, the validation and the lowering are native, so the builder and a `.schema` migration file share one implementation, and `schema.rs`'s `the_noeta_builder_and_the_ir_render_one_canonical_text` is what holds the two IRs to that one text. **That test needs a `noeta` binary**: without one it skips itself (so the `rust` CI job stays self-contained), and CI's `examples` job runs it with `NOETA_CROSS_CHECK=1`, which turns a missing binary into a failure. Changing `schema.noe` recomposes the toolchain the first time it runs, so expect one slow run after every edit.
-- `crates/noeta-para-db/` — the impl crate: the `db` module + `Connection` extern type, the `SqlDriver` seam (SQLite behind default-on `ring-sqlite`, PostgreSQL behind opt-in `ring-postgres`), the portable schema DSL (`schema.rs`: parser, neutral IR, per-`Dialect` lowering — wired in at `SqlDriver::lower_schema`, the same seam as the `?`→`$N` rewrite), the migration/seed engine, and the `noeta migrate` contributed command. `program.rs` holds the `.noe` seed entry convention (`db.run_seed(dsn, seed)`); the engine reaches it through the injected `migrate::ProgramRunner`, since only the CLI can run a program. `migrate::DirKind` is the gate that keeps `.noe` a **seeds-only** body language — a `.noe` file in the migrations directory is a hard error, never a silent skip.
-- `native/` — the thin entry crate the manifest's `native` key points at; re-exports `NOETA_EXTENSIONS`.
-- `editors/` — the `@sql` TextMate injection grammar.
-- `examples/para-db-demo/` — one standalone package, many entry demos. CI checks + tests the hermetic (SQLite/in-memory) ones by name, so a **new demo has to be added to that list in `ci.yml`** or it is never run.
-- `.github/workflows/` — CI (`ci.yml`) and the tag-triggered registry publish (`release.yml`).
+- `noeta.toml` requires `toolchain = ">=0.6"`; the Rust crates take the two contract crates from crates.io by **range** — `noeta-ext-abi = "0.6"` and `noeta-reactive-abi = "0.6"`. A patch toolchain release is absorbed by the range, a minor is not. Don't hand-bump them: `toolchain-pin.yml` rewrites the ranges on a toolchain release and opens a PR, and deliberately leaves `toolchain = ">=X.Y"` and the package version to a human.
+- CI installs the toolchain named by the **org variable** `NOETA_VERSION`, not by anything in this repo. The Rust compiler is pinned at 1.97.0 in `ci.yml`/`release.yml` — lint against that locally, since a floating `@stable` surfaces lints CI doesn't have yet and vice versa.
+- Never move a published `v*` tag; a release is a new tag (`release.yml` gates with the full CI, then `noeta publish`es to the hosted registry).
 
 ## Build & test
 
-- `cargo test` inside `crates/noeta-para-db` works standalone — the toolchain crates are git dependencies on `https://github.com/noeta-lang/noeta` (rev-pinned; flips to tag pins once a toolchain release tag exists). `native/` builds the same way. Postgres-path code compiles under `--features ring-postgres`.
-- Running the examples needs the `noeta` binary and **composes a toolchain** (the native crate is compiled in). Set:
-  - nothing, in the common case: the compose `[patch]` key defaults to the binary's baked repository URL (`https://github.com/noeta-lang/noeta`), which now equals the URL the crates' Cargo.toml declares. When overriding to a fork or local clone, `NOETA_TOOLCHAIN_REPO` MUST equal the declared URL, or the composed build links two copies of the extension ABI and every impl fails with a two-`Extension`-traits E0308;
-  - optionally `NOETA_TOOLCHAIN_SRC=<path to a noeta checkout>` to skip the git fetch.
-- Then `noeta check` / `noeta test` each demo in `examples/para-db-demo/`. The `postgres_demo` / `live_repo_demo` / `watch_demo` entries need a reachable PostgreSQL; the rest are SQLite/in-memory and hermetic.
+- Each Rust crate is its own workspace root, so there is no top-level `cargo test` — run it per directory, as CI does: `for c in crates/*/ native/; do (cd "$c" && cargo test); done`. The Postgres driver is behind an opt-in ring; CI keeps it compiling with `cargo check --features ring-postgres` in `crates/noeta-para-db`.
+- Running the examples needs the `noeta` binary and **composes a toolchain** (the native crate is cargo-built), so expect one slow run after a native change. Usually set nothing; `NOETA_TOOLCHAIN_SRC=<path to a noeta checkout>` skips the git fetch, and `NOETA_TOOLCHAIN_REPO` matters only when pointing composition at a fork or local clone.
+- Then `noeta check` + `noeta test` each demo in `examples/para-db-demo/`. `postgres_demo` / `live_repo_demo` / `watch_demo` need a reachable PostgreSQL; the rest are SQLite/in-memory and hermetic.
+- Two tests hold the Rust half and the Noeta half to one agreement by running a real `noeta` binary, and **skip themselves** when there is none (so `cargo test` stays self-contained): `schema::tests::the_noeta_builder_and_the_ir_render_one_canonical_text` and `command::tests::a_real_noe_migration_applies_through_the_real_command`. `NOETA_CROSS_CHECK=1` turns that skip into a failure. CI's examples job runs only the first by name — run the second locally after touching `migrations.noe`, `program.rs` or `command.rs`.
+
+## Gotchas
+
+- The schema DSL is implemented **twice** — `schema.noe`'s Noeta `Statement` IR and `schema.rs`'s Rust one, field for field, with `.canonical()` the byte-for-byte shared text (`.render()` is the migration-file source form). Change one side and you must change the other, then run the cross-check above.
+- A `.noe` file is a legal body in **both** the migrations and the seeds directory and means a different thing in each: under `migrations/` it declares `migrate(): List<Statement>` (describes), under `seeds/` it declares `seed(conn)` (performs). `migrate::DirKind` is what selects the entry convention — it is never inferred from the file. `.sql`, `.schema` and `.noe` all load in both directories and interleave in one filename order.
+- CI checks + tests the hermetic demos **by name**, so a new demo has to be added to the list in `ci.yml` or it is never run. `examples/para-db-namespaced/` is gated by nothing at all — check it by hand when you touch module naming.
+- A demo's assertions belong in an `@test` block. CI runs `noeta check` + `noeta test` and **nothing else** — an `echo` that "shows" the behavior is not a gate, and a demo with no `@test` reports "no tests found" while passing.
+- `clippy::needless_update` is allowed in `crates/noeta-para-db/Cargo.toml` on purpose: the ABI's documented `..ExtFn::DEFAULTS` additive-evolution convention trips it whenever `ExtFn` happens to have no optional fields. Keep the `..DEFAULTS`, not the lint.
+- `noeta.lock` under `examples/` and every `Cargo.lock` are gitignored — an example is a demo, not a package root. This package, a library, carries no root lock either: it resolves at the consumer.
 
 ## Conventions
 
-- `noeta.lock` files under `examples/` are **gitignored** — an example is a demo, not a package root, and its lock regenerates on every run. (This package, a library, carries no root lock either: it resolves at the consumer.)
-- A demo's assertions belong in an `@test` block. CI runs `noeta check` + `noeta test` and **nothing else** — an `echo` that "shows" the behavior is not a gate, and a demo with no `@test` reports "no tests found" while passing.
-- Rust: default `rustfmt` style (no `rustfmt.toml`), `cargo clippy --all-targets -- -D warnings` clean, zero compiler warnings; the CI toolchain is pinned at 1.97.0 — lint against it locally (a floating `@stable` surfaces lints CI doesn't have yet, and vice versa). `clippy::needless_update` is allowed in `crates/noeta-para-db/Cargo.toml`: the ABI's documented `..ExtFn::DEFAULTS` additive-evolution convention trips it whenever `ExtFn` happens to have no optional fields.
-- Rust naming: `snake_case` files/functions, `PascalCase` types, `SCREAMING_SNAKE_CASE` constants; prefer enums and constants over magic strings.
-- Markdown never hard-wraps lines.
-- **American English** throughout — code, comments, and docs (`behavior`, not `behaviour`).
-- **Conventional commits** for all commit titles. Commit each green slice as it completes, but **never `git push` without explicit authorization**. Never move a published `v*` tag — a release is a new tag.
-- Implement in full — no stubs or TODOs; new functionality lands with tests.
-- Keep `README.md` and this file up to date when layout or behavior changes.
-
-## CI
-
-`ci.yml` gates the Rust crates (fmt/clippy/test) and the examples (pinned released `noeta`); `release.yml` re-runs the crate gate then publishes the tag to the hosted registry (`noeta publish`, keyless Sigstore provenance via GitHub OIDC). Both go green only once the toolchain repo is published under github.com/noeta-lang/noeta and the `file:///` deps are flipped.
+- Rust: default `rustfmt` style (no `rustfmt.toml`), `cargo clippy --all-targets -- -D warnings` clean, zero compiler warnings. `snake_case` files/functions, `PascalCase` types, `SCREAMING_SNAKE_CASE` constants; prefer enums and constants over magic strings.
+- Markdown never hard-wraps lines. **American English** throughout — code, comments, and docs (`behavior`, not `behaviour`).
+- **Conventional commits** for all commit titles. Commit each green slice as it completes, but **never `git push` without explicit authorization**.
+- Implement in full — no stubs or TODOs; new functionality lands with tests. Keep `README.md` and this file up to date when layout or behavior changes.
