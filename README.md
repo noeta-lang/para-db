@@ -19,9 +19,15 @@ The first-party database layer for Noeta — a native swappable driver plus a pu
 
 ## Installation
 
+```sh
+noeta add para/db
+```
+
+That asks the registry for the current release and writes the caret requirement for it, so no version is pinned here to go stale. It adds:
+
 ```toml
 [dependencies]
-para = { version = "^0.5", package = "para/db" }
+para = { version = "^X.Y", package = "para/db" }
 
 [directives]
 sql = "para/db"           # lets your source write `@sql { … }` blocks
@@ -526,7 +532,7 @@ For **other editors** (or a custom setup), `@sql { … }` bodies highlight as SQ
 
 ## Requirements
 
-Noeta 0.4 or newer (`toolchain = ">=0.4"`). Consumers compile this package's native driver crate locally: `cargo` and a Rust toolchain (1.95+) must be on `PATH`. The Noeta toolchain composes and builds it automatically on first use. SQLite is bundled (compiled from source — no system libsqlite3 needed); the Postgres driver rides the opt-in `ring-postgres` feature — the composed toolchain auto-enables it (no flags needed), and a `--native` (AOT) build requests it in the manifest with `[native] rings = ["ring-postgres"]`.
+The toolchain floor is declared as `toolchain` in `noeta.toml` and shown on the package's registry page. Consumers compile this package's native driver crate locally: `cargo` and a Rust toolchain (1.95+) must be on `PATH`. The Noeta toolchain composes and builds it automatically on first use. SQLite is bundled (compiled from source — no system libsqlite3 needed); the Postgres driver rides the opt-in `ring-postgres` feature — the composed toolchain auto-enables it (no flags needed), and a `--native` (AOT) build requests it in the manifest with `[native] rings = ["ring-postgres"]`.
 
 ## Development
 
