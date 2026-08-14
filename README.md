@@ -352,6 +352,10 @@ Two integrity checks run before anything is applied, both hard errors that name 
 - **Checksum drift** — an already-applied migration's file was edited. History is immutable; revert the edit or make the change in a new migration. (For a Noeta or `.schema` file, only a change to what it *does* counts — reformat it freely.)
 - **Deleted applied migration** — a file recorded as applied is gone. Restore it, or `--reset` in development.
 
+One further check is a **warning**, and is deliberately not an error:
+
+- **Applied out of order** — a migration applied that sorts *before* one this database had already applied, which is what a rebase or a merge produces when two branches each add a migration and the one that landed second sorts first. Nothing is broken: it applied, in the only order this database could run it. What differs is that a database built fresh from these files applies them in filename order instead — harmless when the two are independent, and exactly how two migrations touching the same table come apart. Only you know which you have, so the run says what happened and leaves the judgment there; renaming the newer file to sort last is how you make both histories agree. The warning names the files and does not repeat once they are part of the history.
+
 Every `.noe` migration's `migrate()` runs **before** the driver is even opened — a migration takes no connection, so what it means is knowable without a database, and a program that fails to check says so before anything is applied. Lowering then happens before each transaction opens, so a statement the vocabulary cannot express stops the run with the file named and nothing touched.
 
 **Transactionality.** Each migration runs inside its own transaction — `BEGIN`, the file body, the tracking-row insert, `COMMIT`. The first failure rolls that migration back and stops, reporting the exact file. Postgres has fully transactional DDL; SQLite is transactional for the ordinary DDL migrations use — so a migration is all-or-nothing, and a failed run leaves every prior migration applied. (Do not put `BEGIN`/`COMMIT` in a migration file — the runner owns the transaction.)

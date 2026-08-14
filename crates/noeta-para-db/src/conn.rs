@@ -290,7 +290,9 @@ fn connection_method_dispatch(
             // up to date), so an app can `conn.migrate("migrations")` at boot.
             let applied =
                 crate::migrate::apply(&mut **driver, &migrations).map_err(migrate_error)?;
-            Ok(NativeOut::Scalar(Scalar::Int(applied.len() as i64)))
+            // The programmatic surface answers with the count it always has; the
+            // out-of-order note is the CLI's to report, where there is an operator to read it.
+            Ok(NativeOut::Scalar(Scalar::Int(applied.names.len() as i64)))
         }
         "seed" => {
             want_arity(method, args, 1)?;

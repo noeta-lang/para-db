@@ -299,6 +299,20 @@ pub struct Plan {
     pub statuses: Vec<StatusRow>,
     /// Indices into the sorted migration list that are not yet applied, in apply order.
     pub pending: Vec<usize>,
+    /// Pending migrations that sort **before** one already applied — the shape a rebase or a merge
+    /// produces when two branches each add a migration and the one that landed second sorts first.
+    /// A subset of [`Self::pending`], in the same order.
+    ///
+    /// **A warning, deliberately not an error.** It is not corruption: the migration will apply, and
+    /// on this database it applies *after* the one it sorts before. What it means is that this
+    /// database's history and a freshly created one's will differ in order — which is harmless for
+    /// independent migrations and is exactly how two migrations touching the same table come apart.
+    /// Only the author knows which they have, so the engine reports rather than refuses; erroring
+    /// would block the common, harmless case with no way to say "yes, I know".
+    ///
+    /// Empty for the overwhelmingly common linear history, so a consumer that ignores it behaves
+    /// exactly as before.
+    pub out_of_order: Vec<usize>,
 }
 
 /// A migration-engine failure, each naming the offending file where relevant.
@@ -641,7 +655,19 @@ pub fn plan(migrations: &[Migration], applied: &[AppliedRecord]) -> Result<Plan,
             }
         }
     }
-    Ok(Plan { statuses, pending })
+    // Out-of-order detection: a pending migration that sorts before the LAST applied one. Keyed on
+    // the last applied rather than on any applied, because that is the boundary a fresh database
+    // would order differently — anything after it is simply the tail of a linear history.
+    let last_applied = statuses.iter().rposition(|row| row.applied);
+    let out_of_order = match last_applied {
+        Some(boundary) => pending.iter().copied().filter(|&i| i < boundary).collect(),
+        None => Vec::new(),
+    };
+    Ok(Plan {
+        statuses,
+        pending,
+        out_of_order,
+    })
 }
 
 /// Create the tracking table if it does not exist. Portable across SQLite and Postgres.
@@ -735,24 +761,48 @@ fn apply_one(driver: &mut dyn SqlDriver, migration: &Migration) -> Result<(), Mi
     }
 }
 
-/// Apply every pending migration in order, each in its own transaction. Returns the names applied.
-/// Runs the integrity gates first (via [`plan`]); stops at the first failure with the prior
-/// migrations left committed.
+/// What an [`apply`] run did: the migrations it applied, and anything about the run worth telling
+/// the operator that is not a failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Applied {
+    /// The migrations applied, in apply order.
+    pub names: Vec<String>,
+    /// Applied migrations that sorted **before** one already in this database's history — see
+    /// [`Plan::out_of_order`]. Reported by the operation that acted on them rather than left for a
+    /// caller to re-plan and discover, so the programmatic surface and the CLI cannot differ about
+    /// whether the run was worth a word.
+    pub out_of_order: Vec<String>,
+}
+
+/// Apply every pending migration in order, each in its own transaction. Runs the integrity gates
+/// first (via [`plan`]); stops at the first failure with the prior migrations left committed.
 pub fn apply(
     driver: &mut dyn SqlDriver,
     migrations: &[Migration],
-) -> Result<Vec<String>, MigrateError> {
+) -> Result<Applied, MigrateError> {
     ensure_tracking_table(driver)?;
     let applied = read_applied(driver)?;
     let plan = plan(migrations, &applied)?;
 
-    let mut done = Vec::with_capacity(plan.pending.len());
+    // Captured before applying, because applying is what makes them no longer out of order: once
+    // these rows are in the tracking table the boundary has moved, so a re-plan afterwards would
+    // report a clean history and the operator would never hear about it.
+    let out_of_order = plan
+        .out_of_order
+        .iter()
+        .map(|&i| migrations[i].name.clone())
+        .collect();
+
+    let mut names = Vec::with_capacity(plan.pending.len());
     for &index in &plan.pending {
         let migration = &migrations[index];
         apply_one(driver, migration)?;
-        done.push(migration.name.clone());
+        names.push(migration.name.clone());
     }
-    Ok(done)
+    Ok(Applied {
+        names,
+        out_of_order,
+    })
 }
 
 /// The full status of every migration (applied/pending + recorded time), running the integrity gates.
@@ -787,7 +837,9 @@ pub fn reset(
     migrations: &[Migration],
 ) -> Result<Vec<String>, MigrateError> {
     driver.reset().map_err(MigrateError::Db)?;
-    apply(driver, migrations)
+    // A reset re-applies from zero, so there is no prior history for anything to sort before and
+    // `out_of_order` is empty by construction — the names are the whole answer here.
+    Ok(apply(driver, migrations)?.names)
 }
 
 /// How a [`MigrationKind::Program`] seed body is actually run — the seam between this engine, which
@@ -1072,6 +1124,47 @@ mod tests {
         );
         assert_eq!(plan.statuses[0].applied_at.as_deref(), Some("t1"));
         assert_eq!(plan.statuses[2].applied_at, None);
+    }
+
+    #[test]
+    fn plan_flags_a_pending_migration_that_sorts_before_an_applied_one() {
+        // The rebase shape: two branches each add a migration, `0003` lands and is applied, then
+        // `0002` arrives from the other branch. It is pending AND out of order — it will apply, but
+        // after `0003`, where a fresh database would run it before.
+        let a = migration("0001_a.sql", "CREATE TABLE a(id INT);");
+        let b = migration("0002_b.sql", "CREATE TABLE b(id INT);");
+        let c = migration("0003_c.sql", "CREATE TABLE c(id INT);");
+        let migrations = vec![a.clone(), b.clone(), c.clone()];
+        let records = vec![applied(&a, "t1"), applied(&c, "t2")];
+
+        let plan = plan(&migrations, &records).unwrap();
+        assert_eq!(plan.pending, vec![1], "the newcomer is pending");
+        assert_eq!(
+            plan.out_of_order,
+            vec![1],
+            "and it sorts before an applied one"
+        );
+    }
+
+    #[test]
+    fn a_linear_history_is_never_out_of_order() {
+        // Every pending migration sorts after the last applied one — the overwhelmingly common
+        // shape, and the one a false positive here would nag on every single run.
+        let a = migration("0001_a.sql", "CREATE TABLE a(id INT);");
+        let b = migration("0002_b.sql", "CREATE TABLE b(id INT);");
+        let c = migration("0003_c.sql", "CREATE TABLE c(id INT);");
+        let migrations = vec![a.clone(), b.clone(), c.clone()];
+
+        // Some applied, the rest pending.
+        let tail = plan(&migrations, &[applied(&a, "t1")]).unwrap();
+        assert_eq!(tail.pending, vec![1, 2]);
+        assert!(tail.out_of_order.is_empty());
+
+        // And a database with nothing applied at all: there is no boundary to sort before, so a
+        // first run of a full history is never "out of order".
+        let fresh = plan(&migrations, &[]).unwrap();
+        assert_eq!(fresh.pending, vec![0, 1, 2]);
+        assert!(fresh.out_of_order.is_empty());
     }
 
     #[test]
@@ -1712,7 +1805,7 @@ mod sqlite_e2e {
         let migrations = migrations();
 
         let first = apply(&mut driver, &migrations).unwrap();
-        assert_eq!(first, vec!["0001_users.sql", "0002_posts.sql"]);
+        assert_eq!(first.names, vec!["0001_users.sql", "0002_posts.sql"]);
         assert!(table_exists(&mut driver, "users"));
         assert!(table_exists(&mut driver, "posts"));
         // The multi-statement second migration ran fully (its INSERT landed).
@@ -1723,7 +1816,7 @@ mod sqlite_e2e {
 
         // Re-running applies nothing.
         let second = apply(&mut driver, &migrations).unwrap();
-        assert!(second.is_empty());
+        assert!(second.names.is_empty());
     }
 
     #[test]
@@ -1943,7 +2036,10 @@ mod sqlite_e2e {
         let migrations = mixed_migrations();
 
         let applied = apply(&mut driver, &migrations).unwrap();
-        assert_eq!(applied, vec!["0001_todos.schema", "0002_first_todo.sql"]);
+        assert_eq!(
+            applied.names,
+            vec!["0001_todos.schema", "0002_first_todo.sql"]
+        );
         assert!(table_exists(&mut driver, "todos"));
 
         // The lowered SQLite DDL really is what the DSL described: an autoincrement identity, a
@@ -1974,7 +2070,7 @@ mod sqlite_e2e {
         assert_eq!(count(&mut driver, "todos"), 1);
 
         // Re-running is a no-op — the DSL migration is tracked exactly like a SQL one.
-        assert!(apply(&mut driver, &migrations).unwrap().is_empty());
+        assert!(apply(&mut driver, &migrations).unwrap().names.is_empty());
     }
 
     #[test]
@@ -2038,7 +2134,7 @@ mod sqlite_e2e {
         ];
         assert_ne!(reformatted[0].body, migrations[0].body);
         // No drift, and nothing to re-apply.
-        assert!(apply(&mut driver, &reformatted).unwrap().is_empty());
+        assert!(apply(&mut driver, &reformatted).unwrap().names.is_empty());
         assert!(status(&mut driver, &reformatted).unwrap()[0].applied);
     }
 
@@ -2055,7 +2151,7 @@ mod sqlite_e2e {
              .add_bool(\"archived\").not_null().default(false)\n",
         ));
         assert_eq!(
-            apply(&mut driver, &migrations).unwrap(),
+            apply(&mut driver, &migrations).unwrap().names,
             vec!["0003_notes.schema"]
         );
         // Both new columns exist and the pre-existing row got the declared default.

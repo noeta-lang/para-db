@@ -372,7 +372,7 @@ fn execute(
 
     // Default: apply every pending migration, then seed if `--seed`.
     match migrate::apply(driver, &migrations) {
-        Ok(applied) if applied.is_empty() => {
+        Ok(applied) if applied.names.is_empty() => {
             let _ = writeln!(
                 out,
                 "Already up to date ({} migration(s)).",
@@ -388,12 +388,13 @@ fn execute(
             let _ = writeln!(
                 out,
                 "Applied {} migration(s) from {}:",
-                applied.len(),
+                applied.names.len(),
                 dir.display()
             );
-            for name in &applied {
+            for name in &applied.names {
                 let _ = writeln!(out, "  applied {name}");
             }
+            warn_out_of_order(&applied.out_of_order, err);
             if inv.seed {
                 run_seeds(ctx, driver, &dsn, inv.seeds_dir.as_deref(), out, err)
             } else {
@@ -402,6 +403,40 @@ fn execute(
         }
         Err(e) => run_error(err, &e.to_string()),
     }
+}
+
+/// Report migrations that applied **out of order** — they sorted before one already in this
+/// database's history, which is what a rebase or a merge produces when two branches each add a
+/// migration and the one that landed second sorts first.
+///
+/// **A warning, and deliberately not an error.** Nothing is broken: the migrations applied, and they
+/// applied in the only order this database could have run them. What differs is that a database
+/// created fresh from these files will apply them in filename order instead — harmless when the two
+/// migrations are independent, and exactly how two migrations touching the same table come apart.
+/// Only the author knows which they have, so this says what happened and leaves the judgment there;
+/// refusing would block the common harmless case with no way to say "yes, I know".
+///
+/// On stderr, because it is out-of-band commentary on a run that succeeded — a caller piping the
+/// applied list gets the list.
+fn warn_out_of_order(out_of_order: &[String], err: &mut dyn Write) {
+    if out_of_order.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        err,
+        "warning: {} migration(s) applied out of order — they sort before one this database had \
+         already applied:",
+        out_of_order.len()
+    );
+    for name in out_of_order {
+        let _ = writeln!(err, "  {name}");
+    }
+    let _ = writeln!(
+        err,
+        "  A database built fresh from these files applies them in filename order instead. That is \
+         harmless if they are independent; if they touch the same objects, renaming the newer one \
+         to sort last is how you make both histories agree."
+    );
 }
 
 /// The command's [`ProgramRunner`]: a `.noe` seed is loaded, checked and run **on the real host**
@@ -1461,6 +1496,47 @@ mod tests {
             "{}",
             status.out
         );
+    }
+
+    #[test]
+    fn a_migration_that_lands_out_of_order_warns_and_still_applies() {
+        // The rebase shape, end to end: `0001` and `0003` apply, then `0002` arrives from the other
+        // branch. It applies — nothing here is broken — and the run says so, because this database's
+        // order now differs from the one a fresh database would use.
+        let dir = project(
+            "out_of_order",
+            &[
+                ("0001_a.sql", "CREATE TABLE a (id INTEGER);"),
+                ("0003_c.sql", "CREATE TABLE c (id INTEGER);"),
+            ],
+        );
+        let mut ctx = TestCtx::bare();
+        let db = dsn(&dir);
+        assert_eq!(run_in(&dir, &["--db", &db], &mut ctx, None).code, 0);
+
+        // The other branch's migration arrives, sorting between the two already applied.
+        std::fs::write(
+            dir.join("migrations/0002_b.sql"),
+            "CREATE TABLE b (id INTEGER);",
+        )
+        .unwrap();
+        let outcome = run_in(&dir, &["--db", &db], &mut ctx, None);
+
+        // A warning, not a failure: it applied.
+        assert_eq!(outcome.code, 0, "{}", outcome.err);
+        assert!(
+            outcome.out.contains("applied 0002_b.sql"),
+            "{}",
+            outcome.out
+        );
+        assert!(outcome.err.contains("out of order"), "{}", outcome.err);
+        assert!(outcome.err.contains("0002_b.sql"), "{}", outcome.err);
+
+        // And it is not sticky: once applied it is part of this database's history, so the next run
+        // is clean. A warning that repeated forever would be one nobody reads.
+        let again = run_in(&dir, &["--db", &db], &mut ctx, None);
+        assert_eq!(again.code, 0);
+        assert!(!again.err.contains("out of order"), "{}", again.err);
     }
 
     #[test]
