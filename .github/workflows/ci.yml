@@ -61,10 +61,12 @@ jobs:
             (cd "${crate}" && cargo test)
           done
       # The opt-in Postgres driver ring must keep compiling even though the default build never
-      # links the PG client.
-      - name: cargo check --features ring-postgres (opt-in driver ring)
+      # links the PG client. `clippy --all-targets`, not `check`: `check` never builds a **test**
+      # target, so the ring's own `postgres_e2e` module could rot invisibly — and did, when a change
+      # to `apply`'s return type left its call sites behind and this step still reported a pass.
+      - name: clippy --all-targets --features ring-postgres (opt-in driver ring)
         working-directory: crates/noeta-para-db
-        run: cargo check --features ring-postgres
+        run: cargo clippy --all-targets --features ring-postgres -- -D warnings
 
   examples:
     name: Examples (noeta check + test)
