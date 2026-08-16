@@ -70,6 +70,14 @@ pub struct SqliteDriver {
 }
 
 impl SqliteDriver {
+    /// The SQL dialect this driver speaks, named **once**: [`SqlDriver::dialect`] reports it (which is
+    /// what selects a `migrations/sqlite/` override) and [`SqlDriver::lower_schema`] renders with it,
+    /// so the dialect the engine believes is connected and the DDL that reaches the database cannot
+    /// come apart.
+    const DIALECT: crate::schema::Dialect = crate::schema::Dialect::Sqlite;
+}
+
+impl SqliteDriver {
     /// Wrap an open connection: register a bus subscriber and install the update hook that publishes
     /// a changed table's name (= the channel a `db.watch` on that table listens on) to the bus, so any
     /// write through this connection wakes every watcher on the table — in this isolate or a sibling.
@@ -144,13 +152,14 @@ impl SqlDriver for SqliteDriver {
         self.conn.execute_batch(sql).map_err(|e| e.to_string())
     }
 
+    fn dialect(&self) -> Option<crate::schema::Dialect> {
+        Some(Self::DIALECT)
+    }
+
     fn lower_schema(&self, statements: &[crate::schema::Statement]) -> Result<String, String> {
         // The dialect is the only thing this driver contributes; the rendering itself is the one
         // shared implementation, so SQLite and Postgres can never grow divergent DDL writers.
-        Ok(crate::schema::lower(
-            statements,
-            crate::schema::Dialect::Sqlite,
-        ))
+        Ok(crate::schema::lower(statements, Self::DIALECT))
     }
 
     fn reset(&mut self) -> Result<(), String> {

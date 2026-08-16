@@ -46,6 +46,12 @@ impl std::fmt::Debug for PostgresDriver {
 }
 
 impl PostgresDriver {
+    /// The SQL dialect this driver speaks, named **once**: [`SqlDriver::dialect`] reports it (which is
+    /// what selects a `migrations/postgres/` override) and [`SqlDriver::lower_schema`] renders with
+    /// it, so the dialect the engine believes is connected and the DDL that reaches the database
+    /// cannot come apart.
+    const DIALECT: crate::schema::Dialect = crate::schema::Dialect::Postgres;
+
     /// Connect to the server named by `dsn` (a libpq connection string / URL, e.g.
     /// `postgres://user:pass@host:5432/db?sslmode=require`). The dsn's `sslmode` ([`SslMode`]) selects
     /// the TLS behavior: whether TLS is negotiated (default `prefer` → try TLS, fall back to plaintext)
@@ -314,13 +320,14 @@ impl SqlDriver for PostgresDriver {
         self.client.batch_execute(sql).map_err(pg_err)
     }
 
+    fn dialect(&self) -> Option<crate::schema::Dialect> {
+        Some(Self::DIALECT)
+    }
+
     fn lower_schema(&self, statements: &[crate::schema::Statement]) -> Result<String, String> {
         // Same shared renderer as SQLite, one dialect over: `BIGSERIAL PRIMARY KEY` identities and
         // `DOUBLE PRECISION` floats instead of `INTEGER PRIMARY KEY AUTOINCREMENT` and `REAL`.
-        Ok(crate::schema::lower(
-            statements,
-            crate::schema::Dialect::Postgres,
-        ))
+        Ok(crate::schema::lower(statements, Self::DIALECT))
     }
 
     fn reset(&mut self) -> Result<(), String> {

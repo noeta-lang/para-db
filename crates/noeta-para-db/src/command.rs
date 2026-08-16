@@ -279,11 +279,22 @@ fn execute(
         Err(message) => return usage_error(err, &message),
     };
 
+    // The driver first, because discovery needs its **dialect**: which body each migration has is a
+    // question about the connected backend (a `migrations/postgres/` override replaces a base file's
+    // body), so the files cannot be read — let alone checksummed — before it is known. Opening a
+    // driver applies nothing.
+    let mut driver = match open_driver(&dsn) {
+        Ok(driver) => driver,
+        Err(e) => return run_error(err, &format!("cannot open database: {e}")),
+    };
+    let driver = driver.as_mut();
+    let dialect = driver.dialect();
+
     // Discover the migration files (a missing directory is a usage error), then run every `.noe`
-    // one's `migrate()` to learn what it describes. Resolution happens here, before the driver is even
-    // opened: a Noeta migration takes no connection, so what it means is knowable without a
-    // database, and a program that fails to check should say so before anything is applied.
-    let mut migrations = match migrate::load_dir(&dir, DirKind::Migrations) {
+    // one's `migrate()` to learn what it describes. Resolution happens here, before anything is
+    // applied: a Noeta migration takes no connection, so what it means is knowable without touching
+    // the database, and a program that fails to check should say so before the first transaction.
+    let mut migrations = match migrate::load_dir(&dir, DirKind::Migrations, dialect) {
         Ok(migrations) => migrations,
         Err(e) => return usage_error(err, &e.to_string()),
     };
@@ -295,15 +306,9 @@ fn execute(
     }
     let migrations = migrations;
 
-    let mut driver = match open_driver(&dsn) {
-        Ok(driver) => driver,
-        Err(e) => return run_error(err, &format!("cannot open database: {e}")),
-    };
-    let driver = driver.as_mut();
-
     // `migrate seed` — run seeds only, refusing if any migration is still pending.
     if inv.seed_only {
-        let seeds = match load_seeds(&*ctx, inv.seeds_dir.as_deref(), err) {
+        let seeds = match load_seeds(&*ctx, inv.seeds_dir.as_deref(), dialect, err) {
             Ok(seeds) => seeds,
             Err(exit) => return exit,
         };
@@ -392,7 +397,15 @@ fn execute(
                 dir.display()
             );
             for name in &applied.names {
-                let _ = writeln!(out, "  applied {name}");
+                // Which body ran, when it was not the one whose filename is printed — the same note
+                // `--status` carries, on the line that says it happened.
+                let overridden = migrations
+                    .iter()
+                    .find(|m| &m.name == name)
+                    .and_then(|m| m.override_dialect)
+                    .map(|dialect| format!("  ({dialect} override)"))
+                    .unwrap_or_default();
+                let _ = writeln!(out, "  applied {name}{overridden}");
             }
             warn_out_of_order(&applied.out_of_order, err);
             if inv.seed {
@@ -581,7 +594,10 @@ fn run_seeds(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let seeds = match load_seeds(&*ctx, flag, err) {
+    // The same selector migrations use: a seed under `seeds/<dialect>/` overrides its base file for
+    // the connected backend.
+    let dialect = driver.dialect();
+    let seeds = match load_seeds(&*ctx, flag, dialect, err) {
         Ok(seeds) => seeds,
         Err(exit) => return exit,
     };
@@ -598,10 +614,11 @@ fn run_seeds(
 fn load_seeds(
     ctx: &dyn CommandCtx,
     flag: Option<&Path>,
+    dialect: Option<crate::schema::Dialect>,
     err: &mut dyn Write,
 ) -> Result<Vec<migrate::Migration>, u8> {
     let dir = resolve_seeds_dir(ctx, flag);
-    migrate::load_dir(&dir, DirKind::Seeds).map_err(|e| usage_error(err, &e.to_string()))
+    migrate::load_dir(&dir, DirKind::Seeds, dialect).map_err(|e| usage_error(err, &e.to_string()))
 }
 
 /// Print the seed-run summary (an empty run is an explicit no-op line).
@@ -734,11 +751,17 @@ fn print_status(out: &mut dyn Write, dir: &Path, rows: &[migrate::StatusRow]) {
     }
     let _ = writeln!(out, "Migrations under {}:", dir.display());
     for row in rows {
+        // An override is invisible in the listing the operator is looking at — the base filename is
+        // what shows, while a different file's body is what runs — so the status line says so.
+        let overridden = match row.override_dialect {
+            Some(dialect) => format!("  [{dialect} override]"),
+            None => String::new(),
+        };
         if row.applied {
             let at = row.applied_at.as_deref().unwrap_or("");
-            let _ = writeln!(out, "  [applied] {}  ({at})", row.name);
+            let _ = writeln!(out, "  [applied] {}  ({at}){overridden}", row.name);
         } else {
-            let _ = writeln!(out, "  [pending] {}", row.name);
+            let _ = writeln!(out, "  [pending] {}{overridden}", row.name);
         }
     }
     let pending = rows.iter().filter(|r| !r.applied).count();
@@ -1227,6 +1250,75 @@ mod tests {
         let after = run_in(&dir, &["--db", &db, "--status"], &mut ctx, None);
         assert_eq!(after.code, 0, "{}", after.err);
         assert!(after.out.contains("2 applied, 0 pending"), "{}", after.out);
+    }
+
+    #[test]
+    fn the_command_applies_the_connected_dialects_override_and_says_so() {
+        // The CLI half of per-dialect overrides, over a real SQLite file: the base body is Postgres
+        // SQL that SQLite cannot parse, so applying at all proves `migrations/sqlite/` was selected
+        // — and both the apply line and `--status` name the override, because the filename they
+        // print is the base file's while the body that ran is not.
+        let dir = project(
+            "dialect_override",
+            &[
+                (
+                    "0001_docs.sql",
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSONB DEFAULT '{}'::jsonb);",
+                ),
+                (
+                    "sqlite/0001_docs.sql",
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, doc TEXT DEFAULT '{}');",
+                ),
+            ],
+        );
+        let mut ctx = TestCtx::bare();
+        let db = dsn(&dir);
+
+        let applied = run_in(&dir, &["--db", &db], &mut ctx, None);
+        assert_eq!(applied.code, 0, "{}", applied.err);
+        assert!(
+            applied
+                .out
+                .contains("applied 0001_docs.sql  (sqlite override)"),
+            "{}",
+            applied.out
+        );
+
+        let status = run_in(&dir, &["--db", &db, "--status"], &mut ctx, None);
+        assert!(status.out.contains("[sqlite override]"), "{}", status.out);
+        assert!(
+            status.out.contains("1 applied, 0 pending"),
+            "{}",
+            status.out
+        );
+    }
+
+    #[test]
+    fn an_override_with_no_base_file_stops_the_command_before_it_migrates() {
+        // A usage error (exit 2) naming both files: the directory is malformed, and nothing about
+        // the database is wrong yet. It fires while SQLite is connected even though the offending
+        // overlay is Postgres's — the fault is found by whichever backend runs first.
+        let dir = project(
+            "dialect_orphan",
+            &[
+                M1,
+                ("postgres/0002_pg_only.sql", "CREATE TABLE b (doc JSONB);"),
+            ],
+        );
+        let mut ctx = TestCtx::bare();
+        let db = dsn(&dir);
+
+        let outcome = run_in(&dir, &["--db", &db], &mut ctx, None);
+        assert_eq!(outcome.code, 2, "{}", outcome.out);
+        assert!(
+            outcome.err.contains("postgres/0002_pg_only.sql"),
+            "{}",
+            outcome.err
+        );
+
+        // And nothing was applied: the base migration is still pending.
+        let status = run_in(&dir, &["--db", &db, "--status"], &mut ctx, None);
+        assert_eq!(status.code, 2, "{}", status.out);
     }
 
     #[test]

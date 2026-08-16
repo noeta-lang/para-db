@@ -69,6 +69,20 @@ pub trait SqlDriver: Send {
         )
     }
 
+    /// The SQL dialect this driver speaks — the **one** thing above the seam that is allowed to know
+    /// which backend is connected, and only for choosing between bodies an author already wrote: it
+    /// selects a migration's per-dialect override file (`migrations/postgres/…`, see
+    /// [`crate::migrate::load_dir`]). Nothing branches on it to *generate* SQL; that stays inside
+    /// [`SqlDriver::lower_schema`], which is why the two must agree — a driver naming one dialect and
+    /// lowering another would apply the wrong override beside the right DDL.
+    ///
+    /// `None` for a driver with no dialect mapping (the same driver that leaves the
+    /// [`SqlDriver::lower_schema`] default): it has no override directory of its own, so the base
+    /// files apply to it unchanged.
+    fn dialect(&self) -> Option<crate::schema::Dialect> {
+        None
+    }
+
     /// **Destructively** reset the database to an empty schema — drop every object this connection
     /// owns. The dialect-specific wipe lives in each driver (SQLite drops every user table/view/
     /// trigger; Postgres `DROP SCHEMA public CASCADE; CREATE SCHEMA public`), so the migration runner

@@ -1,0 +1,92 @@
+// Per-dialect migration overrides: one migration, spelled the way each backend needs it.
+//
+// A migration body runs verbatim in the connected database's own SQL, so most migrations are written
+// once and portably. For the ones that genuinely diverge — a `BIGSERIAL` against an
+// `AUTOINCREMENT`, a `jsonb` column against a `TEXT` one — a file under `migrations/<dialect>/`
+// REPLACES the body of the same-named file above it whenever that dialect is connected. It keeps the
+// base file's name, so it keeps its ordinal and its row in the tracking table: every backend runs
+// the same migrations in the same order, and only the SQL differs.
+//
+// `dialect_migrations/` holds all three files this demo is about:
+//
+//   20260816000001_create_docs.sql          the Postgres spelling (SQLite cannot parse it)
+//   sqlite/20260816000001_create_docs.sql   the SQLite spelling — selected here
+//   20260816000002_first_doc.sql            portable, so no override at all
+//
+// Run it from this directory, so the relative migrations path resolves:
+//
+//   noeta run dialect_demo.noe
+//   noeta test dialect_demo.noe
+use para.db
+
+// The migrations directory, relative to this demo's own directory. A function rather than a binding
+// because a named function does not see top-level bindings implicitly, and the `@test` block below
+// is all named functions.
+fn migrations(): string {
+    return "dialect_migrations"
+}
+
+fn migrated_database(): db.Connection {
+    conn = db.connect("sqlite::memory:")
+    conn.migrate(migrations())
+    return conn
+}
+
+conn = db.connect("sqlite::memory:")
+
+// Two migrations apply: the overridden one and the portable one.
+applied = conn.migrate(migrations())
+echo "applied ${applied} migration(s)"
+
+// The table is there in SQLite's spelling — an `AUTOINCREMENT` key, a `TEXT` body — because the
+// `sqlite/` file is the body that ran. The base file's `JSONB … ::jsonb` would have failed outright.
+rows = conn.query("SELECT id, body FROM docs ORDER BY id", [])
+for row in rows {
+    id = row["id"]
+    body = row["body"]
+    echo "  #${id} ${body}"
+}
+
+conn.close()
+
+@test {
+    // The stored DDL is the strongest available evidence of which body ran: SQLite keeps each
+    // table's `CREATE TABLE` text verbatim, so the override is readable back out of the database.
+    fn the_connected_dialects_override_is_the_body_that_ran(): void {
+        conn = migrated_database()
+        rows = conn.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'docs'",
+            [],
+        )
+        assert(rows.len() == 1, "the docs table was not created")
+        ddl = "${rows[0]["sql"]}"
+        assert(ddl.contains("AUTOINCREMENT"), "expected the sqlite/ body, got: ${ddl}")
+        assert(
+            ddl.contains("JSONB") == false,
+            "the base file's Postgres body must not have run: ${ddl}",
+        )
+        conn.close()
+    }
+
+    fn an_override_adds_no_migration_and_moves_none(): void {
+        // Two files applied, not three: the override replaced a body, it did not become a migration
+        // of its own. A re-run then applies nothing, because the checksum recorded is the one the
+        // override hashes to — an overridden migration is ordinary history, per backend.
+        conn = db.connect("sqlite::memory:")
+        assert(conn.migrate(migrations()) == 2, "expected the two base migrations")
+        assert(conn.migrate(migrations()) == 0, "a re-run must be a clean no-op")
+        conn.close()
+    }
+
+    fn the_portable_migration_runs_on_top_of_whichever_body_was_selected(): void {
+        // Migration 0002 has no override and is written once. It inserts a row without naming a key,
+        // so it only succeeds if the selected 0001 body really does assign one — which both
+        // spellings do, in their own way.
+        conn = migrated_database()
+        rows = conn.query("SELECT id, body FROM docs", [])
+        assert(rows.len() == 1, "the portable migration's row is missing")
+        assert(rows[0]["id"] == 1, "the database assigned the key")
+        assert("${rows[0]["body"]}".contains("portable"))
+        conn.close()
+    }
+}

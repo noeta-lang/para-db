@@ -24,6 +24,42 @@
 //! Both live in the **same** directory and interleave in one filename order, so a project writes
 //! Noeta wherever the schema vocabulary reaches and drops to raw SQL for the steps it does not.
 //!
+//! # Per-dialect overrides
+//!
+//! A raw-SQL body runs verbatim, so a step that two backends spell differently — a trigger, a partial
+//! index, a `jsonb` column — has nowhere portable to live. A **dialect sub-directory** is that place:
+//! a file under `migrations/<dialect>/` ([`crate::schema::Dialect::dir_name`] — `sqlite/`,
+//! `postgres/`) **replaces the body** of the same-named file in `migrations/` whenever the connected
+//! driver reports that dialect ([`crate::driver::SqlDriver::dialect`]).
+//!
+//! Three rules make that a divergent *spelling* rather than a divergent history:
+//!
+//!   * **The override keeps the base file's name**, and therefore its ordinal and its row in
+//!     [`TRACKING_TABLE`]. Only the body is swapped, so every backend runs the same migrations in the
+//!     same order and a `--status` listing reads the same everywhere. The match is on the **whole
+//!     filename**, extension included: the extension is the body language, so a migration is written
+//!     in one language on every backend and only its text differs.
+//!   * **An override with no base file is an error**
+//!     ([`MigrateError::OverrideWithoutBase`]) — the case that would make two databases diverge
+//!     structurally rather than textually, since a migration only one dialect has is a step the other
+//!     never runs and never records. A step genuinely needed on one backend only is still written as a
+//!     pair: the base file, and an override whose body says (in a comment) that there is nothing to do
+//!     here.
+//!   * **Every dialect directory is validated, not just the connected one.** Migrating SQLite reports
+//!     a broken `postgres/` overlay, so the fault is found by whichever backend runs first rather than
+//!     by production.
+//!
+//! What is checksummed is the body that **actually ran**, so an overridden migration has one identity
+//! per dialect. That is not a second identity for one migration: no database ever sees both bodies, so
+//! nothing ever compares them — a SQLite database records what SQLite ran and the drift gate re-checks
+//! it against what SQLite would run now. The rule the checksum keeps ("what the author wrote for this
+//! database, canonicalized") is unchanged; only the author has chosen to write it twice.
+//!
+//! A sub-directory that is not a dialect name is ignored while it holds no bodies (a `notes/`,
+//! an editor's directory) and is an error the moment it holds one
+//! ([`MigrateError::UnknownDialectDir`]) — a mistyped `postgress/` is otherwise a directory full of
+//! migrations that silently never run.
+//!
 //! **`.schema` is the IR, not a third language.** The portable schema DSL
 //! ([`MigrationKind::Schema`]) is what a `.noe` migration *compiles down to* — the same text
 //! [`crate::schema::render`] produces from a `Vec<Statement>`. It remains readable and remains
@@ -221,8 +257,14 @@ pub struct Migration {
     pub kind: MigrationKind,
     /// Where the file lives — what a [`MigrationKind::Program`] seed is run from (a program is
     /// loaded from disk by the CLI, not handed over as a string). [`Migration::new`] defaults it to
-    /// the bare filename; [`load_dir`] sets the real path.
+    /// the bare filename; [`load_dir`] sets the real path. For an overridden migration this is the
+    /// **override's** path, so a `.noe` override's `migrate()` is the one that runs.
     pub path: PathBuf,
+    /// The dialect whose override supplied this body, when one did — `None` for the ordinary case of
+    /// a file that reads the same on every backend. Reported (by `--status`) rather than kept
+    /// internal: an override is invisible in the directory listing the operator is reading, and a
+    /// migration whose body is not the one they are looking at is worth a word.
+    pub override_dialect: Option<crate::schema::Dialect>,
 }
 
 impl Migration {
@@ -241,6 +283,7 @@ impl Migration {
             checksum,
             kind,
             path,
+            override_dialect: None,
         }
     }
 
@@ -291,6 +334,10 @@ pub struct StatusRow {
     pub checksum: String,
     pub applied: bool,
     pub applied_at: Option<String>,
+    /// The dialect directory this migration's body came from, when it was overridden
+    /// ([`Migration::override_dialect`]) — so a status listing says which of two bodies the row's
+    /// checksum is over.
+    pub override_dialect: Option<crate::schema::Dialect>,
 }
 
 /// The result of planning: every migration's status (in order) plus the indices of the pending ones.
@@ -357,6 +404,20 @@ pub enum MigrateError {
     /// `migrate seed` (seeds-only) found pending migrations: the schema is stale, so seeding is
     /// refused (seeding a stale schema is a footgun). Carries how many migrations are pending.
     PendingMigrations { pending: usize },
+    /// A per-dialect override file (`migrations/<dialect>/<name>`) has no same-named base file to
+    /// override. Reported for **every** dialect directory, not only the connected one, because that is
+    /// what makes it a fault of the directory rather than a fault that waits for the other backend.
+    OverrideWithoutBase {
+        dialect: crate::schema::Dialect,
+        filename: String,
+        /// Which directory it was found in, so the message names what the file is (a migration or a
+        /// seed) rather than guessing.
+        kind: DirKind,
+    },
+    /// A sub-directory of the migrations/seeds directory holds body files but is not named after a
+    /// dialect — a mistyped `postgress/`, or an overlay for a backend that does not exist. Carries the
+    /// name found so the message can show it against the names that work.
+    UnknownDialectDir { name: String, kind: DirKind },
     /// A database error outside a single migration (reading the tracking table, `BEGIN`/`COMMIT`).
     Db(String),
     /// A filesystem error discovering or reading migration files.
@@ -421,6 +482,37 @@ impl std::fmt::Display for MigrateError {
                  date. Run `noeta migrate` first (or `noeta migrate --seed` to migrate then seed) — \
                  seeding a stale schema is a footgun.",
             ),
+            MigrateError::OverrideWithoutBase {
+                dialect,
+                filename,
+                kind,
+            } => {
+                let noun = kind.noun();
+                write!(
+                    f,
+                    "`{dialect}/{filename}` overrides a {noun} that does not exist — there is no \
+                     `{filename}` beside the `{dialect}/` directory. An override replaces the body \
+                     of a {noun}, never adds one: a {noun} only one backend has is a schema the \
+                     others never get, and its name would be missing from their history. Add \
+                     `{filename}` (its body is what every other backend runs — a comment is enough \
+                     when there is nothing to do there), or rename the override to match an \
+                     existing {noun}.",
+                )
+            }
+            MigrateError::UnknownDialectDir { name, kind } => {
+                let known = crate::schema::Dialect::ALL
+                    .iter()
+                    .map(|d| format!("`{}`", d.dir_name()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "sub-directory `{name}` of the {label} directory holds body files but is not a \
+                     dialect — only {known} are read, so nothing in `{name}` would ever run. Rename \
+                     it to the dialect it overrides for, or move its files up beside the others.",
+                    label = kind.label(),
+                )
+            }
             MigrateError::Db(message) => write!(f, "database error: {message}"),
             MigrateError::Io(message) => write!(f, "{message}"),
             MigrateError::InvalidName(name) => {
@@ -488,10 +580,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// tracking table needs no notion of body language (the filename it already records carries it).
 ///
 /// A missing directory is an error (the caller asked to migrate but there is nowhere to read from);
-/// an *empty* existing directory yields an empty list (migrate is then a clean no-op). Sub-directories
-/// and files with any other extension are ignored — leaving room for a future per-dialect
-/// `dir/postgres/` overlay without disturbing what exists.
-pub fn load_dir(dir: &Path, kind: DirKind) -> Result<Vec<Migration>, MigrateError> {
+/// an *empty* existing directory yields an empty list (migrate is then a clean no-op). Files with any
+/// other extension are ignored.
+///
+/// `dialect` is the connected driver's ([`crate::driver::SqlDriver::dialect`]), and selects the
+/// **per-dialect overrides**: a body file under `dir/<dialect>/` replaces the body of the same-named
+/// file directly under `dir`, keeping its name, its ordinal and its place in the tracking table —
+/// see this module's header. `None` (a driver that names no dialect) reads the base files alone. The
+/// *other* dialects' directories are still checked for overrides with no base file, so a broken
+/// overlay is reported by whichever backend runs first.
+pub fn load_dir(
+    dir: &Path,
+    kind: DirKind,
+    dialect: Option<crate::schema::Dialect>,
+) -> Result<Vec<Migration>, MigrateError> {
     let label = kind.label();
     if !dir.exists() {
         return Err(MigrateError::Io(format!(
@@ -507,23 +609,23 @@ pub fn load_dir(dir: &Path, kind: DirKind) -> Result<Vec<Migration>, MigrateErro
     })?;
 
     let mut migrations = Vec::new();
+    let mut subdirectories = Vec::new();
     for entry in entries {
         let entry =
             entry.map_err(|e| MigrateError::Io(format!("reading `{}`: {e}", dir.display())))?;
         let path = entry.path();
+        if path.is_dir() {
+            // A per-dialect override directory, or something the project keeps here that is not one.
+            // Which it is — and whether that matters — is decided by `apply_overrides` below, once
+            // every base file is known.
+            subdirectories.push((entry.file_name().to_string_lossy().into_owned(), path));
+            continue;
+        }
         if !path.is_file() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        // A body file, or not one at all (a README, a `.bak`, a `.gitkeep`) — anything else is
-        // ignored in both directories, as it always has been. Which of the three it *is* comes from
-        // `MigrationKind::of` below, off the same filename; this only decides whether to look.
-        let is_body = path.extension().is_some_and(|ext| {
-            [SQL_EXTENSION, SCHEMA_EXTENSION, PROGRAM_EXTENSION]
-                .iter()
-                .any(|wanted| ext.eq_ignore_ascii_case(wanted))
-        });
-        if !is_body {
+        if !is_body_file(&path) {
             continue;
         }
         let body = std::fs::read_to_string(&path).map_err(|e| {
@@ -539,7 +641,111 @@ pub fn load_dir(dir: &Path, kind: DirKind) -> Result<Vec<Migration>, MigrateErro
         });
     }
     migrations.sort_by(|a, b| a.name.cmp(&b.name));
+    apply_overrides(kind, dialect, &subdirectories, &mut migrations)?;
     Ok(migrations)
+}
+
+/// Validate every dialect sub-directory of a loaded directory and apply the connected one's
+/// overrides — the whole of the per-dialect mechanism, split out so [`load_dir`] stays a plain
+/// discovery loop.
+///
+/// Runs after the base files are in hand and sorted, because an override is only meaningful against a
+/// base file, and because the order is the *base* names' order: an override swaps a body, never a
+/// position.
+///
+/// Every recognized dialect directory is validated (an override with no base file is
+/// [`MigrateError::OverrideWithoutBase`] whichever backend is connected); only `dialect`'s
+/// directory is read for bodies, since the others' text has no meaning here. A sub-directory that is
+/// not a dialect is left alone unless it holds body files, in which case it is a mistyped overlay
+/// ([`MigrateError::UnknownDialectDir`]) rather than a project's `notes/`.
+fn apply_overrides(
+    kind: DirKind,
+    dialect: Option<crate::schema::Dialect>,
+    subdirectories: &[(String, PathBuf)],
+    migrations: &mut [Migration],
+) -> Result<(), MigrateError> {
+    for (name, path) in subdirectories {
+        let overrides = body_files(path, kind)?;
+        let Some(found) = crate::schema::Dialect::from_dir_name(name) else {
+            if overrides.is_empty() {
+                continue;
+            }
+            return Err(MigrateError::UnknownDialectDir {
+                name: name.clone(),
+                kind,
+            });
+        };
+        for (filename, file) in overrides {
+            let Some(base) = migrations.iter_mut().find(|m| m.name == filename) else {
+                return Err(MigrateError::OverrideWithoutBase {
+                    dialect: found,
+                    filename,
+                    kind,
+                });
+            };
+            if Some(found) != dialect {
+                // The right shape for a backend that is not this one: checked for a base file above,
+                // and otherwise not this run's business — reading its body would only invite hashing
+                // text that will never be applied here.
+                continue;
+            }
+            let body = std::fs::read_to_string(&file).map_err(|e| {
+                MigrateError::Io(format!(
+                    "cannot read {} override `{}`: {e}",
+                    kind.noun(),
+                    file.display()
+                ))
+            })?;
+            // Rebuilt through `Migration::new` so the body language and the checksum are derived from
+            // the override exactly as they are for a base file — what ran is what is recorded.
+            *base = Migration {
+                path: file,
+                override_dialect: Some(found),
+                ..Migration::new(filename, body)
+            };
+        }
+    }
+    Ok(())
+}
+
+/// The body files directly under `dir` as `(filename, path)`, sorted by filename — the same
+/// extension test [`load_dir`] applies to a base file, so an override directory accepts exactly what
+/// the directory above it does. A directory that does not exist yields nothing (the caller is asking
+/// whether it holds anything, not requiring it to).
+fn body_files(dir: &Path, kind: DirKind) -> Result<Vec<(String, PathBuf)>, MigrateError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return Err(MigrateError::Io(format!(
+                "cannot read {} directory `{}`: {e}",
+                kind.label(),
+                dir.display()
+            )));
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| MigrateError::Io(format!("reading `{}`: {e}", dir.display())))?;
+        let path = entry.path();
+        if !path.is_file() || !is_body_file(&path) {
+            continue;
+        }
+        files.push((entry.file_name().to_string_lossy().into_owned(), path));
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Whether `path`'s extension is one of the three body languages — a body file, or not one at all (a
+/// README, a `.bak`, a `.gitkeep`). Which of the three it *is* comes from [`MigrationKind::of`] off
+/// the same filename; this only decides whether to look.
+fn is_body_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        [SQL_EXTENSION, SCHEMA_EXTENSION, PROGRAM_EXTENSION]
+            .iter()
+            .any(|wanted| ext.eq_ignore_ascii_case(wanted))
+    })
 }
 
 /// Run a `.noe` **migration** and hand back the canonical schema IR its `migrate()` returned.
@@ -643,6 +849,7 @@ pub fn plan(migrations: &[Migration], applied: &[AppliedRecord]) -> Result<Plan,
                 checksum: m.checksum.clone(),
                 applied: true,
                 applied_at: Some(record.applied_at.clone()),
+                override_dialect: m.override_dialect,
             }),
             None => {
                 pending.push(index);
@@ -651,6 +858,7 @@ pub fn plan(migrations: &[Migration], applied: &[AppliedRecord]) -> Result<Plan,
                     checksum: m.checksum.clone(),
                     applied: false,
                     applied_at: None,
+                    override_dialect: m.override_dialect,
                 });
             }
         }
@@ -1072,6 +1280,7 @@ pub const SEED_PROGRAM_SCAFFOLD_TEMPLATE: &str = "// Seed (Noeta program): re-ru
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::Dialect;
 
     fn migration(name: &str, sql: &str) -> Migration {
         Migration::new(name, sql)
@@ -1416,13 +1625,16 @@ mod tests {
     fn load_dir_errors_when_missing_but_is_empty_when_bare() {
         let missing = std::path::Path::new("/does/not/exist/noeta-migrate-xyz");
         assert!(matches!(
-            load_dir(missing, DirKind::Migrations),
+            load_dir(missing, DirKind::Migrations, None),
             Err(MigrateError::Io(_))
         ));
 
         let dir = std::env::temp_dir().join(format!("noeta-migrate-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(load_dir(&dir, DirKind::Migrations).unwrap(), Vec::new());
+        assert_eq!(
+            load_dir(&dir, DirKind::Migrations, None).unwrap(),
+            Vec::new()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1434,7 +1646,8 @@ mod tests {
         std::fs::write(dir.join("0001_a.sql"), "SELECT 1;").unwrap();
         std::fs::write(dir.join("README.md"), "not a migration").unwrap();
 
-        let migrations = load_dir(&dir, DirKind::Migrations).unwrap();
+        // A connected dialect with no override directory beside the files changes nothing.
+        let migrations = load_dir(&dir, DirKind::Migrations, Some(Dialect::Sqlite)).unwrap();
         assert_eq!(
             migrations
                 .iter()
@@ -1456,7 +1669,7 @@ mod tests {
         std::fs::write(dir.join("0002_b.sql"), "SELECT 2;").unwrap();
         std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
 
-        let migrations = load_dir(&dir, DirKind::Migrations).unwrap();
+        let migrations = load_dir(&dir, DirKind::Migrations, None).unwrap();
         assert_eq!(
             migrations
                 .iter()
@@ -1484,7 +1697,7 @@ mod tests {
         )
         .unwrap();
 
-        let seeds = load_dir(&dir, DirKind::Seeds).unwrap();
+        let seeds = load_dir(&dir, DirKind::Seeds, None).unwrap();
         assert_eq!(
             seeds
                 .iter()
@@ -1500,6 +1713,313 @@ mod tests {
         // text; a `.noe` body travels as a path).
         assert_eq!(seeds[1].path, dir.join("0002_b.noe"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Per-dialect overrides ------------------------------------------------------------------
+
+    /// A fresh temp directory named after the test, with `files` (relative paths, sub-directories
+    /// created as needed) written into it. Removed by the caller. Shared with [`super::sqlite_e2e`],
+    /// which builds the same override trees against a real database.
+    pub(super) fn tree(test: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("noeta-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, body) in files {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The directory both override tests below read: two portable migrations, the second of which
+    /// each backend spells its own way.
+    fn overridden_tree(test: &str) -> PathBuf {
+        tree(
+            test,
+            &[
+                ("0001_a.sql", "CREATE TABLE a (id INTEGER);"),
+                ("0002_b.sql", "CREATE TABLE b (doc JSONB);"),
+                ("sqlite/0002_b.sql", "CREATE TABLE b (doc TEXT);"),
+                ("postgres/0002_b.sql", "CREATE TABLE b (doc JSONB);"),
+            ],
+        )
+    }
+
+    #[test]
+    fn an_override_replaces_the_body_and_keeps_the_name_the_order_and_the_ordinal() {
+        // The whole contract of an override: same filename, same position, different body — so the
+        // tracking table, the apply order and a `--status` listing read identically on every
+        // backend, and only the SQL that reaches the database differs.
+        let dir = overridden_tree("override-selects");
+
+        let migrations = load_dir(&dir, DirKind::Migrations, Some(Dialect::Sqlite)).unwrap();
+        assert_eq!(
+            migrations
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0001_a.sql", "0002_b.sql"],
+            "an override adds no file and moves none",
+        );
+        assert_eq!(migrations[1].body, "CREATE TABLE b (doc TEXT);");
+        assert_eq!(migrations[1].override_dialect, Some(Dialect::Sqlite));
+        // The body ran from the override's own path — which is what makes a `.noe` override resolve
+        // through its own `migrate()`.
+        assert_eq!(migrations[1].path, dir.join("sqlite").join("0002_b.sql"));
+        // The file nobody overrode is untouched, path and all.
+        assert_eq!(migrations[0].override_dialect, None);
+        assert_eq!(migrations[0].path, dir.join("0001_a.sql"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_overridden_migration_has_one_identity_per_dialect_and_the_others_have_one() {
+        // The checksum answer. Each dialect's history records the body that actually ran there, so
+        // an overridden migration hashes differently per backend — and that is not two identities
+        // for one migration, because no database ever sees both bodies. Everything NOT overridden
+        // keeps a single checksum across backends, which is what the drift gate has always meant.
+        let dir = overridden_tree("override-checksums");
+
+        let sqlite = load_dir(&dir, DirKind::Migrations, Some(Dialect::Sqlite)).unwrap();
+        let postgres = load_dir(&dir, DirKind::Migrations, Some(Dialect::Postgres)).unwrap();
+        let base = load_dir(&dir, DirKind::Migrations, None).unwrap();
+
+        assert_eq!(
+            sqlite[0].checksum, postgres[0].checksum,
+            "a portable migration is one migration everywhere",
+        );
+        assert_ne!(
+            sqlite[1].checksum, postgres[1].checksum,
+            "an overridden one is checksummed over the body that ran",
+        );
+        assert_eq!(
+            sqlite[1].checksum,
+            Migration::new("0002_b.sql", "CREATE TABLE b (doc TEXT);").checksum,
+        );
+        // The Postgres override happens to repeat the base body verbatim, so its checksum is the
+        // base's — the identity follows the text, never the directory it was read from.
+        assert_eq!(postgres[1].checksum, base[1].checksum);
+        // Re-loading is stable: a second run against the same database finds the same checksum and
+        // the drift gate stays quiet.
+        let again = load_dir(&dir, DirKind::Migrations, Some(Dialect::Sqlite)).unwrap();
+        assert_eq!(again[1].checksum, sqlite[1].checksum);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overrides_change_no_plan_the_history_order_is_the_same_on_every_backend() {
+        // Because an override keeps its base's name, ordering is dialect-independent: the same
+        // files, planned against the same history, give the same statuses and the same
+        // out-of-order set whichever backend is connected.
+        let dir = overridden_tree("override-plan");
+        let sqlite = load_dir(&dir, DirKind::Migrations, Some(Dialect::Sqlite)).unwrap();
+        let postgres = load_dir(&dir, DirKind::Migrations, Some(Dialect::Postgres)).unwrap();
+
+        // A history that has the *second* migration applied and not the first — the out-of-order
+        // shape — so the comparison covers that computation too.
+        let history = |m: &Migration| vec![applied(m, "t1")];
+        let sqlite_plan = plan(&sqlite, &history(&sqlite[1])).unwrap();
+        let postgres_plan = plan(&postgres, &history(&postgres[1])).unwrap();
+
+        assert_eq!(sqlite_plan.pending, postgres_plan.pending);
+        assert_eq!(sqlite_plan.out_of_order, vec![0]);
+        assert_eq!(sqlite_plan.out_of_order, postgres_plan.out_of_order);
+        assert_eq!(
+            sqlite_plan
+                .statuses
+                .iter()
+                .map(|r| (r.name.as_str(), r.applied))
+                .collect::<Vec<_>>(),
+            postgres_plan
+                .statuses
+                .iter()
+                .map(|r| (r.name.as_str(), r.applied))
+                .collect::<Vec<_>>(),
+        );
+        // The status row carries which body it is about, so an operator reading a checksum knows
+        // which of the two files it belongs to.
+        assert_eq!(
+            sqlite_plan.statuses[1].override_dialect,
+            Some(Dialect::Sqlite)
+        );
+        assert_eq!(
+            postgres_plan.statuses[1].override_dialect,
+            Some(Dialect::Postgres)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_override_with_no_base_file_is_an_error_on_every_backend() {
+        // The rule that keeps a shadow directory a spelling rather than a second history: a
+        // migration only one backend has is a schema the others never get. Reported while SQLITE is
+        // connected, though the offending file is Postgres's — a broken overlay is a fault of the
+        // directory, found by whichever backend runs first.
+        let dir = tree(
+            "override-orphan",
+            &[
+                ("0001_a.sql", "CREATE TABLE a (id INTEGER);"),
+                ("postgres/0002_pg_only.sql", "CREATE TABLE b (doc JSONB);"),
+            ],
+        );
+
+        for connected in [None, Some(Dialect::Sqlite), Some(Dialect::Postgres)] {
+            let err = load_dir(&dir, DirKind::Migrations, connected).unwrap_err();
+            assert_eq!(
+                err,
+                MigrateError::OverrideWithoutBase {
+                    dialect: Dialect::Postgres,
+                    filename: "0002_pg_only.sql".to_string(),
+                    kind: DirKind::Migrations,
+                },
+                "connected as {connected:?}",
+            );
+            // The message names both halves and what to do, since the fix is a file the author has
+            // not written yet.
+            let text = err.to_string();
+            assert!(text.contains("postgres/0002_pg_only.sql"), "{text}");
+            assert!(text.contains("Add `0002_pg_only.sql`"), "{text}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_override_must_match_the_base_filename_extension_included() {
+        // The match is the whole filename: a migration is written in ONE body language on every
+        // backend, and only its text differs. A `.sql` override beside a `.noe` base is therefore
+        // not an override of it at all — it is an override of a migration that does not exist, and
+        // is reported as one rather than silently ignored.
+        let dir = tree(
+            "override-extension",
+            &[
+                ("0001_a.noe", "pub fn migrate(): List<Statement> { }"),
+                ("sqlite/0001_a.sql", "CREATE TABLE a (id INTEGER);"),
+            ],
+        );
+        assert_eq!(
+            load_dir(&dir, DirKind::Migrations, Some(Dialect::Sqlite)).unwrap_err(),
+            MigrateError::OverrideWithoutBase {
+                dialect: Dialect::Sqlite,
+                filename: "0001_a.sql".to_string(),
+                kind: DirKind::Migrations,
+            },
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sub_directory_that_is_not_a_dialect_is_ignored_until_it_holds_a_body() {
+        // A project's own directory is nobody's business — until it holds files that look exactly
+        // like migrations, at which point ignoring it means a mistyped `postgress/` silently never
+        // runs.
+        let dir = tree(
+            "override-unknown-dir",
+            &[
+                ("0001_a.sql", "CREATE TABLE a (id INTEGER);"),
+                ("notes/why.md", "the reasoning"),
+            ],
+        );
+        assert_eq!(
+            load_dir(&dir, DirKind::Migrations, Some(Dialect::Sqlite))
+                .unwrap()
+                .len(),
+            1,
+        );
+
+        std::fs::write(dir.join("notes").join("0001_a.sql"), "SELECT 1;").unwrap();
+        let err = load_dir(&dir, DirKind::Migrations, Some(Dialect::Sqlite)).unwrap_err();
+        assert_eq!(
+            err,
+            MigrateError::UnknownDialectDir {
+                name: "notes".to_string(),
+                kind: DirKind::Migrations,
+            },
+        );
+        // The message shows the names that do work, since the fix is a rename.
+        let text = err.to_string();
+        assert!(
+            text.contains("`sqlite`") && text.contains("`postgres`"),
+            "{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dialect_directory_name_is_matched_case_insensitively() {
+        // `Postgres/` is the same directory to a case-insensitive filesystem and to a hurried
+        // author, and reading it as "not a dialect" would be an error about a typo that is not one.
+        let dir = tree(
+            "override-dir-case",
+            &[
+                ("0001_a.sql", "CREATE TABLE a (id INTEGER);"),
+                ("SQLite/0001_a.sql", "CREATE TABLE a (id TEXT);"),
+            ],
+        );
+        let migrations = load_dir(&dir, DirKind::Migrations, Some(Dialect::Sqlite)).unwrap();
+        assert_eq!(migrations[0].body, "CREATE TABLE a (id TEXT);");
+        assert_eq!(migrations[0].override_dialect, Some(Dialect::Sqlite));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_seeds_directory_takes_overrides_on_the_same_terms() {
+        // One loader, one rule: a seed whose insert one backend spells differently overrides the
+        // same way, and a seed only one backend has is the same divergence a migration would be.
+        let dir = tree(
+            "override-seeds",
+            &[
+                ("0001_users.sql", "INSERT INTO users VALUES (1, 'Ada');"),
+                (
+                    "sqlite/0001_users.sql",
+                    "INSERT OR IGNORE INTO users VALUES (1, 'Ada');",
+                ),
+            ],
+        );
+        let seeds = load_dir(&dir, DirKind::Seeds, Some(Dialect::Sqlite)).unwrap();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(
+            seeds[0].body,
+            "INSERT OR IGNORE INTO users VALUES (1, 'Ada');"
+        );
+
+        std::fs::create_dir_all(dir.join("postgres")).unwrap();
+        std::fs::write(dir.join("postgres").join("0002_only.sql"), "SELECT 1;").unwrap();
+        // The noun follows the directory the loader was asked for.
+        let err = load_dir(&dir, DirKind::Seeds, Some(Dialect::Sqlite)).unwrap_err();
+        assert_eq!(
+            err,
+            MigrateError::OverrideWithoutBase {
+                dialect: Dialect::Postgres,
+                filename: "0002_only.sql".to_string(),
+                kind: DirKind::Seeds,
+            },
+        );
+        assert!(err.to_string().contains("overrides a seed"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_dialect_has_one_directory_name_and_reads_back_from_it() {
+        // The directory name is the dialect's only spelling, so a new backend cannot arrive without
+        // one and two backends cannot share a directory.
+        let mut names: Vec<&str> = Dialect::ALL.iter().map(|d| d.dir_name()).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "two dialects share a directory name");
+        for dialect in Dialect::ALL {
+            assert_eq!(Dialect::from_dir_name(dialect.dir_name()), Some(dialect));
+            assert_eq!(dialect.to_string(), dialect.dir_name());
+        }
+        // `postgresql` is the dsn scheme's alias, deliberately NOT a second directory name.
+        assert_eq!(Dialect::from_dir_name("postgresql"), None);
     }
 
     /// A [`SchemaEmitter`] that returns canned IR — the resolution seam exercised with no CLI, the
@@ -1531,7 +2051,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut migrations = load_dir(&dir, DirKind::Migrations).unwrap();
+        let mut migrations = load_dir(&dir, DirKind::Migrations, None).unwrap();
         assert_eq!(migrations[1].kind, MigrationKind::Program);
 
         let ir = "create_table(\"todos\").id().text(\"title\").not_null()\n";
@@ -1797,6 +2317,84 @@ mod sqlite_e2e {
                  INSERT INTO posts (id, title) VALUES (1, 'hello');",
             ),
         ]
+    }
+
+    #[test]
+    fn the_driver_lowers_in_the_dialect_it_reports() {
+        // The one place the dialect is allowed above the driver seam is override selection, so the
+        // dialect a driver *names* and the dialect it *renders in* have to be the same fact — a
+        // driver reporting one and lowering the other would apply the wrong file's body beside the
+        // right DDL, with nothing to notice.
+        let driver = mem();
+        let dialect = driver
+            .dialect()
+            .expect("the SQLite driver names its dialect");
+        assert_eq!(dialect, crate::schema::Dialect::Sqlite);
+        let statements = crate::schema::parse("create_table(\"t\").id().text(\"name\")").unwrap();
+        assert_eq!(
+            driver.lower_schema(&statements).unwrap(),
+            crate::schema::lower(&statements, dialect),
+        );
+    }
+
+    #[test]
+    fn an_override_is_what_applies_and_what_the_history_records() {
+        // End to end on a real database: the base body is Postgres-only SQL that SQLite cannot even
+        // parse, so the migration can only succeed if the `sqlite/` override is the body that ran —
+        // and the checksum recorded is that body's, so re-running is a clean no-op rather than
+        // drift.
+        let dir = super::tests::tree(
+            "e2e-override",
+            &[
+                (
+                    "0001_docs.sql",
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSONB DEFAULT '{}'::jsonb);",
+                ),
+                (
+                    "sqlite/0001_docs.sql",
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, doc TEXT DEFAULT '{}');",
+                ),
+            ],
+        );
+        let mut driver = mem();
+        let dialect = driver.dialect();
+        let migrations = load_dir(&dir, DirKind::Migrations, dialect).unwrap();
+
+        let applied = apply(&mut driver, &migrations).unwrap();
+        assert_eq!(applied.names, vec!["0001_docs.sql"]);
+        assert!(table_exists(&mut driver, "docs"));
+
+        // The ledger holds the base file's NAME and the override's CHECKSUM: one migration, in the
+        // spelling this database ran.
+        let rows = driver
+            .query(
+                &format!("SELECT filename, checksum FROM {TRACKING_TABLE}"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0][0].1, SqlValue::Text("0001_docs.sql".to_string()));
+        assert_eq!(rows[0][1].1, SqlValue::Text(migrations[0].checksum.clone()),);
+
+        // Re-running re-reads the same override and finds no drift.
+        let again = load_dir(&dir, DirKind::Migrations, dialect).unwrap();
+        assert!(apply(&mut driver, &again).unwrap().names.is_empty());
+
+        // And the base body really is the one SQLite refuses — which is what makes the assertion
+        // above about *selection* rather than about two files that happen to both work.
+        let mut bare = mem();
+        assert!(
+            apply(
+                &mut bare,
+                &[Migration::new(
+                    "0001_docs.sql",
+                    "CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSONB DEFAULT '{}'::jsonb);",
+                )],
+            )
+            .is_err(),
+            "the base body must be SQL SQLite cannot run, or this test proves nothing",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2238,14 +2836,14 @@ mod postgres_e2e {
         ];
 
         let applied = apply(&mut driver, &migrations).unwrap();
-        assert_eq!(applied, vec!["0001_widgets.sql", "0002_seed.sql"]);
+        assert_eq!(applied.names, vec!["0001_widgets.sql", "0002_seed.sql"]);
         let rows = driver
             .query("SELECT COUNT(*) AS n FROM widgets", &[])
             .unwrap();
         assert_eq!(rows[0][0].1, SqlValue::Int(2));
 
         // Idempotent re-run.
-        assert!(apply(&mut driver, &migrations).unwrap().is_empty());
+        assert!(apply(&mut driver, &migrations).unwrap().names.is_empty());
 
         // Status reports both applied.
         let st = status(&mut driver, &migrations).unwrap();
@@ -2280,6 +2878,57 @@ mod postgres_e2e {
         assert_eq!(reapplied.len(), 2);
 
         driver.reset().expect("final cleanup");
+    }
+
+    /// The twin of `sqlite_e2e::an_override_is_what_applies_and_what_the_history_records`, from the
+    /// other side: the same directory, the same base file, and the **Postgres** override selected —
+    /// with a base body that only Postgres refuses, so applying at all is the proof of selection.
+    #[test]
+    fn the_postgres_override_is_what_applies_against_a_live_server() {
+        let _pg = crate::pg_test_guard();
+        let Ok(dsn) = std::env::var("NOETA_PG_TEST_DSN") else {
+            return; // no server configured — skip
+        };
+        let mut driver = PostgresDriver::connect(&dsn).expect("connect to NOETA_PG_TEST_DSN");
+        driver.reset().expect("reset");
+        assert_eq!(driver.dialect(), Some(crate::schema::Dialect::Postgres));
+
+        let dir = super::tests::tree(
+            "pg-e2e-override",
+            &[
+                // `AUTOINCREMENT` is SQLite's spelling and a syntax error on Postgres.
+                (
+                    "0001_widgets.sql",
+                    "CREATE TABLE widgets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);",
+                ),
+                (
+                    "postgres/0001_widgets.sql",
+                    "CREATE TABLE widgets (id BIGSERIAL PRIMARY KEY, name TEXT);",
+                ),
+                (
+                    "sqlite/0001_widgets.sql",
+                    "CREATE TABLE widgets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);",
+                ),
+            ],
+        );
+        let migrations = load_dir(&dir, DirKind::Migrations, driver.dialect()).unwrap();
+        assert_eq!(
+            migrations[0].override_dialect,
+            Some(crate::schema::Dialect::Postgres)
+        );
+
+        let applied = apply(&mut driver, &migrations).unwrap();
+        assert_eq!(applied.names, vec!["0001_widgets.sql"]);
+        // The identity column really is Postgres's: an insert that names no id gets one.
+        driver
+            .execute("INSERT INTO widgets (name) VALUES ('alpha')", &[])
+            .expect("BIGSERIAL assigns the id");
+        // The ledger holds the base name with the override's checksum, and a re-run is a no-op
+        // rather than drift.
+        assert!(apply(&mut driver, &migrations).unwrap().names.is_empty());
+
+        driver.reset().expect("final cleanup");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The twin of `sqlite_e2e::the_query_builders_conflict_statements_run_on_sqlite`, against a
@@ -2345,7 +2994,10 @@ mod postgres_e2e {
         ];
 
         let applied = apply(&mut driver, &migrations).unwrap();
-        assert_eq!(applied, vec!["0001_todos.schema", "0002_first_todo.sql"]);
+        assert_eq!(
+            applied.names,
+            vec!["0001_todos.schema", "0002_first_todo.sql"]
+        );
 
         // `id` was auto-assigned by the sequence BIGSERIAL created, and `done` took its default.
         let rows = driver
@@ -2368,7 +3020,7 @@ mod postgres_e2e {
         // Idempotent re-run, and the checksum recorded is the canonical rendering of the DSL's IR —
         // byte-identical to the one SQLite would record for the same file, since no dialect is on
         // that path.
-        assert!(apply(&mut driver, &migrations).unwrap().is_empty());
+        assert!(apply(&mut driver, &migrations).unwrap().names.is_empty());
         let recorded = read_applied(&mut driver).unwrap();
         assert_eq!(recorded[0].checksum, migrations[0].checksum);
 

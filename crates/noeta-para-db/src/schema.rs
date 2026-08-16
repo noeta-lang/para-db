@@ -48,13 +48,49 @@ use std::fmt;
 // --- Dialect ------------------------------------------------------------------------------------
 
 /// The SQL dialect a schema statement is lowered into. Each [`crate::driver::SqlDriver`] names its
-/// own; this enum exists so the *rendering* is one implementation rather than one per driver.
+/// own ([`crate::driver::SqlDriver::dialect`]); this enum exists so the *rendering* is one
+/// implementation rather than one per driver, and it is what a per-dialect migration override
+/// directory is named after ([`Dialect::dir_name`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     /// SQLite: `INTEGER PRIMARY KEY AUTOINCREMENT` identities, `REAL` floats.
     Sqlite,
     /// PostgreSQL: `BIGSERIAL PRIMARY KEY` identities, `DOUBLE PRECISION` floats.
     Postgres,
+}
+
+impl Dialect {
+    /// Every dialect, in the order errors list them. Exhaustive by construction — a new backend adds
+    /// its variant here, and the `match` in [`Dialect::dir_name`] then refuses to compile until it is
+    /// named, so no dialect can exist without a directory spelling.
+    pub const ALL: [Dialect; 2] = [Dialect::Sqlite, Dialect::Postgres];
+
+    /// The **one** directory name this dialect's migration overrides live under
+    /// (`migrations/sqlite/`, `migrations/postgres/`). One spelling per dialect, deliberately: a
+    /// second accepted name (`postgresql/`) would mean two directories that both look right and only
+    /// one of which is read.
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "sqlite",
+            Dialect::Postgres => "postgres",
+        }
+    }
+
+    /// The dialect a sub-directory name selects, case-insensitively, or `None` when the name is not a
+    /// dialect at all — the inverse of [`Dialect::dir_name`].
+    pub fn from_dir_name(name: &str) -> Option<Dialect> {
+        Dialect::ALL
+            .into_iter()
+            .find(|d| name.eq_ignore_ascii_case(d.dir_name()))
+    }
+}
+
+impl fmt::Display for Dialect {
+    /// The dialect's own name — the same word as its directory, so an error and a directory listing
+    /// read alike.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.dir_name())
+    }
 }
 
 // --- The neutral IR -----------------------------------------------------------------------------

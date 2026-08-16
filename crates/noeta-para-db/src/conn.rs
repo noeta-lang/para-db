@@ -265,11 +265,19 @@ fn connection_method_dispatch(
         "migrate" => {
             want_arity(method, args, 1)?;
             let dir = want_str(method, args, 0)?.to_string();
-            // Discover + checksum the migration files before locking the driver (a filesystem read
-            // over the real project directory, like the SQLite driver opening its file directly).
+            let conn = conn_of(recv)?;
+            let mut driver = conn
+                .0
+                .lock()
+                .map_err(|_| io_error("connection lock poisoned"))?;
+            // Discover + checksum the migration files (a filesystem read over the real project
+            // directory, like the SQLite driver opening its file directly). The connected driver's
+            // dialect is what selects each migration's per-dialect override, so the driver is asked
+            // for it before anything is read.
             let mut migrations = crate::migrate::load_dir(
                 std::path::Path::new(&dir),
                 crate::migrate::DirKind::Migrations,
+                driver.dialect(),
             )
             .map_err(migrate_error)?;
             // A `.noe` migration's `migrate()` has to be loaded, checked and run, and this surface is a
@@ -281,11 +289,6 @@ fn connection_method_dispatch(
                 &mut crate::migrate::UnsupportedEmitter,
             )
             .map_err(migrate_error)?;
-            let conn = conn_of(recv)?;
-            let mut driver = conn
-                .0
-                .lock()
-                .map_err(|_| io_error("connection lock poisoned"))?;
             // Apply pending migrations through the shared engine and report how many ran (0 = already
             // up to date), so an app can `conn.migrate("migrations")` at boot.
             let applied =
@@ -297,18 +300,20 @@ fn connection_method_dispatch(
         "seed" => {
             want_arity(method, args, 1)?;
             let dir = want_str(method, args, 0)?.to_string();
-            // Discover + order the seed files with the same loader migrations use (a real-filesystem
-            // read over the project's `seeds/` directory), before locking the driver.
-            let seeds = crate::migrate::load_dir(
-                std::path::Path::new(&dir),
-                crate::migrate::DirKind::Seeds,
-            )
-            .map_err(migrate_error)?;
             let conn = conn_of(recv)?;
             let mut driver = conn
                 .0
                 .lock()
                 .map_err(|_| io_error("connection lock poisoned"))?;
+            // Discover + order the seed files with the same loader migrations use (a real-filesystem
+            // read over the project's `seeds/` directory) — including its per-dialect overrides, for
+            // which the connected driver's dialect is the selector.
+            let seeds = crate::migrate::load_dir(
+                std::path::Path::new(&dir),
+                crate::migrate::DirKind::Seeds,
+                driver.dialect(),
+            )
+            .map_err(migrate_error)?;
             // Run every seed (untracked, re-runnable) through the shared engine and report how many
             // ran, so an app can `conn.seed("seeds")` at boot after `conn.migrate(...)`. Seeding is
             // never implicit — the app opts in and controls the order (migrate, then seed).

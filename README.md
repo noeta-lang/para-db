@@ -345,7 +345,7 @@ migrations/
 - A **`.noe`** migration is hashed over **the statements its `migrate()` returned**, canonically rendered. The Noeta source is never hashed: it is a program, and two programs that build the same statements are the same migration. Reformat it, rename a local, pull a repeated column list into a helper — same identity. Add a column and it changes, because the IR did.
 - A **`.schema`** migration is hashed over the **canonical rendering of its parsed statements**: source → parse → the neutral IR → canonical re-render → sha256. This is the `.noe` case with the parse step swapped for a program run, and it is why the two agree: a migration rewritten from `.schema` into Noeta that builds the same table keeps its checksum.
 
-Hashing the generated DDL instead would be worse on both counts: it is backend-dependent (`INTEGER PRIMARY KEY AUTOINCREMENT` here, `BIGSERIAL PRIMARY KEY` there), so one migration would have two identities — and it would turn any future improvement to the lowering into "history was edited" for every project that had already run it. The checksum is taken **before** lowering and never sees a dialect, so one migration has one identity across SQLite and PostgreSQL and the code generator stays free to improve.
+Hashing the generated DDL instead would be worse on both counts: it is backend-dependent (`INTEGER PRIMARY KEY AUTOINCREMENT` here, `BIGSERIAL PRIMARY KEY` there), so one migration would have two identities — and it would turn any future improvement to the lowering into "history was edited" for every project that had already run it. The checksum is taken **before** lowering and never sees a dialect, so one migration has one identity across SQLite and PostgreSQL and the code generator stays free to improve. A [per-dialect override](#per-dialect-overrides--when-one-backend-spells-it-differently) is the one case where a migration's checksum differs per backend, and it differs because the *body* does: what is hashed is still the text the author wrote for the database it ran against.
 
 Two integrity checks run before anything is applied, both hard errors that name the file:
 
@@ -356,11 +356,31 @@ One further check is a **warning**, and is deliberately not an error:
 
 - **Applied out of order** — a migration applied that sorts *before* one this database had already applied, which is what a rebase or a merge produces when two branches each add a migration and the one that landed second sorts first. Nothing is broken: it applied, in the only order this database could run it. What differs is that a database built fresh from these files applies them in filename order instead — harmless when the two are independent, and exactly how two migrations touching the same table come apart. Only you know which you have, so the run says what happened and leaves the judgment there; renaming the newer file to sort last is how you make both histories agree. The warning names the files and does not repeat once they are part of the history.
 
-Every `.noe` migration's `migrate()` runs **before** the driver is even opened — a migration takes no connection, so what it means is knowable without a database, and a program that fails to check says so before anything is applied. Lowering then happens before each transaction opens, so a statement the vocabulary cannot express stops the run with the file named and nothing touched.
+Every `.noe` migration's `migrate()` runs **before anything is applied** — a migration takes no connection, so what it means is knowable without touching the database, and a program that fails to check says so before the first transaction opens. (The connection itself is established first, because which body each migration has is a question about the connected dialect; opening a connection applies nothing.) Lowering then happens before each transaction opens, so a statement the vocabulary cannot express stops the run with the file named and nothing touched.
 
 **Transactionality.** Each migration runs inside its own transaction — `BEGIN`, the file body, the tracking-row insert, `COMMIT`. The first failure rolls that migration back and stops, reporting the exact file. Postgres has fully transactional DDL; SQLite is transactional for the ordinary DDL migrations use — so a migration is all-or-nothing, and a failed run leaves every prior migration applied. (Do not put `BEGIN`/`COMMIT` in a migration file — the runner owns the transaction.)
 
 **Forward-only.** There are deliberately no down/rollback files: a down migration is routinely wrong against real production data — the production answer is to roll *forward* with a new migration. Development uses `--reset` (drop the schema and re-apply from zero), and **seeds** (below) refill the rebuilt schema with dev data — so `noeta migrate --reset --seed` is the whole development loop. `--reset` is destructive and driver-specific: on SQLite it drops every user table/view/trigger; on PostgreSQL it runs `DROP SCHEMA public CASCADE; CREATE SCHEMA public` (the `public` schema only).
+
+### Per-dialect overrides — when one backend spells it differently
+
+A `.sql` body runs verbatim, so a step two backends spell differently — a trigger, a partial index, a `jsonb` column — has nowhere portable to live. A **dialect sub-directory** is that place: a file under `migrations/sqlite/` or `migrations/postgres/` **replaces the body** of the same-named file in `migrations/` whenever that driver is connected.
+
+```
+migrations/
+  20260816000001_create_docs.sql       # the body every other backend runs
+  20260816000002_first_doc.sql         # portable: no override, written once
+  sqlite/
+    20260816000001_create_docs.sql     # what SQLite runs instead, same name
+```
+
+**The override keeps the base file's name**, and with it its ordinal and its row in `_noeta_migrations`. Only the body is swapped: every backend runs the same migrations in the same order, `--status` lists the same names everywhere, and the [out-of-order warning](#migrations--evolve-the-schema-over-time) cannot fire on one backend and not another. The match is on the whole filename, extension included — a migration is written in one body language on every backend, and only its text differs. `noeta migrate --status` marks an overridden row `[sqlite override]`, since the filename it prints is the base file's while the body that ran is not.
+
+**An override with no base file is an error.** That is the case that would make two databases diverge structurally rather than textually: a migration only one dialect has is a step the others never run and never record. When a step really is needed on one backend only, write it as a pair — the base file, and an override whose body says (in a comment) that there is nothing to do here. Every dialect directory is checked, not only the connected one, so a broken Postgres overlay is reported by the SQLite run too. A sub-directory that is not a dialect name is ignored while it holds no body files and is an error the moment it holds one, because a mistyped `postgress/` is otherwise a directory of migrations that silently never run.
+
+**The checksum follows the body that ran.** An overridden migration therefore hashes differently on SQLite than on PostgreSQL — which is not two identities for one migration, because no database ever sees both bodies. Each database records what it ran, and its drift check compares that against what it would run now.
+
+Seeds take overrides on exactly the same terms: `seeds/postgres/0001_users.sql` overrides `seeds/0001_users.sql`, with the same base-file requirement.
 
 ## Seeds — re-runnable development data
 
@@ -532,7 +552,7 @@ For **other editors** (or a custom setup), `@sql { … }` bodies highlight as SQ
 
 ## Examples
 
-[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder) + `conflict_demo.noe` (the portable `ON CONFLICT` terminals), `schema_demo.noe` (the schema DSL) + `schema_migrate_demo.noe` (`.schema` and `.sql` migrations side by side, under `schema_migrations/`), `repo_demo.noe` (repository + unit-of-work) + `types_demo.noe` (column types across the seam: a `bool` model field, floats, blobs, and what a genuine model/table disagreement reports), `sql_demo.noe` (the `@sql` tier) + `fluent_demo.noe` (the terminals as methods), `migrate_demo.noe` + `seed_demo.noe` (the engine; `seeds/` holds a portable `.sql` seed and a `.noe` program seed side by side, `boot_seeds/` the SQL-only directory a self-seeding app reads), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
+[`examples/para-db-demo/`](examples/para-db-demo) — one demo per surface: `demo.noe` (connect/execute/query), `query_demo.noe` (the builder) + `conflict_demo.noe` (the portable `ON CONFLICT` terminals), `schema_demo.noe` (the schema DSL) + `schema_migrate_demo.noe` (`.schema` and `.sql` migrations side by side, under `schema_migrations/`), `repo_demo.noe` (repository + unit-of-work) + `types_demo.noe` (column types across the seam: a `bool` model field, floats, blobs, and what a genuine model/table disagreement reports), `sql_demo.noe` (the `@sql` tier) + `fluent_demo.noe` (the terminals as methods), `migrate_demo.noe` + `dialect_demo.noe` (the engine, the second one selecting a per-dialect override out of `dialect_migrations/sqlite/`) + `seed_demo.noe` (seeding; `seeds/` holds a portable `.sql` seed and a `.noe` program seed side by side, `boot_seeds/` the SQL-only directory a self-seeding app reads), `reactive_demo.noe` (the manual-signal pattern, any driver), `live_repo_sqlite_demo.noe`, `live_repo_demo.noe` + `watch_demo.noe` (PostgreSQL, external writes), `postgres_demo.noe`.
 
 ## Requirements
 
